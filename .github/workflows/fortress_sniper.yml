@@ -1,0 +1,376 @@
+name: "⚔️ Fortress Sniper v7.0 — Daily Screener"
+
+# ════════════════════════════════════════════════════════════════════
+# SCHEDULE: Runs at 5:30 PM IST (11:00 UTC) Monday–Friday.
+# NSE closes at 3:30 PM IST; 5:30 PM gives 1 hour for EOD settlement.
+# Manual trigger available via workflow_dispatch with override options.
+# ════════════════════════════════════════════════════════════════════
+#
+# DATA FLOW — v7.0 (Google Sheets workbook as master data source):
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  YOUR WORKBOOK: one spreadsheet, six tabs                  │
+#   │                                                             │
+#   │  Tab 1 → BHAVCOPY   ← you paste NSE bhavcopy CSV here     │
+#   │  Tab 2 → FII_DII    ← you enter FII/DII net figures       │
+#   │  Tab 3 → INSIDER    ← you paste NSE PIT / BSE bulk deals  │
+#   │  Tab 4 → FILINGS    ← you paste NSE announcements         │
+#   │  Tab 5 → EARNINGS   ← you paste NSE event calendar        │
+#   │  Tab 6 → SCREENER   ← screener writes output here         │
+#   └─────────────────────────────────────────────────────────────┘
+#
+#   PRIORITY ORDER (per data type, independent):
+#     1. NSE live API      (tried first — full 2000+ universe)
+#     2. Google Sheets     (your workbook — reliable fallback)
+#     3. yfinance          (300-stock watchlist — absolute last resort)
+#
+#   GOOGLE API QUOTA NOTE:
+#     Each sheet is read in ONE bulk HTTP call (get_all_values).
+#     Total quota consumed per run: ≤ 6 read calls + 2 write calls.
+#     Well inside the 300 req/min limit even for 2 000-row BHAVCOPY.
+# ════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    # 12:00 UTC = 17:30 IST (NSE EOD + 1hr buffer)
+    - cron: "0 12 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+
+      force_sheets:
+        description: "Skip NSE, read data directly from Google Sheets workbook"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+      force_yfinance:
+        description: "Skip NSE + Sheets, use yfinance watchlist only (degraded mode)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+      paper_mode:
+        description: "Run Paper Mode (3-factor comparison alongside main score)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+      account_equity:
+        description: "Account capital in ₹ (e.g. 500000)"
+        required: false
+        default: "500000"
+
+      account_risk_pct:
+        description: "Max risk per trade as decimal (0.015 = 1.5%)"
+        required: false
+        default: "0.015"
+
+      # ── Optional: override any sheet tab name ─────────────────────
+      # Use these only if you rename tabs in your workbook.
+      # Leave blank to use the defaults (BHAVCOPY, FII_DII, etc.)
+      sheet_bhavcopy:
+        description: "Tab 1 name override (default: BHAVCOPY)"
+        required: false
+        default: ""
+      sheet_fii_dii:
+        description: "Tab 2 name override (default: FII_DII)"
+        required: false
+        default: ""
+      sheet_insider:
+        description: "Tab 3 name override (default: INSIDER)"
+        required: false
+        default: ""
+      sheet_filings:
+        description: "Tab 4 name override (default: FILINGS)"
+        required: false
+        default: ""
+      sheet_earnings:
+        description: "Tab 5 name override (default: EARNINGS)"
+        required: false
+        default: ""
+
+env:
+  # ─── Telegram ────────────────────────────────────────────────────
+  # Set in: Settings → Secrets and variables → Actions → Secrets
+  # TELEGRAM_TOKEN     : Your bot token from @BotFather
+  # TELEGRAM_CHAT_ID   : Your personal or group chat ID
+  # TELEGRAM_SHARE_IDS : Optional comma-separated extra chat IDs
+  TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+  TELEGRAM_SHARE_IDS: ${{ secrets.TELEGRAM_SHARE_IDS }}
+
+  # ─── Google Sheets ───────────────────────────────────────────────
+  # GOOGLE_SHEET_ID   : Your spreadsheet ID from the URL
+  #   e.g. https://docs.google.com/spreadsheets/d/<<THIS_PART>>/edit
+  # GOOGLE_CREDS_JSON : Service account JSON key
+  #   (paste raw JSON string, or base64-encoded — both accepted)
+  GOOGLE_SHEET_ID:    ${{ secrets.GOOGLE_SHEET_ID }}
+  GOOGLE_CREDS_JSON:  ${{ secrets.GOOGLE_CREDS_JSON }}
+
+  # ─── Sheet tab name overrides ────────────────────────────────────
+  # These default to BHAVCOPY / FII_DII / INSIDER / FILINGS / EARNINGS
+  # Only set these if you've renamed the tabs in your workbook.
+  SHEET_BHAVCOPY:   ${{ inputs.sheet_bhavcopy  || 'BHAVCOPY'  }}
+  SHEET_FII_DII:    ${{ inputs.sheet_fii_dii   || 'FII_DII'   }}
+  SHEET_INSIDER:    ${{ inputs.sheet_insider    || 'INSIDER'   }}
+  SHEET_FILINGS:    ${{ inputs.sheet_filings    || 'FILINGS'   }}
+  SHEET_EARNINGS:   ${{ inputs.sheet_earnings   || 'EARNINGS'  }}
+  SHEET_SCREENER:   "SCREENER"   # output tab — not overridable via dispatch
+
+  # ─── Account sizing ──────────────────────────────────────────────
+  ACCOUNT_EQUITY:    ${{ inputs.account_equity    || '500000' }}
+  ACCOUNT_RISK_PCT:  ${{ inputs.account_risk_pct  || '0.015'  }}
+
+  # ─── Run mode ────────────────────────────────────────────────────
+  PAPER_MODE:        ${{ inputs.paper_mode     || 'false' }}
+  FORCE_SHEETS:      ${{ inputs.force_sheets   || 'false' }}
+  FORCE_YFINANCE:    ${{ inputs.force_yfinance || 'false' }}
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 1: DAILY SNIPER SCREEN
+  # ══════════════════════════════════════════════════════════════════
+  sniper_screen:
+    name: "⚔️ Sniper Screen — NSE EOD → Sheets → Telegram"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # hard cap — NSE retries can hang
+
+    permissions:
+      contents: write        # needed to commit outputs/ artifacts
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────
+      - name: "📂 Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+
+      # ── Python setup ─────────────────────────────────────────────
+      - name: "🐍 Set up Python 3.12"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── Install dependencies ──────────────────────────────────────
+      - name: "📦 Install requirements"
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Restore SQLite cache ──────────────────────────────────────
+      # Persists EOD price cache + ROCE cache + halal cache across runs.
+      # Key includes the week number so the halal universe refreshes weekly.
+      - name: "🗄️ Restore SQLite cache"
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_cache.db
+          key: fortress-cache-${{ runner.os }}-week${{ env.WEEK_NUM }}
+          restore-keys: |
+            fortress-cache-${{ runner.os }}-
+        env:
+          WEEK_NUM: ${{ github.run_number }}
+
+      # ── Create outputs directory ──────────────────────────────────
+      - name: "📁 Create outputs directory"
+        run: mkdir -p outputs
+
+      # ── Run v7.0 Unified Sniper Screener ─────────────────────────
+      - name: "⚔️ Run Fortress Sniper v7.0"
+        id: screener
+        run: |
+          python screener_v7.py
+        env:
+          # Telegram
+          TELEGRAM_TOKEN:     ${{ env.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ env.TELEGRAM_CHAT_ID }}
+          TELEGRAM_SHARE_IDS: ${{ env.TELEGRAM_SHARE_IDS }}
+          # Google Sheets credentials + sheet ID
+          GOOGLE_SHEET_ID:    ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON:  ${{ env.GOOGLE_CREDS_JSON }}
+          # Sheet tab names (exact, case-sensitive)
+          SHEET_BHAVCOPY:     ${{ env.SHEET_BHAVCOPY }}
+          SHEET_FII_DII:      ${{ env.SHEET_FII_DII }}
+          SHEET_INSIDER:      ${{ env.SHEET_INSIDER }}
+          SHEET_FILINGS:      ${{ env.SHEET_FILINGS }}
+          SHEET_EARNINGS:     ${{ env.SHEET_EARNINGS }}
+          SHEET_SCREENER:     ${{ env.SHEET_SCREENER }}
+          # Run mode flags
+          ACCOUNT_EQUITY:     ${{ env.ACCOUNT_EQUITY }}
+          ACCOUNT_RISK_PCT:   ${{ env.ACCOUNT_RISK_PCT }}
+          PAPER_MODE:         ${{ env.PAPER_MODE }}
+          FORCE_SHEETS:       ${{ env.FORCE_SHEETS }}
+          FORCE_YFINANCE:     ${{ env.FORCE_YFINANCE }}
+
+      # ── Upload Excel artifact ─────────────────────────────────────
+      - name: "📤 Upload Excel report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fortress-sniper-excel-${{ github.run_id }}
+          path: outputs/fortress_screener.xlsx
+          retention-days: 30
+
+      # ── Upload HTML artifact ──────────────────────────────────────
+      - name: "📤 Upload HTML report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fortress-sniper-html-${{ github.run_id }}
+          path: outputs/report.html
+          retention-days: 30
+
+      # ── Commit outputs to repo ────────────────────────────────────
+      # Keeps a rolling history of picks in the repo's outputs/ folder.
+      # Remove this step if you prefer not to commit artifacts to git.
+      - name: "💾 Commit outputs to repository"
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add outputs/fortress_screener.xlsx outputs/report.html || true
+          git diff --staged --quiet || git commit -m "⚔️ Sniper v7.0 picks $(date +'%Y-%m-%d') [bot]"
+          git push || true
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 2: WEEKLY HEALTH CHECK (Sundays at 09:00 IST = 03:30 UTC)
+  #
+  # Validates:
+  #   ✓ NSE bhavcopy URL reachability
+  #   ✓ Google Sheets workbook + all 5 tabs present and non-empty
+  #   ✓ yfinance batch download (TCS, INFY)
+  #   ✓ Telegram bot token
+  #   ✓ Shariah CSV reachability
+  #   ✓ SQLite cache size
+  # ══════════════════════════════════════════════════════════════════
+  weekly_health:
+    name: "🩺 Weekly Health Check — Sheets + NSE + Telegram"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    timeout-minutes: 10
+
+    steps:
+      - name: "📂 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Python 3.12"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "📦 Install"
+        run: pip install -r requirements.txt
+
+      - name: "🩺 Health check"
+        run: |
+          python - <<'EOF'
+          import sys, os, logging
+          logging.basicConfig(level=logging.INFO,
+                              format="%(asctime)s | %(levelname)s | %(message)s")
+          log = logging.getLogger("health")
+          ok  = True
+
+          # ── Import the unified screener ──────────────────────────
+          try:
+              import screener_v7 as sc
+          except Exception as e:
+              log.error(f"❌ screener_v7 import FAILED: {e}")
+              sys.exit(1)
+
+          # ── 1. NSE bhavcopy reachability ─────────────────────────
+          try:
+              date_str, _ = sc.get_last_trading_day()
+              df = sc.download_bhavcopy(date_str)
+              cleaned = sc.clean_bhavcopy(df)
+              log.info(f"✅ NSE bhavcopy: {len(cleaned)} EQ rows")
+          except Exception as e:
+              log.warning(f"⚠️  NSE bhavcopy FAILED (Sheets fallback will be used): {e}")
+              # Not a hard failure — Sheets is the intended fallback
+
+          # ── 2. Google Sheets — workbook + all 5 tabs ─────────────
+          EXPECTED_TABS = {
+              "BHAVCOPY":  sc.SHEET_BHAVCOPY,
+              "FII_DII":   sc.SHEET_FII_DII,
+              "INSIDER":   sc.SHEET_INSIDER,
+              "FILINGS":   sc.SHEET_FILINGS,
+              "EARNINGS":  sc.SHEET_EARNINGS,
+          }
+          if sc._sheets_configured():
+              ready = sc._init_sheets_client()
+              if not ready:
+                  log.error("❌ Google Sheets auth FAILED")
+                  ok = False
+              else:
+                  log.info("✅ Google Sheets workbook opened")
+                  for label, tab_name in EXPECTED_TABS.items():
+                      df = sc._bulk_read_sheet(tab_name)
+                      if df.empty:
+                          log.error(
+                              f"❌ Tab '{tab_name}' ({label}): empty or missing. "
+                              f"Create the tab and populate it."
+                          )
+                          ok = False
+                      else:
+                          log.info(f"✅ Tab '{tab_name}' ({label}): {len(df)} rows")
+          else:
+              log.warning("⚠️  GOOGLE_SHEET_ID or GOOGLE_CREDS_JSON not set — skipping Sheets check")
+
+          # ── 3. yfinance batch ─────────────────────────────────────
+          try:
+              import yfinance as yf
+              raw = yf.download("TCS.NS INFY.NS", period="2d", progress=False)
+              if raw.empty:
+                  raise ValueError("Empty batch result")
+              log.info("✅ yfinance batch: TCS + INFY OK")
+          except Exception as e:
+              log.error(f"❌ yfinance batch FAILED: {e}")
+              ok = False
+
+          # ── 4. Telegram token ─────────────────────────────────────
+          token = os.getenv("TELEGRAM_TOKEN", "")
+          if token:
+              valid, msg = sc.validate_telegram_token(token)
+              if valid:
+                  log.info(f"✅ Telegram token OK: {msg}")
+              else:
+                  log.error(f"❌ Telegram token FAILED: {msg}")
+                  ok = False
+          else:
+              log.warning("⚠️  TELEGRAM_TOKEN not set — skipping token check")
+
+          # ── 5. Shariah CSV ────────────────────────────────────────
+          syms = sc._fetch_shariah_csv()
+          if len(syms) >= 100:
+              log.info(f"✅ Shariah CSV: {len(syms)} symbols")
+          else:
+              log.warning(f"⚠️  Shariah CSV: only {len(syms)} symbols — fallback will be used")
+
+          # ── 6. SQLite cache ───────────────────────────────────────
+          import sqlite3, pathlib
+          db = pathlib.Path("outputs/fortress_cache.db")
+          if db.exists():
+              size_kb = db.stat().st_size // 1024
+              log.info(f"✅ SQLite cache: {size_kb} KB at {db}")
+          else:
+              log.info("ℹ️  SQLite cache not yet created (first run)")
+
+          log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+          log.info(f"Health check {'PASSED ✅' if ok else 'FAILED ❌ — review errors above'}")
+          sys.exit(0 if ok else 1)
+          EOF
+        env:
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          SHEET_BHAVCOPY:    "BHAVCOPY"
+          SHEET_FII_DII:     "FII_DII"
+          SHEET_INSIDER:     "INSIDER"
+          SHEET_FILINGS:     "FILINGS"
+          SHEET_EARNINGS:    "EARNINGS"
+          SHEET_SCREENER:    "SCREENER"
