@@ -163,9 +163,19 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ── Compute ISO week number for cache key ────────────────────
+      # FIX #8: WEEK_NUM previously used github.run_number, which increments
+      # every run, making the primary cache key always unique. This caused every
+      # run to save a brand-new cache blob and never reuse the primary key —
+      # only the prefix fallback ever matched, wasting GitHub cache quota.
+      # Fix: set WEEK_NUM to the real ISO calendar week (date +%V) so the
+      # primary key is stable for the full week and the cache is genuinely reused.
+      - name: "📅 Set ISO week number for cache key"
+        run: echo "WEEK_NUM=$(date +%V)" >> $GITHUB_ENV
+
       # ── Restore SQLite cache ──────────────────────────────────────
       # Persists EOD price cache + ROCE cache + halal cache across runs.
-      # Key includes the week number so the halal universe refreshes weekly.
+      # Key includes the ISO week number so the halal universe refreshes weekly.
       - name: "🗄️ Restore SQLite cache"
         uses: actions/cache@v4
         with:
@@ -173,8 +183,6 @@ jobs:
           key: fortress-cache-${{ runner.os }}-week${{ env.WEEK_NUM }}
           restore-keys: |
             fortress-cache-${{ runner.os }}-
-        env:
-          WEEK_NUM: ${{ github.run_number }}
 
       # ── Create outputs directory ──────────────────────────────────
       - name: "📁 Create outputs directory"
