@@ -2381,25 +2381,33 @@ def calc_cvd_divergence(hist: pd.DataFrame, close: float) -> dict:
 def calc_vsa_absorption(hist: pd.DataFrame, atr14: float, adv20: float) -> dict:
     if len(hist)<5 or atr14<=0 or adv20<=0:
         return {"vsa_absorption":False,"vsa_label":"","vsa_bonus":0}
-    absorption_bars = 0
+    bullish_bars = 0
+    bearish_bars = 0   # FIX (audit round 2): bearish absorption = distribution, NOT smart-money buy
     for _, row in hist.tail(5).iterrows():
         spread=float(row["high"])-float(row["low"]); vol=float(row["volume"])
         cl=float(row["close"]); lo=float(row["low"]); hi=float(row["high"])
         bar_rng=hi-lo
         if bar_rng<=0: continue
         close_pct=(cl-lo)/bar_rng
-        # FIX #11: detect both bullish absorption (close near high) AND
-        # bearish absorption (smart money buying at lows, close near low).
-        # Previously only close_pct >= 0.60 was counted, missing the bearish side.
+        # Bullish absorption: high vol, tight spread, close near HIGH = demand absorbing supply
         bullish_absorb = spread<0.5*atr14 and vol>1.5*adv20 and close_pct>=0.60
+        # Bearish absorption: high vol, tight spread, close near LOW = supply overwhelming demand
+        # Per VSA literature this is DISTRIBUTION / forced selling — scored NEGATIVE, not positive
         bearish_absorb = spread<0.5*atr14 and vol>1.5*adv20 and close_pct<=0.40
-        if bullish_absorb or bearish_absorb:
-            absorption_bars+=1
-    if absorption_bars>=1:
+        if bullish_absorb: bullish_bars += 1
+        elif bearish_absorb: bearish_bars += 1
+    net = bullish_bars - bearish_bars
+    if bullish_bars >= 1 and net > 0:
         return {"vsa_absorption":True,
-                "vsa_label":f"🟢 VSA Absorption ({absorption_bars} bar{'s' if absorption_bars>1 else ''})",
-                "vsa_bonus":min(8,absorption_bars*4)}
-    return {"vsa_absorption":False,"vsa_label":"","vsa_bonus":0}
+                "vsa_signal":"BULLISH",
+                "vsa_label":f"🟢 VSA Bullish Absorption ({bullish_bars} bar{'s' if bullish_bars>1 else ''})",
+                "vsa_bonus":min(8, bullish_bars*4)}
+    elif bearish_bars >= 1 and net < 0:
+        return {"vsa_absorption":False,
+                "vsa_signal":"BEARISH",
+                "vsa_label":f"🔴 VSA Distribution ({bearish_bars} bar{'s' if bearish_bars>1 else ''})",
+                "vsa_bonus":-min(4, bearish_bars*2)}   # negative bonus = penalty
+    return {"vsa_absorption":False,"vsa_signal":"NEUTRAL","vsa_label":"","vsa_bonus":0}
 
 
 def calc_momentum_exhaustion(hist: pd.DataFrame, rsi_v: float,
@@ -2594,10 +2602,16 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
         ma_label = "MA50"
         log.debug(f"{symbol}: insufficient bars for MA100 — using MA50")
     below_tolerance = (close < ma_ref * (1 - CFG["ma200_tolerance"]))
-    # FIX #7: below_tolerance was computed but never used — stocks >5% below MA200
-    # could still score highly if other layers aligned. Wire it in as a hard veto.
+    # FIX #7 (refined per audit round 2): hard veto ONLY when below MA200.
+    # MA100/MA50 pullbacks are valid buy-at-support setups — vetoing them kills
+    # legitimate entries (e.g. stock at ₹95 bouncing off MA100 at ₹100).
+    # For shorter-term MA refs, apply a score penalty instead of a full veto.
     if below_tolerance:
-        return None   # downtrend veto: close is more than ma200_tolerance below MA ref
+        if ma_label == "MA200":
+            return None   # hard veto: structural downtrend below long-term MA
+        else:
+            # Penalty path: reduce fortress pts 15% — still eligible but deprioritised
+            pass   # penalty applied later in pts calculation (see below_tolerance_pen)
 
     alt_pct  = ((close - ma_ref) / ma_ref * 100) if ma_ref > 0 else 0.0
     alt_warn = alt_pct > CFG["alt_warn_pct"]
@@ -2689,11 +2703,10 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     momentum_mode = (adx_v >= 25 and close > ma50_v)
     layer3        = vpoc_touches >= 2 or momentum_mode
 
-    # ── FOG pre-calculation (v5.7 parity) ───────────────────────────
-    # Compute fog here so the fortress result carries fog_block for
-    # upstream callers that short-circuit before assemble_result.
-    fog_pre = calc_fog_enhanced(adx_v, adx_prev, 18.0,  # vix=18 placeholder; overridden in assemble
-                                 ma50_v, ma200_v, 0)     # w52_bonus not yet known; conservative
+    # NOTE (audit round 2): fog_pre previously computed here with a hardcoded vix=18
+    # placeholder and returned as fog_block_pre / fog_tier_pre — but assemble_result
+    # recomputes FOG with the real live VIX and that is the value actually used.
+    # fog_pre was dead code: computed but never read by any caller. Removed.
 
     pts = 0.0
 
@@ -2717,6 +2730,10 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
 
     # Sector truth multiplier
     pts *= sector_mult
+
+    # below_tolerance penalty for MA100/MA50 pullbacks (MA200 already vetoed above)
+    if below_tolerance and ma_label != "MA200":
+        pts *= 0.85   # 15% haircut — still eligible, just deprioritised vs at-support setups
 
     # Altitude penalty (v5.7 progressive alt_pen, not just binary)
     # alt_stop is already guarded above. Apply graded penalty here:
@@ -2776,8 +2793,7 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
         "forward_bonus":   forward_bonus,
         "momentum_velocity_pct": round(velocity, 2),
         # FOG pre-calc (placeholder vix; authoritative value recomputed in assemble_result)
-        "fog_block_pre":   fog_pre["fog_block"],
-        "fog_tier_pre":    fog_pre["fog_tier"],
+        # fog_block_pre / fog_tier_pre removed — dead code (see audit round 2 note above)
     }
 
 
@@ -2888,12 +2904,17 @@ def assemble_result(symbol: str, today_row, hist: pd.DataFrame,
     fil_det  = fil_data.get("detail", fil_det)
 
     price = float(today_row["close"])
-    # FIX #5: only call fetch_roce_proxy when running in yfinance fallback mode.
-    # In NSE/Sheets mode, financials are fresher and this synchronous yf.Ticker().info
-    # call adds 2-4 minutes of latency for 30-50 small-caps in the hot loop.
-    _using_fallback = str(today_row.get("data_quality","")).startswith("EOD_FRESH") and \
-                      not str(today_row.get("data_quality","")).startswith("SHEETS")
-    if price < 300 and fil_pts > 15 and _using_fallback:
+    # FIX #5 (corrected): skip ROCE proxy only when in yfinance degraded mode —
+    # SNAPSHOT_FALLBACK/STALE data means financials are unreliable anyway.
+    # In NSE/Sheets mode (EOD_FRESH, SHEETS_EOD, EOD_CACHED) ROCE IS gated
+    # because fresh data makes the quality check meaningful and worth the latency.
+    # Previous version had this inverted: it ran ROCE for EOD_FRESH and skipped
+    # it for Sheets — backwards from the intent.
+    _is_yfinance_fallback = (
+        str(today_row.get("data_quality","")) in ("SNAPSHOT_FALLBACK", "STALE")
+        or FORCE_YFINANCE
+    )
+    if price < 300 and fil_pts > 15 and not _is_yfinance_fallback:
         roce_val, roce_label = fetch_roce_proxy(symbol)
         if roce_val is None:
             fil_pts = min(fil_pts, 10)
@@ -3400,6 +3421,13 @@ def calc_sniper_exit_plan(close, t1, t3, atr14, trail_stop_existing=None) -> dic
 def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
                        filings, earnings_cal) -> Optional[dict]:
     """Full v7.0 assemble: v5.7 scoring + all 7 Sniper Hybrid systems."""
+    # FIX: fetch macro BEFORE calling assemble_result so vix_now_cached is defined.
+    # Previously macro was referenced before assignment, causing NameError on every stock.
+    # _get_macro_regime() is thread-safe and cached — zero extra network calls.
+    macro      = _get_macro_regime()
+    macro_state= macro["macro_state"]
+    breadth_ok = macro["breadth_ok"]
+
     result = assemble_result(symbol, today_row, hist, fii_data, insider_map,
                               filings, earnings_cal,
                               vix_now_cached=macro.get("vix_val"))
@@ -3407,11 +3435,6 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
         return None
 
     close  = float(today_row["close"])
-    # ── Re-use the fort dict already computed inside assemble_result ──
-    # assemble_result calls fortress_score() once and stores every field
-    # in `result` with matching key names. Re-calling fortress_score() here
-    # would be a second full indicator pass (wasteful — fixed from v7.0 bug).
-    # Reconstruct the fort-shaped sub-dict from result keys instead.
     fort = {k: result[k] for k in (
         "layer1","layer2","layer3","vcp_coil","entry_zone","entry_band",
         "stop_note","atr_mult","alt_pct","sector_mult","regime","mfi",
@@ -3420,12 +3443,7 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
         "ma200_val","ma_label","w52_bonus","w52_label","atrv_bonus",
         "atrv_label","forward_bonus","momentum_velocity_pct",
     ) if k in result}
-    # score_fortress lives in result as "score_fortress", not "fortress_pts"
     fort["fortress_pts"] = result.get("score_fortress", 0)
-
-    macro      = _get_macro_regime()
-    macro_state= macro["macro_state"]
-    breadth_ok = macro["breadth_ok"]
 
     if macro_state == "MASSACRE":
         result["sniper_directive"] = "⚠️ HALT — MARKET MASSACRE"
@@ -3792,14 +3810,20 @@ def push_to_gsheets(top5: list, date_label: str):
             ])
 
         # Single batch update — 1 API write call for all rows
-        # FIX #6: gspread ≥6.0 changed the positional signature of ws.update().
-        # Old: ws.update(list_of_lists) was treated as values.
-        # New: first positional arg is range_name; passing a list raises APIError.
-        # Fix: always pass range_name="A1" explicitly so both old and new gspread work.
-        _sheets_retry(
-            ws.update, "A1", rows_to_write,
-            label=f"batch_update({SHEET_SCREENER})"
-        )
+        # FIX #6 (hardened per audit round 2): gspread ≥6.0 uses update(range_name, values).
+        # gspread <6.0 uses update(values) or update(range_name, values).
+        # Use try/except to handle both versions gracefully instead of version-sniffing.
+        try:
+            _sheets_retry(
+                ws.update, "A1", rows_to_write,
+                label=f"batch_update({SHEET_SCREENER})"
+            )
+        except TypeError:
+            # gspread <6.0 fallback: positional arg is values directly
+            _sheets_retry(
+                ws.update, rows_to_write,
+                label=f"batch_update_legacy({SHEET_SCREENER})"
+            )
         log.info(f"  Google Sheets Tab '{SHEET_SCREENER}' updated: {len(top5)} picks ✅")
     except Exception as e:
         log.error(f"push_to_gsheets failed: {e}")
