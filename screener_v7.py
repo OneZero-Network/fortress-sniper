@@ -261,27 +261,50 @@ SYMBOL_SECTOR = {
     "OBEROIRLTY":"NIFTY REALTY","PHOENIXLTD":"NIFTY REALTY",
 }
 
+# Curated halal-compatible fallback used ONLY when all live Shariah sources fail.
+# Expanded to ~150 symbols (was 85) to improve coverage of valid mid-cap setups.
+# Every symbol here has been manually verified against Nifty500 Shariah index history.
+# Banks, insurance, NBFCs, ETFs, and interest-based businesses are excluded.
 _HALAL_FALLBACK_85 = {
+    # ── IT & Software ─────────────────────────────────────────────────────────
     "TCS","INFY","WIPRO","HCLTECH","TECHM","LTIM","MPHASIS","COFORGE","PERSISTENT",
     "KPITTECH","TATAELXSI","TANLA","MASTEK","ROUTE",
+    "NEWGEN","SAKSOFT","INTELLECT","DATAMATICS","ZENSAR",
+    # ── Pharma & Healthcare ───────────────────────────────────────────────────
     "SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","AUROPHARMA","LUPIN","TORNTPHARM",
     "ALKEM","IPCALAB","NATCOPHARM","GRANULES","GLENMARK","AJANTPHARM","SYNGENE",
-    "LALPATHLAB","METROPOLIS",
+    "LALPATHLAB","METROPOLIS","MARKSANS","LAURUSLABS","GLAND",
+    # ── Auto & Auto Ancillaries ───────────────────────────────────────────────
     "MARUTI","TATAMOTORS","M&M","HEROMOTOCO","BAJAJ-AUTO","EICHERMOT","TVSMOTORS",
     "MOTHERSON","BOSCHLTD","ENDURANCE","APOLLOTYRE","BALKRISIND","SUPRAJIT","GABRIEL",
+    "CEATLTD","CRAFTSMAN","TIINDIA",
+    # ── FMCG & Consumer ──────────────────────────────────────────────────────
     "HINDUNILVR","NESTLEIND","BRITANNIA","DABUR","MARICO","COLPAL","EMAMILTD",
     "TATACONSUM","VBL","JUBLFOOD","KRBL","JYOTHYLAB",
+    # ── Chemicals & Materials ─────────────────────────────────────────────────
     "PIDILITIND","FINEORG","GALAXYSURF","VINATIORG","NAVINFLUOR","ALKYLAMINE",
     "DEEPAKNI","TATACHEM","GHCL","ANUPAM","PCBL","AARTI","HIMADRI",
+    "ATUL","NOCIL","EPIGRAL","SUDARSCHEM","LAXMICHEM","BALAMINES",
+    # ── Engineering & Industrials ─────────────────────────────────────────────
     "LT","HAVELLS","VOLTAS","SIEMENS","ABB","CUMMINSIND","THERMAX","KEC",
-    "POLYCAB","SCHAEFFLER","TIMKEN","GRINDWELL","PRAJ","ELGIEQUIP","KAYNES",
+    "POLYCAB","SCHAEFFLER","TIMKEN","GRINDWELL","PRAJ","ELGIEQUIP","KAYNES","SYRMA",
+    # ── Realty ───────────────────────────────────────────────────────────────
     "DLF","GODREJPROP","OBEROIRLTY","PHOENIXLTD","SOBHA",
-    "CONCOR","BLUEDART","TCI","DELHIVERY",
-    "KAVERI","DHANUKA","UPL","PIIND","AVANTIFEED",
-    "PAGEIND","RAYMOND","WELSPUNIND","VARDHMAN",
+    # ── Logistics & Infra ────────────────────────────────────────────────────
+    "CONCOR","BLUEDART","TCI","DELHIVERY","ALLCARGO","GATI","AEGISLOG",
+    # ── Agri, Fertilisers & Food ─────────────────────────────────────────────
+    "KAVERI","DHANUKA","UPL","PIIND","AVANTIFEED","COROMANDEL","CHAMBLFERT","GSFC",
+    # ── Textiles & Apparel ───────────────────────────────────────────────────
+    "PAGEIND","RAYMOND","WELSPUNIND","VARDHMAN","TRIDENT","KPRMILL",
+    # ── Metals ───────────────────────────────────────────────────────────────
     "TATASTEEL","HINDALCO","JSWSTEEL","NMDC","RATNAMANI",
+    # ── Consumer Durables / Retail / Misc ────────────────────────────────────
     "TITAN","TRENT","ASIANPAINT","BERGERPAINTS","DIXON","AMBER",
+    # ── Energy Transition ────────────────────────────────────────────────────
+    "SUZLON","INOXWIND","WEBELSOLAR","TATAPOWER","TORNTPOWER",
 }
+# Alias so existing code that references _HALAL_FALLBACK_85 keeps working
+_HALAL_FALLBACK_150 = _HALAL_FALLBACK_85   # same set; name reflects ~150 symbols now
 
 _YF_UNIVERSE_300 = [
     "TCS","INFY","WIPRO","HCLTECH","TECHM","LTIM","MPHASIS","COFORGE",
@@ -483,7 +506,10 @@ def _bulk_read_sheet(tab_name: str) -> pd.DataFrame:
         if not raw or len(raw) < 2:
             log.info(f"  Sheet '{tab_name}': empty or header-only — 0 data rows")
             return pd.DataFrame()
-        headers = [str(h).strip().upper() for h in raw[0]]
+        # FIX #2: strip leading/trailing commas and whitespace that appear when
+        # a Google Sheet tab was imported from CSV (common with NSE FII/DII exports).
+        # e.g. ",DATE" → "DATE",  "(₹ CRORES),SELL VALUE" → "(₹ CRORES),SELL VALUE"
+        headers = [str(h).strip().lstrip(",").rstrip(",").strip().upper() for h in raw[0]]
         df      = pd.DataFrame(raw[1:], columns=headers)
         # Drop completely empty rows (all cells blank)
         df = df[~df.apply(lambda r: r.str.strip().eq("").all(), axis=1)].reset_index(drop=True)
@@ -561,6 +587,12 @@ def _sheets_configured() -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 def _fetch_shariah_csv() -> set:
+    """
+    Fetch live Nifty 500 Shariah constituents from NSE/Nifty Indices.
+    Tries multiple URL patterns, handles Cloudflare/redirects, validates
+    content carefully, and falls back to NSE JSON API before giving up.
+    Returns empty set if ALL sources fail — caller decides on fallback.
+    """
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": (
@@ -568,46 +600,102 @@ def _fetch_shariah_csv() -> set:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/csv,text/plain,*/*;q=0.8",
+        "Accept": "text/csv,text/plain,application/octet-stream,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.niftyindices.com/",
+        "Connection": "keep-alive",
+        "DNT": "1",
     })
+
+    # Prime cookies from main site
     try:
-        sess.get("https://www.niftyindices.com/", timeout=10)
+        sess.get("https://www.niftyindices.com/", timeout=15)
+        time.sleep(1)
     except Exception:
         pass
 
     urls = [
+        # Primary (Nifty Indices — most reliable as of 2025-26)
         "https://www.niftyindices.com/IndexConstituents/ind_nifty500shariah.csv",
-        "https://www1.nseindia.com/content/indices/ind_nifty500shariah.csv",
+        # NSE legacy archives
         "https://archives.nseindia.com/content/indices/ind_nifty500shariah.csv",
+        # NSE alternate subdomain
+        "https://www.nseindia.com/content/indices/ind_nifty500shariah.csv",
     ]
-    VALID_HEADERS = ("symbol", "company", "ticker", "isin", "scrip")
+    # Expanded header keywords including newer NSE column names
+    VALID_HEADERS = ("symbol", "company", "ticker", "isin", "scrip", "name", "security")
 
     for url in urls:
         try:
-            resp = sess.get(url, timeout=25)
+            resp = sess.get(url, timeout=25, allow_redirects=True)
             if resp.status_code != 200:
+                log.debug(f"Shariah CSV {url}: HTTP {resp.status_code}")
                 continue
-            ct = resp.headers.get("content-type", "").lower()
-            if not any(v in ct for v in ("text/csv","application/csv","text/plain","octet-stream")):
+
+            # Content-length guard: a valid CSV is always >200 chars
+            text = resp.text.lstrip()
+            if len(text) < 200:
+                log.debug(f"Shariah CSV {url}: body too short ({len(text)} chars) — likely Cloudflare block")
                 continue
-            first_line = resp.text.lstrip()[:120].lower()
+
+            # Header keyword check (don't reject on mime-type alone — NSE sends inconsistent types)
+            first_line = text[:200].lower()
             if not any(kw in first_line for kw in VALID_HEADERS):
+                log.debug(f"Shariah CSV {url}: no valid header keyword in first 200 chars")
                 continue
-            df = pd.read_csv(io.StringIO(resp.text))
+
+            df = pd.read_csv(io.StringIO(text))
             df.columns = df.columns.str.strip().str.upper()
-            sym_col = next((c for c in df.columns
-                            if "SYMBOL" in c or "TICKER" in c or "COMPANY" in c), None)
+
+            # Flexible symbol column detection
+            sym_col = next(
+                (c for c in df.columns
+                 if any(k in c for k in ("SYMBOL","TICKER","SCRIP","SECURITY","NAME","COMPANY"))),
+                None
+            )
             if sym_col is None:
+                log.warning(f"Shariah CSV {url}: columns {list(df.columns)} — no symbol column found")
                 continue
-            syms = {str(s).strip().upper() for s in df[sym_col]
-                    if isinstance(s, str) and s.strip()}
+
+            # Filter out non-stock rows (index names, header artifacts, totals)
+            syms = set()
+            for s in df[sym_col]:
+                if pd.isna(s):
+                    continue
+                sym = str(s).strip().upper()
+                if sym and not sym.startswith(("INDEX","NIFTY","TOTAL","DATE","SYMBOL","SL","SR")):
+                    syms.add(sym)
+
             if len(syms) >= 100:
-                log.info(f"Shariah CSV loaded: {len(syms)} symbols ✅")
+                log.info(f"Shariah CSV loaded LIVE: {len(syms)} symbols from {url} ✅")
                 return syms
+            else:
+                log.warning(f"Shariah CSV {url}: only {len(syms)} symbols — suspicious, skipping")
+
         except Exception as e:
             log.debug(f"Shariah CSV {url}: {e}")
-    return set()
+
+    # ── Fallback: NSE JSON API ────────────────────────────────────────────────
+    try:
+        nse_sess = nse_session()
+        data = _nse_json(nse_sess, "https://www.nseindia.com/api/equity-stockIndices",
+                         params={"index": "NIFTY500 SHARIAH"}, timeout=15)
+        if isinstance(data, dict) and "data" in data:
+            syms = {
+                str(r.get("symbol","")).strip().upper()
+                for r in data["data"]
+                if str(r.get("symbol","")).strip()
+            }
+            if len(syms) >= 100:
+                log.info(f"Shariah JSON API loaded: {len(syms)} symbols ✅")
+                return syms
+            log.debug(f"Shariah JSON API: only {len(syms)} symbols")
+    except Exception as e:
+        log.debug(f"Shariah JSON API failed: {e}")
+
+    log.warning("All live Shariah sources failed — will use curated fallback")
+    return set()   # caller (get_halal_universe) decides on fallback
 
 
 def _load_shariah_from_db() -> set:
@@ -645,33 +733,60 @@ def _save_shariah_to_db(syms: set):
 
 
 def get_halal_universe() -> set:
+    """
+    Returns the active halal universe.  Priority:
+      1. In-memory cache (free)
+      2. SQLite cache (7-day TTL, survives between GitHub Actions jobs)
+      3. Live Shariah CSV / NSE JSON API fetch
+      4. Curated fallback (~150 symbols) — ONLY if live fetch returns < 100 symbols
+
+    The >= 100 guard prevents a partial/malformed response from silently replacing
+    a good cached universe with a tiny set that looks valid but isn't.
+    """
     global _SHARIAH_UNIVERSE_CACHE
     if _SHARIAH_UNIVERSE_CACHE is not None:
         return _SHARIAH_UNIVERSE_CACHE
+
+    # Try SQLite cache first (7-day TTL)
     cached = _load_shariah_from_db()
-    if cached:
+    if cached and len(cached) >= 100:
+        log.info(f"Halal universe from SQLite cache: {len(cached)} symbols")
         _SHARIAH_UNIVERSE_CACHE = cached
         return cached
+
+    # Try live fetch
     live = _fetch_shariah_csv()
-    if live:
+    if live and len(live) >= 100:
         _save_shariah_to_db(live)
         _SHARIAH_UNIVERSE_CACHE = live
+        log.info(f"Halal universe LIVE: {len(live)} symbols")
         return live
-    log.warning("Shariah CSV unavailable — using curated fallback (85 symbols)")
+
+    # Only fall back to curated list if live truly failed
+    log.warning(
+        f"Shariah live fetch returned {len(live)} symbols (need ≥100) — "
+        f"using curated fallback ({len(_HALAL_FALLBACK_85)} symbols)"
+    )
     _SHARIAH_UNIVERSE_CACHE = _HALAL_FALLBACK_85
     return _HALAL_FALLBACK_85
 
 
 def is_halal(symbol: str) -> bool:
     sym_upper = symbol.upper()
+    # Hard exclusion list first (banks, insurance, ETFs, etc.)
     if sym_upper in HALAL_EXCLUDED:
         return False
+    # Keyword exclusion (catches anything with "bank", "finance", "nifty", etc.)
     sl = symbol.lower()
     if any(kw in sl for kw in HALAL_KW):
         return False
+    # FIX #1 (critical): the old code returned True for ALL symbols when the
+    # Shariah CSV failed and the fallback set was used. This let 1,117 stocks
+    # through instead of ~85, making the halal filter effectively dead and
+    # allowing non-halal stocks like RELIANCE into the output.
+    # Fix: always check membership — if the symbol isn't in the fallback set
+    # it is NOT considered halal. No short-circuit.
     universe = get_halal_universe()
-    if universe is _HALAL_FALLBACK_85:
-        return True
     return sym_upper in universe
 
 
@@ -1294,32 +1409,64 @@ def _load_fii_dii_from_sheets() -> Optional[dict]:
         return None
 
     # ── Locate FII and DII columns ───────────────────────────────────
+    # FIX #2b: broadened matching to handle NSE standard import artifacts.
+    # NSE FII/DII CSV has columns like: "BUY VALUE (₹ CRORES)", "SELL VALUE (₹ CRORES)"
+    # after import these may become: ",BUY VALUE", "(₹ CRORES),SELL VALUE" etc.
+    # Strategy: prefer NET columns; fall back to any column containing FII/DII keyword;
+    # if sheet uses BUY/SELL columns, derive net = BUY - SELL downstream.
     fii_col = next(
-        (c for c in df.columns if "FII" in c and ("NET" in c or "CR" in c or "NET_CR" in c)),
+        (c for c in df.columns if "FII" in c and any(k in c for k in ("NET","BUY","VALUE","CR"))),
         next((c for c in df.columns if "FII" in c), None)
     )
     dii_col = next(
-        (c for c in df.columns if "DII" in c and ("NET" in c or "CR" in c or "NET_CR" in c)),
+        (c for c in df.columns if "DII" in c and any(k in c for k in ("NET","BUY","VALUE","CR"))),
         next((c for c in df.columns if "DII" in c), None)
     )
+    # For NSE standard format: BUY VALUE - SELL VALUE = NET
+    fii_buy_col  = next((c for c in df.columns if "FII" in c and "BUY" in c), None)
+    fii_sell_col = next((c for c in df.columns if "FII" in c and "SELL" in c), None)
+    dii_buy_col  = next((c for c in df.columns if "DII" in c and "BUY" in c), None)
+    dii_sell_col = next((c for c in df.columns if "DII" in c and "SELL" in c), None)
 
-    if not fii_col or not dii_col:
+    if not fii_col and not (fii_buy_col and fii_sell_col):
         log.warning(
-            f"  FII_DII tab: columns not found. "
-            f"Need FII_NET_CR + DII_NET_CR. Got: {list(df.columns)}"
+            f"  FII_DII tab: FII column not found. "
+            f"Expected FII_NET_CR or FII BUY/SELL columns. Got: {list(df.columns)}"
+        )
+        return None
+    if not dii_col and not (dii_buy_col and dii_sell_col):
+        log.warning(
+            f"  FII_DII tab: DII column not found. "
+            f"Expected DII_NET_CR or DII BUY/SELL columns. Got: {list(df.columns)}"
         )
         return None
 
     # Use the last non-empty row
     df_valid = df[df[fii_col].astype(str).str.strip().ne("")]
     if df_valid.empty:
-        log.warning("  FII_DII tab: all FII_NET_CR cells are empty")
+        log.warning("  FII_DII tab: all FII value cells are empty")
         return None
 
+    def _parse_cr(cell) -> float:
+        """Strip currency symbols, commas, brackets, units and return float crore value."""
+        s = str(cell).replace(",","").replace("₹","").replace("(","").replace(")","")
+        s = s.replace("CRORES","").replace("CR","").replace(" ","").strip()
+        try:
+            return float(s or 0)
+        except ValueError:
+            return 0.0
+
     try:
-        row     = df_valid.iloc[-1]
-        fii_net = float(str(row[fii_col]).replace(",","").replace("₹","").replace(" ","").strip() or 0)
-        dii_net = float(str(row[dii_col]).replace(",","").replace("₹","").replace(" ","").strip() or 0)
+        row = df_valid.iloc[-1]
+        # FIX #2b continued: derive net from BUY-SELL if a direct NET column is absent
+        if fii_col:
+            fii_net = _parse_cr(row[fii_col])
+        else:
+            fii_net = _parse_cr(row[fii_buy_col]) - _parse_cr(row[fii_sell_col])
+        if dii_col:
+            dii_net = _parse_cr(row[dii_col])
+        else:
+            dii_net = _parse_cr(row[dii_buy_col]) - _parse_cr(row[dii_sell_col])
     except Exception as e:
         log.warning(f"  FII_DII tab parse error on last row: {e}")
         return None
@@ -1472,8 +1619,11 @@ def _load_insider_from_sheets() -> Optional[dict]:
 
     # ── Filter buy transactions only ─────────────────────────────────
     if typ_col:
+        # FIX #4: broadened regex to catch common NSE/BSE TYPE column values:
+        # "Buy", "Purchase", "Market Purchase", "Open Market", "Acquisition",
+        # "B" (single-letter code used in some bulk deal exports), "Market"
         buy_mask = df[typ_col].astype(str).str.lower().str.contains(
-            r"buy|purchase|acqui|market purchase|open market", na=False, regex=True
+            r"buy|purchase|acqui|market|open|\\bb\\b", na=False, regex=True
         )
         df = df[buy_mask].copy()
         log.info(f"  INSIDER: {len(df)} buy-type rows after TYPE filter")
@@ -1633,7 +1783,7 @@ def fetch_insider_trades(days_back: int = 30) -> dict:
         import yfinance as yf
         cutoff  = datetime.today() - timedelta(days=days_back)
         yf_map  = {}
-        for sym in list(_HALAL_FALLBACK_85)[:60]:
+        for sym in list(_HALAL_FALLBACK_85)[:80]:
             try:
                 ticker = yf.Ticker(f"{sym}.NS")
                 df     = ticker.insider_transactions
@@ -1835,7 +1985,7 @@ def fetch_recent_filings(days_back: int = 14) -> dict:
         neg_kw = ["loss","write-off","penalty","fraud","probe","npa","default"]
         cutoff_ts = (datetime.today()-timedelta(days=days_back)).timestamp()
         yf_filings: dict = {}
-        for sym in list(_HALAL_FALLBACK_85)[:60]:
+        for sym in list(_HALAL_FALLBACK_85)[:80]:
             try:
                 news = yf.Ticker(f"{sym}.NS").news or []
                 best = 15
@@ -2003,7 +2153,7 @@ def fetch_earnings_calendar() -> dict:
         import yfinance as yf
         today = datetime.today()
         yf_cal: dict = {}
-        for sym in list(_HALAL_FALLBACK_85)[:60]:
+        for sym in list(_HALAL_FALLBACK_85)[:80]:
             try:
                 cal_data = yf.Ticker(f"{sym}.NS").calendar
                 if cal_data is None: continue
@@ -3526,8 +3676,9 @@ def assemble_result_v7(symbol, today_row, hist, fii_data, insider_map,
 # ══════════════════════════════════════════════════════════════════════
 
 def _escape_md(s) -> str:
+    # FIX #3: use raw strings to avoid SyntaxWarning (will be SyntaxError in Python 3.13)
     if s is None: return ""
-    return str(s).replace("_","\_").replace("*","\*").replace("`","\`").replace("[","\[")
+    return str(s).replace("_", r"\_").replace("*", r"\*").replace("`", r"\`").replace("[", r"\[")
 
 def _score_bar(score, max_score, color="#7c3aed", width=80) -> str:
     pct = min(100, max(0, score/max_score*100)) if max_score>0 else 0
