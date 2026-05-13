@@ -6,10 +6,10 @@ name: "⚔️ Fortress Sniper v8.0 — Daily Screener"
 # Manual trigger available via workflow_dispatch with override options.
 # ════════════════════════════════════════════════════════════════════
 #
-# DATA FLOW — v7.0 (Google Sheets workbook as master data source):
+# DATA FLOW — v8.0 (Google Sheets workbook as master data source):
 #
 #   ┌─────────────────────────────────────────────────────────────┐
-#   │  YOUR WORKBOOK: one spreadsheet, six tabs                  │
+#   │  YOUR WORKBOOK: one spreadsheet, seven tabs                │
 #   │                                                             │
 #   │  Tab 1 → BHAVCOPY   ← you paste NSE bhavcopy CSV here     │
 #   │  Tab 2 → FII_DII    ← you enter FII/DII net figures       │
@@ -17,6 +17,7 @@ name: "⚔️ Fortress Sniper v8.0 — Daily Screener"
 #   │  Tab 4 → FILINGS    ← you paste NSE announcements         │
 #   │  Tab 5 → EARNINGS   ← you paste NSE event calendar        │
 #   │  Tab 6 → SCREENER   ← screener writes output here         │
+#   │  Tab 7 → HALAL_LIST ← your custom halal whitelist         │
 #   └─────────────────────────────────────────────────────────────┘
 #
 #   PRIORITY ORDER (per data type, independent):
@@ -193,7 +194,7 @@ jobs:
       - name: "📁 Create outputs directory"
         run: mkdir -p outputs
 
-      # ── Run v7.0 Unified Sniper Screener ─────────────────────────
+      # ── Run v8.0 Unified Sniper Screener ─────────────────────────
       - name: "⚔️ Run Fortress Sniper v8.0"
         id: screener
         run: |
@@ -220,6 +221,8 @@ jobs:
           FORCE_SHEETS:       ${{ env.FORCE_SHEETS }}
           FORCE_YFINANCE:     ${{ env.FORCE_YFINANCE }}
           SHEET_HALAL_LIST:   ${{ env.SHEET_HALAL_LIST }}
+          # INFRA-3: Configurable SQLite cache path (default: outputs/fortress_cache.db)
+          CACHE_PATH:         ${{ secrets.CACHE_PATH || 'outputs/fortress_cache.db' }}
 
       # ── Upload Excel artifact ─────────────────────────────────────
       - name: "📤 Upload Excel report"
@@ -294,7 +297,7 @@ jobs:
           try:
               import screener_v8 as sc
           except Exception as e:
-              log.error(f"❌ screener_v7 import FAILED: {e}")
+              log.error(f"❌ screener_v8 import FAILED: {e}")
               sys.exit(1)
 
           # ── 1. NSE bhavcopy reachability ─────────────────────────
@@ -314,6 +317,10 @@ jobs:
               "INSIDER":   sc.SHEET_INSIDER,
               "FILINGS":   sc.SHEET_FILINGS,
               "EARNINGS":  sc.SHEET_EARNINGS,
+          }
+          # LOW-5: SHEET_SCREENER also sourced from env (consistent with dispatch overrides)
+          EXPECTED_OUTPUT_TABS = {
+              "SCREENER":  sc.SHEET_SCREENER,
           }
           # v8.0: HALAL_LIST is optional — warn but don't fail if absent
           OPTIONAL_TABS = {
