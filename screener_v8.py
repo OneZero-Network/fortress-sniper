@@ -1273,6 +1273,46 @@ def load_bhavcopy_from_sheets() -> pd.DataFrame:
 
     required = {"symbol", "open", "high", "low", "close", "volume"}
     missing  = required - set(df.columns)
+
+    # ── Volume resilience (BUG FIX) ──────────────────────────────────
+    # If ONLY volume is missing (OHLC + symbol are present), don't return
+    # an empty df — that triggers full DEGRADED MODE and ignores the
+    # user's 625-symbol HALAL_LIST entirely.
+    # Priority: 1) derive from turnover  2) derive from TOTTRDVAL raw col
+    # 3) set to 0 and continue with a warning (volume signals degrade,
+    #    but price/fundamental/Bayes signals still work on the full list).
+    if missing == {"volume"}:
+        if "turnover_lakhs" in df.columns:
+            # Reverse-engineer: volume = turnover_lakhs × 1e5 / close
+            df["volume"] = (
+                pd.to_numeric(df["turnover_lakhs"], errors="coerce") * 100_000
+            ) / pd.to_numeric(df["close"], errors="coerce").replace(0, np.nan)
+            log.warning(
+                "  BHAVCOPY: TOTTRDQTY absent — VOLUME derived from TURNOVER÷CLOSE. "
+                "Add TOTTRDQTY column to your BHAVCOPY tab for accurate volume signals."
+            )
+            missing = set()  # resolved
+        elif "TOTTRDVAL" in raw.columns:
+            df["volume"] = (
+                pd.to_numeric(raw["TOTTRDVAL"], errors="coerce") * 1e5
+            ) / pd.to_numeric(df["close"], errors="coerce").replace(0, np.nan)
+            log.warning(
+                "  BHAVCOPY: VOLUME derived from raw TOTTRDVAL column. "
+                "Add TOTTRDQTY column to your BHAVCOPY tab for accurate volume signals."
+            )
+            missing = set()  # resolved
+        else:
+            # Last resort: set volume=0, mark data quality, proceed without degrading.
+            # Volume-based signals (VDU, CVD, liquidity) will be suppressed,
+            # but all 3000+ price rows are still usable for the full HALAL_LIST run.
+            df["volume"] = 0
+            log.warning(
+                "  BHAVCOPY: TOTTRDQTY (volume) column is missing from your Google Sheet. "
+                "Volume-based signals (VDU, CVD, liquidity filter) will be zeroed out. "
+                "FIX: In your BHAVCOPY tab, paste ALL NSE bhavcopy columns including TOTTRDQTY."
+            )
+            missing = set()  # don't abort — continue with full symbol list
+
     if missing:
         log.warning(
             f"  BHAVCOPY tab missing required columns: {missing}. "
@@ -4590,11 +4630,28 @@ def run_screener_v8():
     # v8.0: price universe hard-capped at PRICE_CAP (₹800). Stocks above
     # ₹800 are excluded entirely — no large-cap bucket. This keeps the
     # screener focused on mid/small-cap setups with better R:R profiles.
-    candidates = bhavcopy[
-        (bhavcopy["turnover_lakhs"] >= CFG["turnover_lakhs"]) &
-        (bhavcopy["close"] >= 50) &
-        (bhavcopy["close"] <= PRICE_CAP)
-    ].copy()
+    #
+    # Volume resilience: if TOTTRDQTY was absent from the BHAVCOPY sheet,
+    # volume was set to 0 → turnover_lakhs = 0. In that case skip the
+    # turnover gate (apply price filter only) so the full HALAL_LIST is
+    # still scored. A warning was already logged during bhavcopy load.
+    _volume_available = bhavcopy["volume"].sum() > 0
+    if _volume_available:
+        candidates = bhavcopy[
+            (bhavcopy["turnover_lakhs"] >= CFG["turnover_lakhs"]) &
+            (bhavcopy["close"] >= 50) &
+            (bhavcopy["close"] <= PRICE_CAP)
+        ].copy()
+    else:
+        log.warning(
+            "⚠️  Volume=0 across all rows — TOTTRDQTY missing from BHAVCOPY tab. "
+            "Liquidity (turnover) gate SKIPPED; applying price filter only. "
+            "Add TOTTRDQTY to your sheet to restore liquidity filtering."
+        )
+        candidates = bhavcopy[
+            (bhavcopy["close"] >= 50) &
+            (bhavcopy["close"] <= PRICE_CAP)
+        ].copy()
     log.info(f"After liquidity + price (≤₹{PRICE_CAP}) filter: {len(candidates)}")
     candidates = candidates[candidates["symbol"].apply(is_halal)].copy()
     log.info(f"After halal filter: {len(candidates)}")
