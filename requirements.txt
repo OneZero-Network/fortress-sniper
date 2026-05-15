@@ -1,34 +1,4 @@
 # ══════════════════════════════════════════════════════════════════════
-# Fortress Sniper v8.0 — Python dependencies
-# INFRA-1: This file was missing; the workflow referenced it but it
-# did not exist, causing the "Install requirements" step to fail.
-# ══════════════════════════════════════════════════════════════════════
-
-# ── Google Sheets integration ────────────────────────────────────────
-gspread>=6.0.0
-google-auth>=2.0.0
-google-auth-oauthlib>=1.0.0
-
-# ── Data & numerics ──────────────────────────────────────────────────
-pandas>=2.0.0
-numpy>=1.24.0
-yfinance>=0.2.40
-openpyxl>=3.1.0
-
-# ── Networking ───────────────────────────────────────────────────────
-requests>=2.31.0
-
-# ── Market calendars (MED-3: pinned so NSE holiday-aware trading-day
-# counting works; fallback to 5/7 approximation if import fails) ──────
-pandas_market_calendars>=4.3.0
-
-# ── Version detection (MED-4: explicit gspread API version check) ────
-packaging>=23.0
-
-# ── Optional: faster Monte Carlo path (falls back to numpy if absent) ─
-# scipy>=1.11.0
-
-# ══════════════════════════════════════════════════════════════════════
 # APEX SNIPER v1.1 — Requirements
 # ══════════════════════════════════════════════════════════════════════
 
