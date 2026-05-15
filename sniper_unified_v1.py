@@ -2364,7 +2364,266 @@ def push_gsheets(picks: list, date_label: str):
             r.get("story","—"),
         ])
     _push_sheet("SCREENER", rows)
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 15b — OUTCOME ENGINE (closed-loop feedback)
+# ══════════════════════════════════════════════════════════════════════════════
 
+def _get_yesterday_picks() -> List[dict]:
+    """Fetch yesterday's picks that are still 'open' and need tracking."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        yesterday = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        rows = con.execute(
+            "SELECT run_date, symbol, entry_price, stop_loss, r1, r2, r3, grade, fused_score, story "
+            "FROM pick_outcomes WHERE status='open' AND run_date=?",
+            (yesterday,)
+        ).fetchall()
+        con.close()
+        return [dict(zip(["run_date","symbol","entry_price","stop_loss","r1","r2","r3","grade","fused_score","story"], r)) for r in rows]
+    except Exception as e:
+        log.debug(f"Get yesterday picks: {e}")
+        return []
+
+
+def _update_pick_outcome(symbol: str, run_date: str, status: str, exit_price: float = None, pnl_pct: float = None, days_held: int = None, hit_target: str = None):
+    """Update a pick's outcome after checking market data."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "UPDATE pick_outcomes SET status=?, exit_price=?, pnl_pct=?, days_held=?, hit_target=?, updated_at=? "
+            "WHERE symbol=? AND run_date=?",
+            (status, exit_price, pnl_pct, days_held, hit_target, datetime.today().isoformat(), symbol, run_date)
+        )
+        con.commit(); con.close()
+        log.info(f"  Outcome: {symbol} → {status} | P&L: {pnl_pct:+.1f}% | Days: {days_held}")
+    except Exception as e:
+        log.debug(f"Update outcome {symbol}: {e}")
+
+
+def _check_pick_outcome(pick: dict, hist: pd.DataFrame) -> dict:
+    """
+    Check if yesterday's pick hit R1, R2, R3, or stop loss.
+    Returns: {"status": str, "exit_price": float, "pnl_pct": float, "days_held": int, "hit_target": str}
+    """
+    if hist.empty or len(hist) < 2:
+        return {"status": "open", "exit_price": None, "pnl_pct": None, "days_held": None, "hit_target": None}
+    
+    entry = pick["entry_price"]
+    stop = pick["stop_loss"]
+    r1 = pick["r1"]
+    r2 = pick["r2"]
+    r3 = pick["r3"]
+    
+    # Get prices since pick date
+    pick_date = pd.Timestamp(pick["run_date"])
+    since_pick = hist[hist["date"] >= pick_date]
+    
+    if since_pick.empty:
+        return {"status": "open", "exit_price": None, "pnl_pct": None, "days_held": None, "hit_target": None}
+    
+    highs = since_pick["high"].values
+    lows = since_pick["low"].values
+    closes = since_pick["close"].values
+    days_held = len(since_pick)
+    
+    # Check stop loss first (priority)
+    if any(l <= stop for l in lows):
+        idx = next(i for i, l in enumerate(lows) if l <= stop)
+        exit_price = stop
+        pnl = (exit_price - entry) / entry * 100
+        return {"status": "stopped", "exit_price": exit_price, "pnl_pct": pnl, "days_held": idx + 1, "hit_target": "stop"}
+    
+    # Check R3 (highest priority if hit)
+    if any(h >= r3 for h in highs):
+        idx = next(i for i, h in enumerate(highs) if h >= r3)
+        exit_price = r3
+        pnl = (exit_price - entry) / entry * 100
+        return {"status": "r3_hit", "exit_price": exit_price, "pnl_pct": pnl, "days_held": idx + 1, "hit_target": "r3"}
+    
+    # Check R2
+    if any(h >= r2 for h in highs):
+        idx = next(i for i, h in enumerate(highs) if h >= r2)
+        # Partial exit at R2, but position still open for R3
+        return {"status": "r2_hit", "exit_price": r2, "pnl_pct": (r2 - entry) / entry * 100, "days_held": idx + 1, "hit_target": "r2"}
+    
+    # Check R1
+    if any(h >= r1 for h in highs):
+        idx = next(i for i, h in enumerate(highs) if h >= r1)
+        return {"status": "r1_hit", "exit_price": r1, "pnl_pct": (r1 - entry) / entry * 100, "days_held": idx + 1, "hit_target": "r1"}
+    
+    # Expire after 12 days (MC_HORIZON) if nothing hit
+    if days_held >= MC_HORIZON:
+        last_close = float(closes[-1])
+        pnl = (last_close - entry) / entry * 100
+        return {"status": "expired", "exit_price": last_close, "pnl_pct": pnl, "days_held": days_held, "hit_target": "none"}
+    
+    # Still open
+    return {"status": "open", "exit_price": None, "pnl_pct": None, "days_held": days_held, "hit_target": None}
+
+
+def _run_outcome_engine():
+    """Check all open picks from previous days and update their outcomes."""
+    log.info("=" * 70)
+    log.info("🔁 OUTCOME ENGINE — Checking yesterday's picks…")
+    log.info("=" * 70)
+    
+    open_picks = _get_yesterday_picks()
+    if not open_picks:
+        log.info("  No open picks to check")
+        return
+    
+    log.info(f"  Tracking {len(open_picks)} open pick(s)")
+    sess = _get_nse_session()
+    
+    for pick in open_picks:
+        sym = pick["symbol"]
+        try:
+            hist = fetch_history(sym, days=30, sess=sess)
+            outcome = _check_pick_outcome(pick, hist)
+            
+            if outcome["status"] != "open":
+                _update_pick_outcome(
+                    sym, pick["run_date"], outcome["status"],
+                    outcome["exit_price"], outcome["pnl_pct"],
+                    outcome["days_held"], outcome["hit_target"]
+                )
+            else:
+                log.info(f"  {sym}: still open ({outcome['days_held']} days)")
+                
+            time.sleep(0.3)
+        except Exception as e:
+            log.debug(f"Outcome check {sym}: {e}")
+    
+    log.info("  Outcome engine complete")
+
+
+def _get_sector_performance(days: int = 30) -> dict:
+    """Calculate win rate and avg P&L per sector from pick_outcomes."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        since = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows = con.execute(
+            "SELECT p.sector, o.status, o.pnl_pct FROM pick_outcomes o "
+            "JOIN sniper_results p ON o.symbol=p.symbol AND o.run_date=p.run_date "
+            "WHERE o.run_date>=? AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')",
+            (since,)
+        ).fetchall()
+        con.close()
+        
+        sector_stats = {}
+        for sector, status, pnl in rows:
+            if sector not in sector_stats:
+                sector_stats[sector] = {"wins": 0, "losses": 0, "total_pnl": 0, "count": 0}
+            sector_stats[sector]["count"] += 1
+            sector_stats[sector]["total_pnl"] += (pnl or 0)
+            if status in ("r1_hit", "r2_hit", "r3_hit"):
+                sector_stats[sector]["wins"] += 1
+            else:
+                sector_stats[sector]["losses"] += 1
+        
+        # Calculate win rate
+        for sector, stats in sector_stats.items():
+            stats["win_rate"] = stats["wins"] / stats["count"] * 100 if stats["count"] > 0 else 0
+            stats["avg_pnl"] = stats["total_pnl"] / stats["count"] if stats["count"] > 0 else 0
+        
+        return sector_stats
+    except Exception as e:
+        log.debug(f"Sector performance: {e}")
+        return {}
+
+
+def _adjust_sector_multipliers():
+    """Dynamically adjust SECTOR_TRUTH based on actual performance."""
+    perf = _get_sector_performance(days=30)
+    if not perf:
+        log.info("  No performance data yet — using default multipliers")
+        return
+    
+    log.info("=" * 70)
+    log.info("📊 SECTOR PERFORMANCE (30-day) — Adjusting multipliers…")
+    log.info("=" * 70)
+    
+    for sector, stats in sorted(perf.items(), key=lambda x: x[1]["win_rate"], reverse=True):
+        old_mult = SECTOR_TRUTH.get(sector, 1.0)
+        new_mult = old_mult
+        
+        # Adjust based on win rate
+        if stats["win_rate"] >= 60 and stats["count"] >= 5:
+            new_mult = min(1.3, old_mult + 0.05)
+        elif stats["win_rate"] <= 30 and stats["count"] >= 5:
+            new_mult = max(0.7, old_mult - 0.05)
+        
+        if new_mult != old_mult:
+            SECTOR_TRUTH[sector] = new_mult
+            log.info(f"  {sector}: {old_mult:.2f} → {new_mult:.2f} (win {stats['win_rate']:.0f}%, {stats['count']} trades)")
+        else:
+            log.info(f"  {sector}: {old_mult:.2f} unchanged (win {stats['win_rate']:.0f}%, {stats['count']} trades)")
+
+
+def _get_stale_picks(days_stale: int = 5) -> List[dict]:
+    """Find picks that never triggered entry (price never hit buy zone)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        since = (datetime.today() - timedelta(days=days_stale)).strftime("%Y-%m-%d")
+        rows = con.execute(
+            "SELECT run_date, symbol, entry_price, buy_lo, buy_hi, story "
+            "FROM sniper_results s "
+            "WHERE s.run_date<=? AND NOT EXISTS ("
+            "  SELECT 1 FROM pick_outcomes o WHERE o.symbol=s.symbol AND o.run_date=s.run_date"
+            ")",
+            (since,)
+        ).fetchall()
+        con.close()
+        return [dict(zip(["run_date","symbol","entry_price","buy_lo","buy_hi","story"], r)) for r in rows]
+    except Exception as e:
+        log.debug(f"Stale picks: {e}")
+        return []
+
+
+def _alert_open_positions():
+    """Alert if any open pick is within 5% of stop loss."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            "SELECT symbol, entry_price, stop_loss, r1, days_held, status "
+            "FROM pick_outcomes WHERE status='open'"
+        ).fetchall()
+        con.close()
+        
+        if not rows:
+            return
+        
+        log.info("=" * 70)
+        log.info("🚨 OPEN POSITION ALERTS")
+        log.info("=" * 70)
+        
+        sess = _get_nse_session()
+        for sym, entry, stop, r1, days, status in rows:
+            try:
+                # Get latest price
+                info = _nse_json(sess, "https://www.nseindia.com/api/quote-equity", 
+                                params={"symbol": sym}, timeout=10)
+                latest = float(info.get("priceInfo", {}).get("lastPrice", 0))
+                
+                if latest <= 0:
+                    continue
+                    
+                stop_distance = (latest - stop) / stop * 100
+                r1_distance = (r1 - latest) / latest * 100
+                
+                if stop_distance <= 5:
+                    log.warning(f"  🔴 {sym}: ₹{latest:.0f} — only {stop_distance:.1f}% from stop! ({days} days in)")
+                elif r1_distance <= 5:
+                    log.info(f"  🟢 {sym}: ₹{latest:.0f} — {r1_distance:.1f}% from R1 target ({days} days in)")
+                else:
+                    log.info(f"  ⚪ {sym}: ₹{latest:.0f} | Stop: {stop_distance:.1f}% away | R1: {r1_distance:.1f}% away")
+                    
+                time.sleep(0.3)
+            except Exception as e:
+                log.debug(f"Alert check {sym}: {e}")
+                
+    except Exception as e:
+        log.debug(f"Open alerts: {e}")
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 16 — MAIN PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
