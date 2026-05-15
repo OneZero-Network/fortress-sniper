@@ -1860,8 +1860,8 @@ def assemble_pick(
         bayes_score * W["bayesian"]    +
         float(vpoc_score_val := (
     25 if fort["layer1"] else
-    (15 if (abs(close-poc)/poc <= 0.05 and poc > 0) else 0)
-)) * W["fortress_vpoc"]        # VPOC sub-score into APEX weight
+    15 if poc > 0 and abs(close-poc)/poc <= 0.05 else
+    0)) * W["fortress_vpoc"]        # VPOC sub-score into APEX weight
     )
     # score variable reuse fix
     vpoc_for_apex = (
