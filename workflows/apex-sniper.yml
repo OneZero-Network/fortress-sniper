@@ -1,0 +1,65 @@
+name: Dual Screener — Fortress + APEX Independent
+
+on:
+  schedule:
+    - cron: '25 3 * * 1-5'   # Fortress at 8:55 AM IST
+    - cron: '35 3 * * 1-5'   # APEX at 9:05 AM IST
+    - cron: '55 9 * * 1-5'   # Fortress at 3:25 PM IST
+    - cron: '5 10 * * 1-5'   # APEX at 3:35 PM IST
+  workflow_dispatch:
+    inputs:
+      which:
+        description: 'Which screener to run?'
+        required: true
+        default: 'apex'
+        type: choice
+        options:
+          - fortress
+          - apex
+          - both
+
+jobs:
+  fortress:
+    if: github.event_name == 'schedule' || inputs.which == 'fortress' || inputs.which == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install yfinance pandas numpy requests gspread google-auth
+          python fortress_screener_v81.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+
+  apex:
+    if: github.event_name == 'schedule' || inputs.which == 'apex' || inputs.which == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install yfinance pandas numpy requests gspread google-auth
+          mkdir -p outputs
+          python apex_sniper_v1.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_SHARE_IDS: ${{ secrets.TELEGRAM_SHARE_IDS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY || '500000' }}
+          ACCOUNT_RISK_PCT: ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
+          APEX_TOP_N: ${{ secrets.APEX_TOP_N || '5' }}
+          APEX_MIN_SCORE: ${{ secrets.APEX_MIN_SCORE || '48' }}
+          PAPER_MODE: ${{ secrets.PAPER_MODE || 'true' }}
+          GOOGLE_FINANCE_ENABLED: ${{ secrets.GOOGLE_FINANCE_ENABLED || 'false' }}
+          NSEPYTHON_ENABLED: ${{ secrets.NSEPYTHON_ENABLED || 'false' }}
