@@ -43,6 +43,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(
@@ -152,6 +153,22 @@ SECTOR_ATR_MULT = {
     "NIFTY METAL": 1.20, "NIFTY IT": 0.90, "NIFTY PHARMA": 1.10,
     "NIFTY AUTO": 1.05,  "NIFTY FMCG": 0.85, "DIVERSIFIED": 1.00,
 }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YFINANCE CIRCUIT BREAKER & SHARED CACHES
+# ══════════════════════════════════════════════════════════════════════════════
+
+_YF_DOWNLOAD_TIMEOUT = 15          # seconds for yf.download
+_YF_INFO_TIMEOUT     = 10          # seconds for yf.Ticker().info
+_YF_FAIL_COUNT       = 0
+_YF_FAIL_THRESHOLD   = 3           # skip all yf calls after 3 consecutive failures
+
+_CNX500_CACHE        = None
+_CNX500_CACHE_TIME   = 0
+_SECTOR_INDEX_CACHE  = {}        # ticker -> DataFrame
+_SECTOR_MOM_CACHE    = {}        # "sector_days" -> result dict
+_MAX_SECTOR_YF_CALLS = 8         # max unique sector index downloads per run
+_SECTOR_YF_CALLS     = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,20 +449,52 @@ def get_sector(sym: str) -> str:
 
 def _live_sector_momentum(sector: str, days: int = 20) -> dict:
     """Compute sector vs CNX500 relative momentum. Returns bonus/penalty."""
+    NEUTRAL = {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
+
+    if sector not in SECTOR_INDICES:
+        return NEUTRAL
+
+    global _YF_FAIL_COUNT
+    if _YF_FAIL_COUNT >= _YF_FAIL_THRESHOLD:
+        return NEUTRAL
+
+    cache_key = f"{sector}_{days}"
+    if cache_key in _SECTOR_MOM_CACHE:
+        return _SECTOR_MOM_CACHE[cache_key]
+
+    global _SECTOR_YF_CALLS
+    if _SECTOR_YF_CALLS >= _MAX_SECTOR_YF_CALLS:
+        log.debug(f"Sector YF call cap reached ({_MAX_SECTOR_YF_CALLS}) — skipping {sector}")
+        return NEUTRAL
+
     try:
         import yfinance as yf
-        sector_ticker = SECTOR_INDICES.get(sector)
-        if not sector_ticker:
-            return {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
 
-        sector_df = yf.download(f"^{sector_ticker}", period="30d", progress=False, auto_adjust=True)
-        cnx_df = yf.download("^CNX500", period="30d", progress=False, auto_adjust=True)
+        # Shared CNX500 cache (TTL 1 hour)
+        global _CNX500_CACHE, _CNX500_CACHE_TIME
+        now = time.time()
+        if _CNX500_CACHE is None or (now - _CNX500_CACHE_TIME) > 3600:
+            cnx_df = yf.download("^CNX500", period="30d", progress=False,
+                                auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+            _CNX500_CACHE = cnx_df
+            _CNX500_CACHE_TIME = now
+        else:
+            cnx_df = _CNX500_CACHE
+
+        sector_ticker = SECTOR_INDICES[sector]
+        if sector_ticker not in _SECTOR_INDEX_CACHE:
+            sector_df = yf.download(f"^{sector_ticker}", period="30d", progress=False,
+                                    auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+            _SECTOR_INDEX_CACHE[sector_ticker] = sector_df
+            _SECTOR_YF_CALLS += 1
+        else:
+            sector_df = _SECTOR_INDEX_CACHE[sector_ticker]
 
         if sector_df.empty or cnx_df.empty or len(sector_df) < 20:
-            return {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
+            return NEUTRAL
 
         sector_close = sector_df["Close"].squeeze().values
-        cnx_close = cnx_df["Close"].squeeze().values
+        cnx_close    = cnx_df["Close"].squeeze().values
 
         sec_5d = (sector_close[-1] - sector_close[-5]) / sector_close[-5] * 100 if len(sector_close) >= 5 else 0
         cnx_5d = (cnx_close[-1] - cnx_close[-5]) / cnx_close[-5] * 100 if len(cnx_close) >= 5 else 0
@@ -466,10 +515,15 @@ def _live_sector_momentum(sector: str, days: int = 20) -> dict:
         else:
             tier, bonus = "NEUTRAL", 0
 
-        return {"rel_5d": round(rel_5d, 2), "rel_20d": round(rel_20d, 2), "momentum_tier": tier, "bonus": bonus}
+        result = {"rel_5d": round(rel_5d, 2), "rel_20d": round(rel_20d, 2),
+                  "momentum_tier": tier, "bonus": bonus}
+        _SECTOR_MOM_CACHE[cache_key] = result
+        return result
+
     except Exception as e:
-        log.debug(f"Sector momentum {sector}: {e}")
-        return {"rel_5d": 0.0, "rel_20d": 0.0, "momentum_tier": "NEUTRAL", "bonus": 0}
+        _YF_FAIL_COUNT += 1
+        log.warning(f"YF fail #{_YF_FAIL_COUNT}: sector momentum {sector} — {e}")
+        return NEUTRAL
 
 def _lookup_sector_nse(sym: str) -> str:
     try:
@@ -1078,7 +1132,8 @@ def _bhavcopy_from_yfinance() -> pd.DataFrame:
         for _attempt in range(3):
             try:
                 raw = yf.download(tickers, period="2d", interval="1d",
-                                  progress=False, auto_adjust=False, group_by="ticker")
+                                  progress=False, auto_adjust=False, group_by="ticker",
+                                  timeout=_YF_DOWNLOAD_TIMEOUT)
                 if raw.empty:
                     break
                 for sym in chunk:
@@ -1204,7 +1259,8 @@ def fetch_history(symbol: str, days: int = 300,
         import yfinance as yf
         end = datetime.today(); start = end - timedelta(days=days + 50)
         raw = yf.download(f"{symbol}.NS", start=start, end=end,
-                          progress=False, auto_adjust=False)
+                          progress=False, auto_adjust=False,
+                          timeout=_YF_DOWNLOAD_TIMEOUT)
         if not raw.empty:
             raw = raw.reset_index()
             raw.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in raw.columns]
@@ -1498,9 +1554,9 @@ def fetch_macro_regime() -> dict:
     FALLBACK = {"macro_state":"CHOP","vix_val":18.0,"nifty_chg":0.0,"breadth_ok":True}
     try:
         import yfinance as yf
-        vix_df   = yf.download("^INDIAVIX", period="5d",  progress=False, auto_adjust=True)
-        nifty_df = yf.download("^NSEI",     period="10d", progress=False, auto_adjust=True)
-        cnx_df   = yf.download("^CNX500",   period="60d", progress=False, auto_adjust=True)
+        vix_df   = yf.download("^INDIAVIX", period="5d",  progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+        nifty_df = yf.download("^NSEI",     period="10d", progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
+        cnx_df   = yf.download("^CNX500",   period="60d", progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
     except Exception:
         return FALLBACK
 
@@ -1551,9 +1607,9 @@ def check_smallcap_cb() -> Tuple[bool, str]:
         else (False, "CB data unavailable — pass")
     try:
         import yfinance as yf
-        df = yf.download("^CNXSC", period="60d", progress=False, auto_adjust=True)
+        df = yf.download("^CNXSC", period="60d", progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
         if df.empty:
-            df = yf.download("NIFTYSMLCAP100.NS", period="60d", progress=False, auto_adjust=True)
+            df = yf.download("NIFTYSMLCAP100.NS", period="60d", progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
         if not df.empty and len(df) >= 20:
             c    = df["Close"].squeeze().values
             ma20 = float(np.mean(c[-20:]))
@@ -1600,7 +1656,7 @@ def _adx(df: pd.DataFrame, period: int = 14) -> float:
 def _mfi(df: pd.DataFrame, period: int = 14) -> float:
     tp  = (df["high"]+df["low"]+df["close"])/3
     rmf = tp*df["volume"]
-    pos = rmf.where(tp>tp.shift(),0); neg=rmf.where(tp<tp.shift(),0)
+    pos = rmf.where(tp>tp.shift(),0); neg=rmf.where(tp<<tp.shift(),0)
     mfr = pos.rolling(period).sum()/neg.rolling(period).sum().replace(0,np.nan)
     s   = 100-(100/(1+mfr))
     v   = float(s.iloc[-1]) if not s.empty else 50.0
@@ -1718,7 +1774,7 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     if sector in SECTOR_INDICES:
         try:
             import yfinance as yf
-            idf = yf.download(f"^{SECTOR_INDICES[sector]}", period="30d", progress=False, auto_adjust=True)
+            idf = yf.download(f"^{SECTOR_INDICES[sector]}", period="30d", progress=False, auto_adjust=True, timeout=_YF_DOWNLOAD_TIMEOUT)
             if not idf.empty and len(idf)>=2:
                 ic = idf["Close"].squeeze().values
                 sect_20 = float((ic[-1]-ic[-20])/ic[-20]*100) if len(ic)>=20 else None
@@ -1740,19 +1796,19 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     entry_zone = ("PRISTINE" if entry_lo<=close<=entry_hi else ("ABOVE" if close>entry_hi else "BELOW"))
 
     # Stop / exits
-    atr_mult = SECTOR_ATR_MULT.get(sector, 1.0) * (0.75 if close<100 else 1.0 if close<300 else 1.40)
+    atr_mult = SECTOR_ATR_MULT.get(sector, 1.0) * (0.75 if close<<100 else 1.0 if close<<300 else 1.40)
     t3 = round(max(close - atr_mult*atr14, close*0.93), 2)
     r1 = round(close*1.15,2); r2=round(close*1.30,2); r3=round(close*1.50,2)
 
     # VCP coil
-    vol_contract = adv20>0 and volume<adv20*0.8
+    vol_contract = adv20>0 and volume<<adv20*0.8
     vcp_coil = ("TIGHT 🟢" if atr14>0 and atr100>0 and (atr14/atr100)<0.70 and vol_contract else "LOOSE")
 
     # VDU (volume dry-up) with price confirmation
     vdu_bars = 0
     if len(hist)>=6 and vol_rel:
         for n in range(3,6):
-            if all(float(hist["volume"].iloc[-(i+1)])<float(hist["volume"].iloc[-(i+2)]) for i in range(n-1)):
+            if all(float(hist["volume"].iloc[-(i+1)])<<float(hist["volume"].iloc[-(i+2)]) for i in range(n-1)):
                 vdu_bars = n
     vdu_confirmed = True
     if vdu_bars>=3:
@@ -1861,17 +1917,17 @@ def _calc_vsa(hist: pd.DataFrame, atr14: float, adv20: float, vol_rel: bool) -> 
         rng=hi-lo
         if rng<=0: continue
         cp=(cl-lo)/rng
-        if sp<0.5*atr14 and vol>1.5*adv20 and cp>=0.60: bull+=1
-        elif sp<0.5*atr14 and vol>1.5*adv20 and cp<=0.40: bear+=1
+        if sp<<0.5*atr14 and vol>1.5*adv20 and cp>=0.60: bull+=1
+        elif sp<<0.5*atr14 and vol>1.5*adv20 and cp<=0.40: bear+=1
     net=bull-bear
     if net>0:  return {"vsa_absorption":True, "vsa_label":f"🟢 VSA Bullish ({bull}b)","vsa_bonus":min(8,bull*4)}
-    elif net<0: return {"vsa_absorption":False,"vsa_label":f"🔴 VSA Dist ({bear}b)","vsa_bonus":-min(4,bear*2)}
+    elif net<<0: return {"vsa_absorption":False,"vsa_label":f"🔴 VSA Dist ({bear}b)","vsa_bonus":-min(4,bear*2)}
     return {"vsa_absorption":False,"vsa_label":"","vsa_bonus":0}
 
 
 def _calc_fog(adx_v: float, adx_prev: float, vix: float, ma50: float, ma200: float, w52_bonus: int) -> dict:
     score=0; reasons=[]
-    if adx_v<=18 and adx_v<adx_prev: score+=1; reasons.append(f"ADX {adx_v:.1f}↓")
+    if adx_v<=18 and adx_v<<adx_prev: score+=1; reasons.append(f"ADX {adx_v:.1f}↓")
     if vix>SNIPER_CFG["vix_fog"]:    score+=1; reasons.append(f"VIX {vix:.1f}>{SNIPER_CFG['vix_fog']:.0f}")
     if ma200>0 and ma50>0 and abs(ma50-ma200)/ma200<=0.03: score+=1; reasons.append("MA compressed")
     if adx_v<=18 and w52_bonus==0:   score+=1; reasons.append("no 52W coil")
@@ -1958,12 +2014,12 @@ def _vol_profile_score(profile: dict, close: float) -> Tuple[float, str]:
     va_lo=profile.get("va_low",0); va_hi=profile.get("va_high",0)
     if va_lo>0 and va_hi>0:
         if va_lo<=close<=va_hi: score+=20; notes.append("INSIDE VA")
-        elif close<va_lo:       score+=8;  notes.append("BELOW VA")
+        elif close<<va_lo:       score+=8;  notes.append("BELOW VA")
     wp=profile.get("whale_pct",0)
     if wp>=35:   score+=25; notes.append(f"WHALE DEF {wp:.0f}%")
     elif wp>=25: score+=15; notes.append(f"Strong POC {wp:.0f}%")
     va_w=(va_hi-va_lo)/poc*100 if poc>0 and va_hi>va_lo else 0
-    if 0<va_w<=8: score+=10; notes.append("TIGHT VA")
+    if 0<<va_w<=8: score+=10; notes.append("TIGHT VA")
     return float(min(100,score))," · ".join(notes) if notes else "Diffuse"
 
 
@@ -1975,7 +2031,7 @@ def _pattern_score(hist: pd.DataFrame, atr14: float, profile: dict) -> Tuple[flo
     if n>=7:
         rng=hi-lo
         if rng[-1]<=rng[-7:].min()+1e-9: score+=20; pats.append("NR7 🌀")
-    if n>=2 and hi[-2]-lo[-2]>0 and (hi[-1]-lo[-1])/(hi[-2]-lo[-2])<0.60:
+    if n>=2 and hi[-2]-lo[-2]>0 and (hi[-1]-lo[-1])/(hi[-2]-lo[-2])<<0.60:
         score+=15; pats.append("Inside-Bar")
     if n>=30:
         pvts=[]
@@ -1988,9 +2044,9 @@ def _pattern_score(hist: pd.DataFrame, atr14: float, profile: dict) -> Tuple[flo
                 score+=30; pats.append(f"VCP-{len(lp)}P 🎯")
     if n>=10:
         r10=cl[-10:]; band=(r10.max()-r10.min())/r10.mean()*100
-        if band<5: score+=15; pats.append(f"Flat-Base({band:.1f}%)")
+        if band<<5: score+=15; pats.append(f"Flat-Base({band:.1f}%)")
     if n>=12:
-        dv=vol[-10:][np.diff(cl[-11:])<0]; md=float(dv.max()) if len(dv)>0 else 0
+        dv=vol[-10:][np.diff(cl[-11:])<<0]; md=float(dv.max()) if len(dv)>0 else 0
         if md>0 and vol[-1]>md and cl[-1]>cl[-2]: score+=20; pats.append("PocketPivot 💉")
     if n>=40:
         mid=n//2
@@ -2458,7 +2514,7 @@ def assemble_pick(
         roe_val, roe_lbl = _fetch_roce(symbol)
         if roe_val is None:
             fil_pts=min(fil_pts,10); fil_det=f"{fil_det} | ⚠️ ROE unverifiable"
-        elif roe_val<5.0:
+        elif roe_val<<5.0:
             fil_pts=min(fil_pts,8); fil_det=f"{fil_det} | ❌ {roe_lbl}"
         else:
             fil_det=f"{fil_det} | ✅ {roe_lbl}"
@@ -2466,7 +2522,7 @@ def assemble_pick(
     # Earnings safety score
     def _earn_pts():
         if earn_days is None: return 20,"No result date"
-        if earn_days<0:
+        if earn_days<<0:
             r=abs(earn_days)
             if r<=5:  return 28,"Results just announced — fresh data"
             elif r<=21: return 25,f"Results {r}td ago — clear runway"
@@ -2994,17 +3050,17 @@ def save_html(picks: list, fii_data: dict, date_label: str):
         for i,r in enumerate(picks,1):
             layers="".join("✓" if r.get(f"layer{n}") else "✗" for n in range(1,4))
             vol_warn='' if r.get("vol_reliable",True) else '<span style="color:#dc2626;font-size:10px"> ⚠️ No Volume</span>'
-            rows+=f"""<tr>
+            rows+=f"""<<tr>
               <td>{i}</td>
               <td><b>{r['symbol']}</b><br><small>{r.get('sector','—')}</small>{vol_warn}</td>
               <td>{r['fused']}/100<br>
                   <small style="color:#6b7280">Fort {r['fort_pct']:.0f}% · APEX {r['apex_composite']}</small><br>
                   <small style="color:#7c3aed">{r['grade']}</small></td>
-              <td><small>Buy ₹{r['buy_lo']}–{r['buy_hi']}<br>SL ₹{r['stop_loss']}<br>R1 ₹{r['r1']} / R2 ₹{r['r2']} / R3 ₹{r['r3']}</small></td>
+              <td><small>Buy ₹{r['buy_lo']}–{r['buy_hi']}<<br>SL ₹{r['stop_loss']}<<br>R1 ₹{r['r1']} / R2 ₹{r['r2']} / R3 ₹{r['r3']}</small></td>
               <td><small>
                 <b>Whale</b> {r['whale_score']:.0f} · <b>Div</b> {r['div_score']:.0f} · <b>VP</b> {r['vp_score']:.0f}<br>
-                <b>Pat</b> {r['pat_score']:.0f} · <b>Bayes</b> {r['bayes_pct']}% · <b>MC</b> {r['mc_survival']}%<br>
-                VPOC {layers} | {r.get('regime','—')} | {r.get('vcp_coil','—')[:5]}<br>
+                <b>Pat</b> {r['pat_score']:.0f} · <b>Bayes</b> {r['bayes_pct']}% · <b>MC</b> {r['mc_survival']}%<<br>
+                VPOC {layers} | {r.get('regime','—')} | {r.get('vcp_coil','—')[:5]}<<br>
                 RSI {r['rsi']} | MFI {r['mfi']} | ADX {r['adx']}
               </small></td>
               <td><small style="color:#555;font-style:italic">{r.get('story','—')}</small></td>
@@ -3700,15 +3756,18 @@ def run():
     sec_counts: dict = {}; globally_capped=[]
     for r in results:
         sec=r["sector"]; cnt=sec_counts.get(sec,0)
-        if cnt<2: globally_capped.append(r); sec_counts[sec]=cnt+1
+        if cnt<<2: globally_capped.append(r); sec_counts[sec]=cnt+1
 
     # ── DYNAMIC BUCKET ALLOCATION ──
     # Batch market cap lookup — vectorized, cached, single yfinance call
 
     def _batch_market_caps(symbols: list, fallback_map: dict) -> dict:
-        """Return {symbol: mcap_in_cr} via batch yfinance tickers + SQLite cache."""
+        """Return {symbol: mcap_in_cr} via batch yfinance tickers + SQLite cache.
+        Uses ThreadPoolExecutor with per-symbol timeout so one slow call
+        cannot block the entire batch."""
         result = {}
-        # 1. Check SQLite cache first
+
+        # 1. SQLite cache
         try:
             con = sqlite3.connect(DB_PATH)
             cached = {r[0]: r[1] for r in con.execute(
@@ -3720,43 +3779,55 @@ def run():
         except Exception:
             cached = {}
 
-        # 2. Batch fetch remaining via yfinance (max 50 per call)
         need_fetch = [s for s in symbols if s not in result]
-        if need_fetch:
+        if not need_fetch:
+            return result
+
+        # 2. Parallel fetch with hard timeout per symbol
+        def _fetch_one(sym):
             try:
                 import yfinance as yf
-                for i in range(0, len(need_fetch), 50):
-                    chunk = need_fetch[i:i+50]
-                    for sym in chunk:
-                        try:
-                            info = yf.Ticker(f"{sym}.NS").info
-                            mc = info.get("marketCap")
-                            if mc:
-                                result[sym] = float(mc) / 1e7
-                        except Exception:
-                            pass
-                        time.sleep(0.05)
-
-                # Cache results
-                try:
-                    con = sqlite3.connect(DB_PATH)
-                    today_iso = datetime.today().isoformat()
-                    for sym, mcap in result.items():
-                        if sym in need_fetch:
-                            con.execute(
-                                "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
-                                (sym, mcap, today_iso)
-                            )
-                    con.commit(); con.close()
-                except Exception:
-                    pass
+                info = yf.Ticker(f"{sym}.NS").info
+                mc = info.get("marketCap")
+                if mc:
+                    return sym, float(mc) / 1e7
             except Exception:
                 pass
+            return sym, fallback_map.get(sym, 100.0)
 
-        # 3. Apply fallbacks for anything still missing
-        for sym in symbols:
-            if sym not in result:
-                result[sym] = fallback_map.get(sym, 100.0)
+        try:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(_fetch_one, sym): sym for sym in need_fetch}
+                for future in futures:
+                    sym = futures[future]
+                    try:
+                        sym_out, mcap = future.result(timeout=_YF_INFO_TIMEOUT)
+                        result[sym_out] = mcap
+                    except FutureTimeoutError:
+                        log.warning(f"Market cap timeout: {sym}")
+                        result[sym] = fallback_map.get(sym, 100.0)
+                    except Exception:
+                        result[sym] = fallback_map.get(sym, 100.0)
+        except Exception as e:
+            log.error(f"Batch market cap executor failed: {e}")
+            for sym in need_fetch:
+                if sym not in result:
+                    result[sym] = fallback_map.get(sym, 100.0)
+
+        # 3. Cache to SQLite
+        try:
+            con = sqlite3.connect(DB_PATH)
+            today_iso = datetime.today().isoformat()
+            for sym, mcap in result.items():
+                if sym in need_fetch:
+                    con.execute(
+                        "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
+                        (sym, mcap, today_iso)
+                    )
+            con.commit()
+            con.close()
+        except Exception:
+            pass
 
         return result
 
