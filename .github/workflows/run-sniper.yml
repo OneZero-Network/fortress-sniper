@@ -122,6 +122,7 @@ jobs:
       - name: 💾 Save DB to cache
         uses: actions/cache/save@v4
         if: always()
+        continue-on-error: true
         with:
           path: outputs/sniper_cache.db
           key: sniper-db-cache
@@ -190,6 +191,7 @@ jobs:
       - name: 💾 Save DB to cache
         uses: actions/cache/save@v4
         if: always() && hashFiles('outputs/sniper_cache.db') != ''
+        continue-on-error: true
         with:
           path: outputs/sniper_cache.db
           key: sniper-db-cache
@@ -247,6 +249,7 @@ jobs:
       - name: 💾 Save DB to cache
         uses: actions/cache/save@v4
         if: always() && hashFiles('outputs/sniper_cache.db') != ''
+        continue-on-error: true
         with:
           path: outputs/sniper_cache.db
           key: sniper-db-cache
