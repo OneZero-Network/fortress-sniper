@@ -1,18 +1,26 @@
 # ═══════════════════════════════════════════════════════════════
-# GitHub Actions: UNIFIED HALAL SNIPER v1.0
-# Schedule: Weekdays at 6:30 PM IST (after NSE market close)
-# Manual trigger: workflow_dispatch (no inputs — clean UI)
+# GitHub Actions: UNIFIED HALAL SNIPER v3.0-M
+# Bismillah — In the name of Allah, the Most Gracious, the Most Merciful
+#
+# Jobs:
+#   1. sniper-run        — daily EOD scan (Mon-Fri 6:30 PM IST)
+#   2. reply-handler     — Telegram reply poller (every 10 min, market hours)
+#   3. weekly-review     — Friday performance summary (4 PM IST)
 # ═══════════════════════════════════════════════════════════════
 
-name: 🕌 Unified Halal Sniper v1.0
+name: 🕌 Unified Halal Sniper v3.0-M
 
 on:
   schedule:
     # 13:00 UTC = 18:30 IST (Mon-Fri after market close)
     - cron: '0 13 * * 1-5'
-  workflow_dispatch:      # ← no inputs block = no right-side box
+  workflow_dispatch:      # manual trigger, no inputs
 
 jobs:
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1 — Main daily sniper run
+  # ─────────────────────────────────────────────────────────────
   sniper-run:
     name: 🔫 Run Unified Sniper
     runs-on: ubuntu-latest
@@ -20,22 +28,25 @@ jobs:
 
     env:
       # ── Secrets ──
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_SHARE_IDS: ${{ secrets.TELEGRAM_SHARE_IDS }}
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+      TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_SHARE_IDS:  ${{ secrets.TELEGRAM_SHARE_IDS }}
+      GOOGLE_SHEET_ID:     ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_CREDS_JSON:   ${{ secrets.GOOGLE_CREDS_JSON }}
       # ── Config ──
-      PAPER_MODE: 'true'
-      FORCE_YFINANCE: 'false'
-      FORCE_SHEETS: 'false'
-      CB_FAIL_SAFE: 'true'
-      ACCOUNT_EQUITY: '500000'
-      ACCOUNT_RISK_PCT: '0.015'
+      PAPER_MODE:           'true'
+      FORCE_YFINANCE:       'false'
+      FORCE_SHEETS:         'false'
+      CB_FAIL_SAFE:         'true'
+      ACCOUNT_EQUITY:       '500000'
+      ACCOUNT_RISK_PCT:     '0.015'
       SHARIAH_CACHE_TTL_DAYS: '1'
-      APEX_TOP_N: '5'
-      APEX_MIN_SCORE: '48'
-      MC_SIMS: '600'
+      APEX_TOP_N:           '5'
+      APEX_MIN_SCORE:       '48'
+      MC_SIMS:              '600'
+      # ── v3.0-M Capacity guard ──
+      CAPACITY_MAX_OPEN:    '4'
+      CAPACITY_MAX_WEEK:    '6'
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────────
@@ -55,11 +66,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. Run the sniper ────────────────────────────────────
-      - name: 🎯 Execute Unified Sniper
-        run: python sniper_unified_v1.py
+      # ── 4. Restore DB cache ──────────────────────────────────
+      - name: 🗄️ Restore DB from cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            sniper-db-${{ runner.os }}-
 
-      # ── 5. Upload artifacts ─────────────────────────────────
+      - name: 📂 Ensure outputs dir
+        run: mkdir -p outputs
+
+      # ── 5. Run the sniper ────────────────────────────────────
+      - name: 🎯 Execute Unified Sniper v3.0-M
+        run: python sniper_unified_v2.py
+
+      # ── 6. Upload artifacts ─────────────────────────────────
       - name: 📤 Upload outputs
         uses: actions/upload-artifact@v4
         if: always()
@@ -71,12 +94,109 @@ jobs:
             outputs/sniper_cache.db
           retention-days: 30
 
-      # ── 6. Commit cache back to repo (optional) ─────────────
-      - name: 💾 Persist cache to repo (optional)
-        if: false
+      # ── 7. Upload reply_handler.py ───────────────────────────
+      - name: 📤 Upload reply_handler
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reply-handler-${{ github.run_id }}
+          path: reply_handler.py
+          retention-days: 90
+
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2 — Telegram reply poller (v3.0-M decision logging)
+  # Polls every 10 min on weekdays during market hours (8:30 AM - 4 PM IST)
+  # ─────────────────────────────────────────────────────────────
+  reply-handler:
+    name: 💬 Process Telegram Replies
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Separate schedule — run on cron independently
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    env:
+      TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      CACHE_PATH:       outputs/sniper_cache.db
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install minimal requirements
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add outputs/sniper_cache.db
-          git diff --cached --quiet || git commit -m "🤖 Auto-update sniper cache [skip ci]"
-          git push
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: 🗄️ Restore DB from cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            sniper-db-${{ runner.os }}-
+
+      - name: 📂 Ensure outputs dir
+        run: mkdir -p outputs
+
+      - name: 💬 Poll Telegram replies
+        run: python reply_handler.py
+
+      - name: 📤 Upload updated DB
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reply-db-${{ github.run_id }}
+          path: outputs/sniper_cache.db
+          retention-days: 7
+
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3 — Weekly review (Fridays 4 PM IST = 10:30 UTC)
+  # ─────────────────────────────────────────────────────────────
+  weekly-review:
+    name: 📊 Weekly Performance Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'workflow_dispatch'   # also triggered by Friday cron below
+
+    env:
+      TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      CACHE_PATH:       outputs/sniper_cache.db
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🗄️ Restore DB from cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            sniper-db-${{ runner.os }}-
+
+      - name: 📂 Ensure outputs dir
+        run: mkdir -p outputs
+
+      - name: 📊 Send weekly review
+        run: python sniper_unified_v2.py --weekly-review
