@@ -5801,6 +5801,9 @@ def _check_sheets_freshness():
                 pass
     except Exception as e:
         log.debug(f"Sheets freshness check: {e}")
+
+
+def _data_quality_gate(bhavcopy: pd.DataFrame, data_source: str) -> dict:
     """
     Auto-adjust thresholds if data quality degrades.
     Returns: {apex_min_score: int, apex_top_n: int, alert: str}
