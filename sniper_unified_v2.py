@@ -3174,6 +3174,81 @@ def _train_meta_labeler(min_samples: int = 50) -> Optional[object]:
         return None
 
 
+def _fit_and_persist_platt_params(X, y, base_model) -> Optional[dict]:
+    """
+    GAP-2 FIX: Extract Platt scaling A/B parameters from a fitted
+    CalibratedClassifierCV and persist them to the platt_calibration DB table.
+
+    The existing training code wraps the model in CalibratedClassifierCV but
+    never writes A/B scalars to the DB — so _load_calibration_params() always
+    returns None, and _platt_calibrate() is always an identity passthrough.
+
+    Why extract A/B instead of just using the wrapped sklearn model?
+    The AI Judge runs in the inference pipeline on individual picks — it calls
+    _platt_calibrate(raw_prob, {A, B}) with a scalar, not a DataFrame.
+    The sklearn CalibratedClassifierCV expects a full feature matrix.
+    A/B extraction gives us the inference-time sigmoid without sklearn dependency.
+
+    Extracts A and B from the first calibrated classifier's sigmoid (Platt method):
+      p_calibrated = 1 / (1 + exp(A * raw_score + B))
+    where raw_score is the uncalibrated model's decision_function or predict_proba output.
+
+    Returns dict with A, B, n_samples, ece (expected calibration error) or None on failure.
+    """
+    try:
+        from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+        from sklearn.metrics import brier_score_loss
+        import numpy as np
+
+        n_samples = len(y)
+        n_folds   = min(5, max(2, n_samples // 10))
+
+        # Fit the Platt-calibrated wrapper
+        platt_clf = CalibratedClassifierCV(base_model, method="sigmoid", cv=n_folds)
+        platt_clf.fit(X, y)
+
+        # Extract A, B from the first calibrator's sigmoid parameters
+        # CalibratedClassifierCV stores calibrators in .calibrated_classifiers_
+        A, B = None, None
+        for cc in getattr(platt_clf, "calibrated_classifiers_", []):
+            for cal in getattr(cc, "calibrators_", []):
+                # sklearn's _SigmoidCalibration stores a_ and b_
+                if hasattr(cal, "a_") and hasattr(cal, "b_"):
+                    A = float(cal.a_)
+                    B = float(cal.b_)
+                    break
+            if A is not None:
+                break
+
+        if A is None:
+            log.warning("Platt param extraction: could not find a_/b_ — sigmoid params unavailable")
+            return None
+
+        # Compute Expected Calibration Error on training set (optimistic but useful for logging)
+        raw_probs = platt_clf.predict_proba(X)[:, 1]
+        brier     = brier_score_loss(y, raw_probs)
+        fraction_pos, mean_pred = calibration_curve(y, raw_probs, n_bins=10, strategy="uniform")
+        ece = float(np.mean(np.abs(fraction_pos - mean_pred)))
+
+        # Persist to DB — _load_calibration_params() will pick this up next run
+        try:
+            with _db_conn(write=True) as con:
+                con.execute(
+                    "INSERT INTO platt_calibration (A, B, n_samples, ece) VALUES (?, ?, ?, ?)",
+                    (A, B, n_samples, round(ece, 4))
+                )
+            log.info(f"Platt params persisted: A={A:.4f} B={B:.4f} | "
+                     f"n={n_samples} | Brier={brier:.4f} | ECE={ece:.4f}")
+        except Exception as db_err:
+            log.warning(f"Platt DB write failed: {db_err}")
+
+        return {"A": A, "B": B, "n_samples": n_samples, "ece": round(ece, 4)}
+
+    except Exception as e:
+        log.warning(f"_fit_and_persist_platt_params failed: {e}")
+        return None
+
+
 def _train_meta_labeler_v2(min_samples: int = 20) -> Optional[object]:
     """
     Meta-labeler v2 (v3.0-M): trains on YOUR decisions, not all signals.
@@ -3334,17 +3409,19 @@ def _train_meta_labeler_v2(min_samples: int = 20) -> Optional[object]:
         # (e.g. _META_VETO_THRESHOLD = 0.40) unreliable.
         # Platt scaling fits a logistic curve on top of the raw scores using
         # cross-validated held-out folds so we don't overfit the calibration.
-        # cv="prefit" is wrong here because we need held-out data for calibration;
-        # we use cv=min(5, n_folds) to match what we have.
-        # After calibration, predict_proba() returns true probability estimates.
+        # GAP-2 FIX: _fit_and_persist_platt_params() extracts A/B scalars AND writes
+        # them to platt_calibration DB so _load_calibration_params() can find them.
+        # The old code called CalibratedClassifierCV but never persisted A/B — the
+        # table was always empty so every run was an identity passthrough.
         n_cal_folds = min(5, max(2, len(X) // 10))   # at least 10 samples per fold
         try:
+            platt_result = _fit_and_persist_platt_params(X, y, model)
             platt_model = CalibratedClassifierCV(model, method="sigmoid", cv=n_cal_folds)
             platt_model.fit(X, y)
-            # Brier score on full set (same data — optimistic, but useful for logging)
             brier = brier_score_loss(y, platt_model.predict_proba(X)[:, 1])
             log.info(f"Platt calibration applied: cv={n_cal_folds} folds | Brier={brier:.4f} "
-                     f"(lower=better; 0.25=random, 0=perfect)")
+                     f"(lower=better; 0.25=random, 0=perfect)"
+                     + (f" | A={platt_result['A']:.4f} B={platt_result['B']:.4f}" if platt_result else " | A/B extraction failed"))
             calibrated_model = platt_model
         except Exception as cal_err:
             log.warning(f"Platt calibration failed ({cal_err}) — using uncalibrated model")
