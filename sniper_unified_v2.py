@@ -99,9 +99,10 @@ CB_FAIL_SAFE     = os.getenv("CB_FAIL_SAFE", "true").lower() == "true"
 ACCOUNT_EQUITY   = float(os.getenv("ACCOUNT_EQUITY", "500000"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "0.015"))
 
-SHARIAH_TTL_DAYS = int(os.getenv("SHARIAH_CACHE_TTL_DAYS", "1"))
+SHARIAH_TTL_DAYS = int(os.getenv("SHARIAH_CACHE_TTL_DAYS", "7"))  # FIX-3: was 1 day; CI IPs blocked so daily re-fetch always fails; extend to 7d
 APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "5"))
 APEX_MIN_SCORE   = int(os.getenv("APEX_MIN_SCORE", "48"))
+NSE_MAX_RETRIES  = int(os.getenv("NSE_MAX_RETRIES", "3"))         # FIX-4: set NSE_MAX_RETRIES=1 in CI env to cut log noise when NSE is blocked
 
 MC_SIMS    = int(os.getenv("MC_SIMS", "600"))
 
@@ -610,6 +611,10 @@ def get_sector(sym: str) -> str:
 def _tg_health_alert(message: str):
     """Send a health-alert Telegram message (best-effort, no crash on failure)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    # FIX-3: Set SUPPRESS_HEALTH_ALERTS=1 in CI env to silence Shariah/yfinance noise
+    if os.getenv("SUPPRESS_HEALTH_ALERTS", "").lower() in ("1", "true", "yes"):
+        log.debug(f"Health alert suppressed: {message[:80]}")
         return
     try:
         requests.post(
@@ -1318,7 +1323,7 @@ def _nse_json(sess: requests.Session, url: str, params: dict = None, timeout: in
     Delays: ~2s, ~4s, ~8s (+ ±25 % jitter each time).
     """
     last_exc: Exception = RuntimeError("unreachable")
-    for attempt in range(3):
+    for attempt in range(NSE_MAX_RETRIES):  # FIX-4: was hardcoded 3; set NSE_MAX_RETRIES=1 in CI
         if attempt:
             base_delay = 2 ** attempt          # 2, 4
             jitter     = base_delay * 0.25 * random.random()
@@ -6031,11 +6036,68 @@ def run():
     log.info(f"FII/DII: {fii_data['label']} | Insider: {len(insider_map)} symbols | "
              f"Filings: {len(filings)} | Earnings: {len(earn_cal)} events")
 
-    # 6. Pre-load all histories via batch yfinance (eliminates per-symbol network calls)
-    log.info("Pre-loading historical data (batch yfinance)…")
-    hist_cache = _preload_histories_yf(cands["symbol"].tolist(), days=300)
+    # 6. Pre-load histories in BACKGROUND — scoring starts immediately (FIX-1).
+    #    Old: blocked entire run waiting for 98-symbol batch download (~3-6 min).
+    #    New: background thread fills hist_cache while scoring loop runs;
+    #         fetch_history() uses cache if available, falls back to individual
+    #         download if the symbol hasn't arrived yet. No gems missed.
+    import threading as _threading
+    hist_cache: Dict[str, pd.DataFrame] = {}
+    _hist_lock  = _threading.Lock()
 
-    # 7. Scoring loop (one loop, both engines fused) — ZERO per-symbol network calls
+    def _bg_preload_histories():
+        end   = datetime.today()
+        start = end - timedelta(days=350)
+        syms  = cands["symbol"].tolist()
+        try:
+            import yfinance as yf
+        except ImportError:
+            return
+        for i in range(0, len(syms), 50):
+            chunk   = syms[i:i + 50]
+            tickers = " ".join(f"{s}.NS" for s in chunk)
+            for attempt in range(2):
+                try:
+                    raw = yf.download(tickers, start=start, end=end,
+                                      progress=False, auto_adjust=False,
+                                      group_by="ticker",
+                                      timeout=_YF_DOWNLOAD_TIMEOUT)
+                    if raw.empty:
+                        break
+                    for sym in chunk:
+                        tk = f"{sym}.NS"
+                        try:
+                            if hasattr(raw.columns, "levels"):
+                                lvl0 = list(raw.columns.get_level_values(0))
+                                lvl1 = list(raw.columns.get_level_values(1))
+                                tk_level = 0 if any(".NS" in str(v) for v in lvl0) else (1 if any(".NS" in str(v) for v in lvl1) else 0)
+                                tickers_in_col = list(raw.columns.get_level_values(tk_level))
+                                sub = (raw.xs(tk, axis=1, level=tk_level) if tk in tickers_in_col
+                                       else (raw[tk] if tk in raw.columns else None))
+                            else:
+                                sub = raw.copy() if len(chunk) == 1 else None
+                            if sub is None or sub.empty:
+                                continue
+                            sub = sub.reset_index()
+                            sub.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in sub.columns]
+                            if "close" not in sub.columns and "adj close" in sub.columns:
+                                sub = sub.rename(columns={"adj close": "close"})
+                            sub["date"] = pd.to_datetime(sub["date"])
+                            df = sub[["date", "open", "high", "low", "close", "volume"]].dropna()
+                            with _hist_lock:
+                                hist_cache[sym.upper()] = _validate_no_lookahead(df)
+                        except Exception:
+                            continue
+                    break
+                except Exception as e:
+                    log.debug(f"BG preload chunk {i}-{i+50} attempt {attempt+1}: {e}")
+                    time.sleep(2 * (attempt + 1))
+
+    _preload_thread = _threading.Thread(target=_bg_preload_histories, daemon=True)
+    _preload_thread.start()
+    log.info(f"Pre-loading {len(cands)} histories in background — scoring starts immediately")
+
+    # 7. Scoring loop (one loop, both engines fused)
     sess    = _get_nse_session()
     results = []
     for i,(_, row) in enumerate(cands.iterrows()):
