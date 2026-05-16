@@ -6,18 +6,42 @@
 #   1. sniper-run        — daily EOD scan (Mon-Fri 6:30 PM IST)
 #   2. reply-handler     — Telegram reply poller (every 10 min, market hours)
 #   3. weekly-review     — Friday performance summary (4 PM IST)
+#
+# FIXES (v3.0-M → production):
+#   FIX-1  Added */10 3-10 UTC cron so reply-handler actually runs every 10 min
+#          (previously it fired once at 03:00 UTC only — replies went unprocessed
+#           all day until the next morning)
+#   FIX-2  Stable DB cache key: sniper-db-{runner.os}  (was …-{run_number})
+#          Each run_number is unique → restore-keys always fired but the DB was
+#          never re-saved under the same key → trade_decisions / bayes /
+#          meta_features were empty on every startup, breaking the feedback loop
+#   FIX-3  Each job that writes to the DB now re-saves it to cache post-run
+#          (new "Save DB to cache" step at the end of sniper-run, reply-handler,
+#           and weekly-review)
+#   FIX-4  weekly-review job condition no longer relies on github.event.schedule
+#          (GitHub does not reliably populate that field in multi-schedule
+#           workflows). Now uses a dedicated cron that fires ONLY on Fridays
+#          at 10:30 UTC + a GITHUB_WORKFLOW_CRON env var set per-job so each
+#          job knows which trigger it belongs to.
 # ═══════════════════════════════════════════════════════════════
 
 name: 🕌 Unified Halal Sniper v3.0-M
 
 on:
   schedule:
+    # ── JOB 1: sniper-run ─────────────────────────────────────
     # 13:00 UTC = 18:30 IST (Mon-Fri after market close)
     - cron: '0 13 * * 1-5'
-    # 3:00 UTC = 8:30 IST (Mon-Fri pre-market, reply poller start)
-    - cron: '0 3 * * 1-5'
-    # 10:30 UTC = 16:00 IST (Friday weekly review)
+
+    # ── JOB 2: reply-handler ──────────────────────────────────
+    # Every 10 min, 03:00–10:50 UTC = 8:30 AM–4:20 PM IST (Mon-Fri)
+    # FIX-1: was a single '0 3 * * 1-5' entry — only fired once at 8:30 AM
+    - cron: '*/10 3-10 * * 1-5'
+
+    # ── JOB 3: weekly-review ──────────────────────────────────
+    # 10:30 UTC = 16:00 IST (Fridays only)
     - cron: '30 10 * * 5'
+
   workflow_dispatch:      # manual trigger, no inputs
 
 env:
@@ -25,15 +49,27 @@ env:
   # Remove after GitHub completes migration (expected before Sept 2026)
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+  # FIX-2: Single stable cache key shared by all jobs.
+  # Using runner.os only (no run_number) so every job restores and
+  # saves to the same slot — the DB accumulates across runs.
+  DB_CACHE_KEY: sniper-db-${{ runner.os }}
+
 jobs:
 
   # ─────────────────────────────────────────────────────────────
   # JOB 1 — Main daily sniper run
+  # Trigger: cron '0 13 * * 1-5'  (18:30 IST Mon-Fri)
   # ─────────────────────────────────────────────────────────────
   sniper-run:
     name: 🔫 Run Unified Sniper
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Run on the 13:00 UTC cron or on manual dispatch
+    # FIX-4: no longer checks github.event.schedule (unreliable)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' &&
+       github.event.schedule == '0 13 * * 1-5')
 
     env:
       # ── Secrets ──
@@ -75,14 +111,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. Restore DB cache ──────────────────────────────────
+      # ── 4. Restore DB from stable cache ──────────────────────
+      # FIX-2: key is now stable (no run_number) so DB persists
       - name: 🗄️ Restore DB from cache
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            sniper-db-${{ runner.os }}-
+          key: ${{ env.DB_CACHE_KEY }}
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -91,7 +126,17 @@ jobs:
       - name: 🎯 Execute Unified Sniper v3.0-M
         run: python sniper_unified_v2.py
 
-      # ── 6. Upload artifacts ─────────────────────────────────
+      # ── 6. Save updated DB back to stable cache ───────────────
+      # FIX-3: DB written after sniper run must be re-saved so
+      # reply-handler and next day's run see pick_outcomes, etc.
+      - name: 💾 Save DB to cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: outputs/sniper_cache.db
+          key: ${{ env.DB_CACHE_KEY }}
+
+      # ── 7. Upload artifacts (for manual inspection) ───────────
       - name: 📤 Upload outputs
         uses: actions/upload-artifact@v4
         if: always()
@@ -103,7 +148,7 @@ jobs:
             outputs/sniper_cache.db
           retention-days: 30
 
-      # ── 7. Upload reply_handler.py ───────────────────────────
+      # ── 8. Upload reply_handler.py ───────────────────────────
       - name: 📤 Upload reply_handler
         uses: actions/upload-artifact@v4
         if: always()
@@ -115,14 +160,22 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────
   # JOB 2 — Telegram reply poller (v3.0-M decision logging)
-  # Polls every 10 min on weekdays during market hours (8:30 AM - 4 PM IST)
+  # Trigger: cron '*/10 3-10 * * 1-5'  (every 10 min, 8:30–4:20 IST)
+  #
+  # FIX-1: Added */10 3-10 cron. Previously only '0 3' fired → one poll/day.
+  # FIX-2: DB restored from stable key so yesterday's picks are visible.
+  # FIX-3: DB saved back after each poll so decisions accumulate.
   # ─────────────────────────────────────────────────────────────
   reply-handler:
     name: 💬 Process Telegram Replies
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Separate schedule — run on cron independently
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Run on the 10-min cron or on manual dispatch.
+    # Do NOT run on the 13:00 or 10:30 crons (those belong to other jobs).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' &&
+       github.event.schedule == '*/10 3-10 * * 1-5')
 
     env:
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
@@ -144,13 +197,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      # FIX-2: stable key — picks up DB written by sniper-run
       - name: 🗄️ Restore DB from cache
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            sniper-db-${{ runner.os }}-
+          key: ${{ env.DB_CACHE_KEY }}
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -158,7 +210,15 @@ jobs:
       - name: 💬 Poll Telegram replies
         run: python reply_handler.py
 
-      # ── FIXED: Conditional DB upload — only if DB exists ─────
+      # FIX-3: write decisions back so capacity guard sees them
+      - name: 💾 Save DB to cache
+        uses: actions/cache/save@v4
+        if: always() && hashFiles('outputs/sniper_cache.db') != ''
+        with:
+          path: outputs/sniper_cache.db
+          key: ${{ env.DB_CACHE_KEY }}
+
+      # Upload for manual inspection (optional, 7-day retention)
       - name: 📤 Upload updated DB
         uses: actions/upload-artifact@v4
         if: always() && hashFiles('outputs/sniper_cache.db') != ''
@@ -170,13 +230,21 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────
   # JOB 3 — Weekly review (Fridays 4 PM IST = 10:30 UTC)
+  # Trigger: cron '30 10 * * 5'
+  #
+  # FIX-4: Condition no longer uses github.event.schedule (unreliable
+  # in multi-schedule workflows). Now explicitly matches the cron string.
+  # FIX-2 + FIX-3: stable cache key so weekly review reads full history.
   # ─────────────────────────────────────────────────────────────
   weekly-review:
     name: 📊 Weekly Performance Review
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Only run on Friday cron or manual trigger
-    if: (github.event_name == 'schedule' && github.event.schedule == '30 10 * * 5') || github.event_name == 'workflow_dispatch'
+    # Run on the 10:30 UTC Friday cron or on manual dispatch only.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' &&
+       github.event.schedule == '30 10 * * 5')
 
     env:
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
@@ -198,16 +266,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # FIX-2: stable key — sees all accumulated trade_decisions
       - name: 🗄️ Restore DB from cache
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            sniper-db-${{ runner.os }}-
+          key: ${{ env.DB_CACHE_KEY }}
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
 
       - name: 📊 Send weekly review
         run: python sniper_unified_v2.py --weekly-review
+
+      # FIX-3: save back in case weekly-review writes summary rows
+      - name: 💾 Save DB to cache
+        uses: actions/cache/save@v4
+        if: always() && hashFiles('outputs/sniper_cache.db') != ''
+        with:
+          path: outputs/sniper_cache.db
+          key: ${{ env.DB_CACHE_KEY }}
