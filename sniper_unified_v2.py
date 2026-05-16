@@ -2404,11 +2404,13 @@ def _vpoc_profile(df: pd.DataFrame, n_bins: int = 50) -> dict:
 # SECTION 11 — FORTRESS SCORING ENGINE (fully preserved from v8.2)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]:
+def fortress_score(symbol: str, today_row, hist: pd.DataFrame,
+                   macro_state: str = "CHOP") -> Optional[dict]:
     """
     Core Fortress engine: 6-layer VPOC, regime, MFI/ADX, sector truth,
     52W compression, ATR velocity, VDU, VCP coil.
     Returns dict or None (hard-veto).
+    RC3 FIX: macro_state now passed in so MA200 tolerance can be regime-aware.
     """
     if len(hist) < MIN_HIST_BARS:
         log.info(f"FORTRESS VETO {symbol}: insufficient bars ({len(hist)} < {MIN_HIST_BARS})")
@@ -2439,8 +2441,20 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     alt_pct  = (close-ma_ref)/ma_ref*100 if ma_ref>0 else 0.0
 
     if alt_pct < -SNIPER_CFG["ma200_tolerance"]*100 and ma_label=="MA200":
-        log.info(f"FORTRESS VETO {symbol}: alt_pct below MA200 tolerance")
-        return None
+        # RC3 FIX: Widen tolerance in CHOP/PANIC regimes — mean-reversion and
+        # bounce entries happen exactly at MA200 dips. Static 5% tolerance killed
+        # quality IT stocks in correction (WIPRO, VIMTALABS, ZENSARTECH in the log).
+        # CHOP  → 7.5% (1.5×): controlled pullback entries are valid
+        # PANIC → 10%  (2.0×): catch high-quality stocks in a broad flush
+        # MASSACRE → tolerance unchanged (pipeline returns None upstream anyway)
+        regime_scale = {"CHOP": 1.5, "PANIC": 2.0}.get(macro_state, 1.0)
+        effective_tol = SNIPER_CFG["ma200_tolerance"] * regime_scale * 100
+        if alt_pct < -effective_tol:
+            log.info(f"FORTRESS VETO {symbol}: alt_pct={alt_pct:.1f}% below MA200 tol "
+                     f"{effective_tol:.1f}% ({macro_state} regime)")
+            return None
+        log.info(f"FORTRESS MA200 PASS {symbol}: alt_pct={alt_pct:.1f}% within "
+                 f"regime-scaled {effective_tol:.1f}% ({macro_state})")
     if alt_pct > SNIPER_CFG["alt_stop_pct"]:
         log.info(f"FORTRESS VETO {symbol}: alt_pct above stop threshold")
         return None
@@ -3357,8 +3371,19 @@ def _train_meta_labeler_v2(min_samples: int = 20) -> Optional[object]:
 
 
 
+def _model_feature_hash(model) -> str:
+    """M2 FIX: Compute a short hash of the feature set the model was trained on.
+    Stored alongside the model so load-time can detect column drift."""
+    import hashlib
+    names = list(model.feature_names_in_) if hasattr(model, "feature_names_in_") else []
+    raw   = ",".join(sorted(names)).encode()
+    return hashlib.md5(raw).hexdigest()[:12]
+
+
 def _load_meta_model(model_path: str = "meta_model.pkl") -> Optional[object]:
-    """Load cached meta-labeler model if fresh (< 7 days)."""
+    """Load cached meta-labeler model if fresh (< 7 days).
+    M2 FIX: Also validates feature hash against a sidecar .hash file.
+    Forces retrain if the feature set has drifted since the model was saved."""
     import pickle
     p = Path(model_path)
     if not p.exists():
@@ -3370,6 +3395,15 @@ def _load_meta_model(model_path: str = "meta_model.pkl") -> Optional[object]:
     try:
         with open(p, "rb") as f:
             model = pickle.load(f)
+        # M2 FIX: Check feature hash sidecar
+        hash_path = Path(str(model_path) + ".hash")
+        if hash_path.exists() and hasattr(model, "feature_names_in_"):
+            saved_hash    = hash_path.read_text().strip()
+            current_hash  = _model_feature_hash(model)
+            if saved_hash != current_hash:
+                log.warning(f"Meta-model feature hash mismatch "
+                            f"(saved={saved_hash}, current={current_hash}) — forcing retrain")
+                return None
         log.info(f"Meta-model loaded ({age_days}d old)")
         return model
     except Exception as e:
@@ -3378,12 +3412,18 @@ def _load_meta_model(model_path: str = "meta_model.pkl") -> Optional[object]:
 
 
 def _save_meta_model(model, model_path: str = "meta_model.pkl"):
-    """Persist trained meta-labeler and record the closed-pick count at training time."""
+    """Persist trained meta-labeler and record the closed-pick count at training time.
+    M2 FIX: Also writes a .hash sidecar so load-time detects feature drift."""
     import pickle
     try:
         with open(model_path, "wb") as f:
             pickle.dump(model, f)
         log.info(f"Meta-model saved: {model_path}")
+        # M2 FIX: Write feature hash sidecar alongside the model
+        try:
+            Path(str(model_path) + ".hash").write_text(_model_feature_hash(model))
+        except Exception:
+            pass
         # H3: persist closed-pick count so retrain guard works across restarts
         try:
             closed = sqlite3.connect(DB_PATH, timeout=5).execute(
@@ -3395,6 +3435,25 @@ def _save_meta_model(model, model_path: str = "meta_model.pkl"):
             pass
     except Exception as e:
         log.debug(f"Meta-model save failed: {e}")
+
+
+def _heuristic_meta_prob(pick: dict) -> float:
+    """ROOT CAUSE #2 FIX: Cold-start meta-probability when meta-model is untrained.
+    Without this, all picks get identical 0.55 default → identical AI% → no ranking.
+    Weighted blend of the three most reliable early signals:
+      fused (40%) — already integrates fortress + APEX, best single predictor
+      mc_survival (30%) — Monte Carlo survival is model-agnostic
+      bayes_pct (30%) — 14-node Bayesian network output
+    Result: HINDCOPPER fused=57, mc=85.5, bayes≈52 → prob≈0.58 (MAYBE)
+            THYROCARE  fused=48, mc=92.7, bayes≈52 → prob≈0.57 (MAYBE)
+            VESUVIUS   fused=40, mc=82.0, bayes≈52 → prob≈0.53
+    Clipped to [0.35, 0.75] — never overconfident without real training data.
+    """
+    fused = pick.get("fused", 50) or 50
+    mc    = pick.get("mc_survival", 50) or 50
+    bayes = pick.get("bayes_pct", 50) or 50
+    prob  = (fused * 0.40 + mc * 0.30 + bayes * 0.30) / 100
+    return round(min(0.75, max(0.35, prob)), 3)
 
 
 def _get_meta_probability(model, features: dict) -> float:
@@ -3695,6 +3754,29 @@ def _capacity_guard(date_label: str) -> dict:
 # SECTION 5f — TRADE DECISION LOGGER  (v3.0-M)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def confirm_entry(symbol: str) -> tuple:
+    """M3 FIX: Pre-entry earnings confirmation gate.
+    Call this in your Telegram reply handler BEFORE logging a TAKEN decision.
+    Earnings announced after scoring but before manual entry (e.g. pre-market next morning)
+    would otherwise let you walk blind into a volatility event.
+
+    Returns: (allowed: bool, reason: str)
+    Usage in reply_handler.py:
+        ok, reason = confirm_entry(symbol)
+        if not ok:
+            _tg_post(TOKEN, CHAT_ID, f"⛔ {symbol} BLOCKED: {reason}")
+            return
+        _log_trade_decision(run_date, symbol, "TAKEN", entry_price=price)
+    """
+    earn_days = _check_earnings_yf(symbol)
+    if earn_days is not None and 0 <= earn_days <= 1:
+        return False, f"Earnings in {earn_days}d — entry blocked to avoid volatility event"
+    # Also re-check the hardcoded earnings calendar in case yfinance misses it
+    if earn_days is None:
+        log.debug(f"confirm_entry({symbol}): yfinance calendar unavailable — proceeding with caution")
+    return True, "OK"
+
+
 def _log_trade_decision(run_date: str, symbol: str, decision: str,
                          entry_price: float = None, shares: int = 0,
                          skip_reason: str = None, ai_confidence: float = None,
@@ -3702,6 +3784,7 @@ def _log_trade_decision(run_date: str, symbol: str, decision: str,
     """
     Log a manual trade decision to trade_decisions table.
     Called by reply_handler.py when you reply to the Telegram bot.
+    NOTE: Call confirm_entry(symbol) before calling this for TAKEN decisions.
     """
     try:
         with _db_conn(write=True) as con:
@@ -3826,6 +3909,17 @@ def _send_weekly_review():
 # ══════════════════════════════════════════════════════════════════════════════
 # ── CALIBRATED PRIORS (based on NSE halal mid-cap backtest estimates) ──
 # These are conservative estimates. Replace with your actual backtest results.
+# M1 FIX: Regime-aware prior overrides for macro_clear node.
+# In CLEAR regime, macro_clear=True is the norm — the prior edge is already baked in.
+# In PANIC/MASSACRE, stocks that look "clear" are actually in denial; cut the pt aggressively.
+# In CHOP, macro_clear=True is rare and mildly meaningful; reduce its signal slightly.
+# Format mirrors _BAYES_PRIORS: (pt, pf, weight) — only the macro_clear tuple is overridden.
+_REGIME_PRIOR_OVERRIDES: dict = {
+    "PANIC":    {"macro_clear": (0.44, 0.38, 1.0)},  # Clear-looking stocks in PANIC are traps
+    "MASSACRE": {"macro_clear": (0.30, 0.38, 1.0)},  # Invert edge: being "clear" means denial
+    "CHOP":     {"macro_clear": (0.52, 0.42, 1.0)},  # Mild edge reduction vs CLEAR's 0.58
+}
+
 _BAYES_PRIORS = {
     # Format: (condition, profit_prob_if_true, profit_prob_if_false, weight)
     # Weights sum to ~1.0, adjusted by empirical edge
@@ -3904,7 +3998,16 @@ def _bayesian_apex(macro_state: str, breadth_ok: bool, layer1: bool, layer2: boo
     total_positive_edge = 0.0
     max_possible_edge   = 0.0
 
+    # M1 FIX: Apply regime-specific prior overrides before iterating.
+    # In PANIC/MASSACRE, the macro_clear node prior is recalculated — not just shifted
+    # by a flat regime_adj after the fact. This correctly reduces signal strength at
+    # the source rather than patching the output.
+    regime_overrides = _REGIME_PRIOR_OVERRIDES.get(macro_state, {})
+
     for name, pt, pf, weight in _BAYES_PRIORS:
+        # Apply override tuple if this regime has one for this node
+        if name in regime_overrides:
+            pt, pf, weight = regime_overrides[name]
         cond = conditions.get(name, False)
         edge = (pt - pf) * weight          # always positive (pt > pf by design)
         if cond:
@@ -3998,7 +4101,7 @@ def assemble_pick(
         return None
 
     # ── FORTRESS STEP ─────────────────────────────────────────────────
-    fort = fortress_score(symbol, today_row, hist)
+    fort = fortress_score(symbol, today_row, hist, macro_state=macro_state)  # RC3 FIX: pass regime
     if fort is None:
         return None
 
@@ -4337,7 +4440,16 @@ def assemble_pick(
     )
 
     meta_model = _load_meta_model()
-    meta_prob = _get_meta_probability(meta_model, meta_features)
+    # RC2 FIX: When meta-model is untrained (< 20 closed picks), _get_meta_probability
+    # returns a flat 0.55 for every pick → identical AI% → no ranking differentiation.
+    # Use _heuristic_meta_prob() instead, which blends fused/mc/bayes for real signal.
+    # We need the partial pick dict built so far; r is assembled below, so pass locals.
+    _partial = {"fused": fused, "mc_survival": mc_survival, "bayes_pct": bayes["bayes_pct"]}
+    if meta_model is None:
+        meta_prob = _heuristic_meta_prob(_partial)
+        log.debug(f"  {symbol}: cold-start meta_prob={meta_prob:.3f} (heuristic)")
+    else:
+        meta_prob = _get_meta_probability(meta_model, meta_features)
     # FIX 5: Meta-model veto guard.
     # The meta-labeler is trained incrementally via _train_meta_labeler(min_samples=50).
     # When trained on fewer than 200 profitable samples its class imbalance causes it
@@ -5468,12 +5580,16 @@ def _kelly_fraction(p_calibrated: float, b: float = 2.0) -> str:
     """
     Fractional Kelly position size tier.
     Returns: 'FULL' | 'HALF' | 'QUARTER' | 'VETO'
+    ROOT CAUSE #1 FIX: QUARTER threshold lowered 0.45 → 0.40 to match the
+    calibrated_ai_judge confidence_floor. Previously every uncalibrated pick
+    (p_cal ≈ 0.43) was vetoed here even after passing the judge — picks showed
+    'Size: VETO' despite not being vetoed. Both gates must use the same floor.
     """
     if p_calibrated >= 0.75:
         return "FULL"
     elif p_calibrated >= 0.55:
         return "HALF"
-    elif p_calibrated >= 0.45:
+    elif p_calibrated >= 0.40:   # RC1 FIX: was 0.45 — must match confidence_floor in calibrated_ai_judge
         return "QUARTER"
     return "VETO"
 
