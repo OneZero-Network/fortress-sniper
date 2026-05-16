@@ -1,6 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
 # GitHub Actions: UNIFIED HALAL SNIPER v3.0-M
-# Single-file production fix
 # ═══════════════════════════════════════════════════════════════
 
 name: 🕌 Unified Halal Sniper v3.0-M
@@ -79,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      DB_CACHE_KEY: sniper-db-${{ runner.os }}
+      DB_CACHE_KEY: sniper-db-cache
       TELEGRAM_TOKEN:      ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_SHARE_IDS:  ${{ secrets.TELEGRAM_SHARE_IDS }}
@@ -117,7 +116,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
+          key: sniper-db-cache
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -130,7 +129,7 @@ jobs:
         if: always()
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
+          key: sniper-db-cache
 
       - name: 📤 Upload outputs
         uses: actions/upload-artifact@v4
@@ -162,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      DB_CACHE_KEY: sniper-db-${{ runner.os }}
+      DB_CACHE_KEY: sniper-db-cache
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CACHE_PATH:       outputs/sniper_cache.db
@@ -186,7 +185,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
+          key: sniper-db-cache
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -199,7 +198,7 @@ jobs:
         if: always() && hashFiles('outputs/sniper_cache.db') != ''
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
+          key: sniper-db-cache
 
       - name: 📤 Upload updated DB
         uses: actions/upload-artifact@v4
@@ -220,7 +219,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      DB_CACHE_KEY: sniper-db-${{ runner.os }}
+      DB_CACHE_KEY: sniper-db-cache
       TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CACHE_PATH:       outputs/sniper_cache.db
@@ -244,7 +243,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
+          key: sniper-db-cache
 
       - name: 📂 Ensure outputs dir
         run: mkdir -p outputs
@@ -257,4 +256,4 @@ jobs:
         if: always() && hashFiles('outputs/sniper_cache.db') != ''
         with:
           path: outputs/sniper_cache.db
-          key: ${{ env.DB_CACHE_KEY }}
+          key: sniper-db-cache
