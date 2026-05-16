@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   UNIFIED HALAL SNIPER v4.1-M — FORTRESS × APEX × CALIBRATED AI JUDGE     ║
+║   UNIFIED HALAL SNIPER v4.2-M — FORTRESS × APEX × CALIBRATED AI JUDGE     ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   ARCHITECTURE                                                               ║
@@ -8,6 +8,31 @@
 ║   ONE pipeline. ONE halal guard. ONE DB. ONE macro fetch.                   ║
 ║   Fortress scoring + APEX 7-engine composite run together,                  ║
 ║   ranked by a single fused score, sent in one clean Telegram message.       ║
+║                                                                              ║
+║   v4.2-M UPGRADES (audit-driven, 2026-05-16)                                ║
+║   ─────────────────────────────────────────────────────────────             ║
+║   FIX-A1 NSE LOG ORDER: fetch_history() now checks _NSE_IP_BLOCKED before   ║
+║           retrying NSE. Stops 3 JSONDecodeError warnings appearing between   ║
+║           a symbol's ✅ log and the next FORTRESS line. Log is now clean.    ║
+║   FIX-A2 SHARIAH ALERT REMOVED: _tg_health_alert() call stripped from       ║
+║           _fetch_shariah_csv(). CI runs no longer spam Telegram when NSE     ║
+║           blocks the CSV URL. log.error() kept for Actions log visibility.   ║
+║   FIX-A3 HALAL SYNC: ITC (tobacco) added to HALAL_EXCLUDED pre-filter to    ║
+║           match _HALAL_L1_VETO_SYMBOLS. Eliminates L1/pre-filter divergence. ║
+║   FIX-A4 INTEREST INCOME CHECK: _halal_l2_financial_veto() now also vetoes  ║
+║           symbols with netInterestIncome/totalRevenue ≥ 30% (NBFC guard).   ║
+║   FIX-A5 ILLIQUID ASSETS: _halal_l4_llm_screen() prompt extended with       ║
+║           illiquid_asset_risk field. HIGH → -15 score penalty applied in     ║
+║           halal_ai_screen(). Catches derivative-heavy business models.       ║
+║   FIX-A6 DB BACKUP: _backup_db_to_sheets() added, called from weekly agent. ║
+║           Exports last 500 pick_outcomes rows to BACKUP Sheets tab.          ║
+║   FIX-A7 LEAKED CONNECTIONS: _load_shariah_db() and _save_shariah_db() now  ║
+║           use _db_conn() context manager (missed in SQL-001 bugfix pass).    ║
+║   FIX-A8 AUTO-EXPIRE STALE POSITIONS: _auto_expire_stale_positions() added, ║
+║           called at run() start. Marks positions > MC_HORIZON+2 days old as  ║
+║           expired so capacity guard is not blocked by 31+ ghost positions.   ║
+║   FIX-A9 COLD-START DISPLAY: top-picks log now appends (COLD) label when     ║
+║           meta-model is untrained, so flat Cal% reads as expected not broken. ║
 ║                                                                              ║
 ║   v4.1-M UPGRADES (audit-driven, 2026-05-16)                                ║
 ║   ─────────────────────────────────────────────────────────────             ║
@@ -79,7 +104,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.1-M"
+VERSION = "UNIFIED v4.2-M"
 
 # ── Event-Driven Pipeline Infrastructure ──────────────────────────────────────
 # Producer threads push MarketEvents into the queue.
@@ -580,6 +605,7 @@ HALAL_EXCLUDED = {
     "RECLTD","PFC","IRFC","HUDCO","PNBHOUSING",
     "HDFCLIFE","SBILIFE","ICICIPRU","LICI","STARHEALTH","GICRE","NIACL",
     "LTIM","NIFTYBEES","JUNIORBEES","GOLDBEES","BANKBEES","LIQUIDBEES",
+    "ITC",   # FIX-A3: tobacco — already in _HALAL_L1_VETO_SYMBOLS; synced to pre-filter
 }
 
 HALAL_KW = (
@@ -937,45 +963,43 @@ def _fetch_shariah_csv() -> set:
         "Shariah CSV: all 3 URLs failed — falling back to hardcoded list. "
         "Halal screening is DEGRADED. Check niftyindices.com reachability."
     )
-    # BUG#7 FIX: Only send Telegram alert when ALL sources fail AND no DB cache exists.
-    # Previously this fired every run when NSE blocks the CI IP — spamming the channel.
-    # The alert is now suppressed when a valid DB cache will be used as fallback.
-    _db_cache = _load_shariah_db()
-    if len(_db_cache) < 100:
-        # No usable DB cache either — genuinely degraded, alert warranted
-        _tg_health_alert(
-            "⚠️ Shariah CSV fetch FAILED (all 3 URLs). "
-            "Running on hardcoded fallback list — halal screening may be stale."
-        )
+    # FIX-A2: Removed _tg_health_alert() call — CI runs on blocked NSE IPs were
+    # spamming Telegram on every cold-start run. Degradation is visible in the
+    # Actions log via log.error() above. Alert only warranted for genuinely novel
+    # failures; the hardcoded fallback list keeps halal screening functional.
+    db_cache_size = len(_load_shariah_db())
+    if db_cache_size >= 100:
+        log.info(f"Shariah CSV fetch failed but DB cache has {db_cache_size} symbols — using cache")
     else:
-        log.info(f"Shariah CSV fetch failed but DB cache has {len(_db_cache)} symbols — no alert sent")
+        log.warning("Shariah CSV fetch failed AND DB cache is empty — using hardcoded fallback list")
     return set()
 
 
 def _load_shariah_db() -> set:
+    # FIX-A7: use _db_conn() context manager — raw sqlite3.connect() was leaked
+    # on any exception (missed in SQL-001 bugfix pass).
     try:
-        con = sqlite3.connect(DB_PATH)
-        row = con.execute("SELECT symbol, cached_date FROM halal_cache LIMIT 1").fetchone()
-        if row:
-            age = (datetime.today().date() - datetime.strptime(row[1], "%Y-%m-%d").date()).days
-            if age <= SHARIAH_TTL_DAYS:
-                syms = {r[0] for r in con.execute("SELECT symbol FROM halal_cache").fetchall()}
-                con.close()
-                return syms
-        con.close()
+        with _db_conn() as con:
+            row = con.execute("SELECT symbol, cached_date FROM halal_cache LIMIT 1").fetchone()
+            if row:
+                age = (datetime.today().date() - datetime.strptime(row[1], "%Y-%m-%d").date()).days
+                if age <= SHARIAH_TTL_DAYS:
+                    return {r[0] for r in con.execute("SELECT symbol FROM halal_cache").fetchall()}
     except Exception:
         pass
     return set()
 
 
 def _save_shariah_db(syms: set):
+    # FIX-A7: use _db_conn(write=True) context manager for guaranteed close + commit.
     try:
         today = datetime.today().strftime("%Y-%m-%d")
-        con   = sqlite3.connect(DB_PATH)
-        con.execute("DELETE FROM halal_cache")
-        con.executemany("INSERT OR REPLACE INTO halal_cache (symbol, cached_date) VALUES (?,?)",
-                        [(s, today) for s in syms])
-        con.commit(); con.close()
+        with _db_conn(write=True) as con:
+            con.execute("DELETE FROM halal_cache")
+            con.executemany(
+                "INSERT OR REPLACE INTO halal_cache (symbol, cached_date) VALUES (?,?)",
+                [(s, today) for s in syms]
+            )
     except Exception as e:
         log.debug(f"Shariah DB save: {e}")
 
@@ -1086,10 +1110,13 @@ def _halal_l1_business_veto(symbol: str) -> bool:
 
 def _halal_l2_financial_veto(symbol: str) -> Tuple[bool, float]:
     """
-    Layer 2: Debt/MarketCap < 33% check.
+    Layer 2: Debt/MarketCap < 33% check + interest income ratio check.
     Returns (veto, debt_to_mcap). Defaults to (False, -1.0) on data failure.
     FIX-4.1-M: returns -1.0 (sentinel) when data unavailable so caller can
     apply a data-unavailable penalty instead of silently passing as debt=0.
+    FIX-A4: Also vetos when netInterestIncome/totalRevenue >= 30%.
+    This catches NBFCs and bank subsidiaries that pass the debt screen
+    (low borrowings on balance sheet) but derive most revenue from lending.
     """
     try:
         con = sqlite3.connect(DB_PATH, timeout=5)
@@ -1112,6 +1139,19 @@ def _halal_l2_financial_veto(symbol: str) -> Tuple[bool, float]:
         info   = yf.Ticker(f"{symbol}.NS").info
         debt   = float(info.get("totalDebt") or 0)
         mcap   = float(info.get("marketCap") or 0)
+
+        # FIX-A4: Interest income ratio guard
+        # netInterestIncome > 0 means a lending business (banks, NBFCs).
+        # If >30% of total revenue is from interest, it is functionally a lender.
+        net_interest = float(info.get("netInterestIncome") or 0)
+        total_rev    = float(info.get("totalRevenue") or 0)
+        if net_interest > 0 and total_rev > 0:
+            interest_ratio = net_interest / total_rev
+            if interest_ratio >= 0.30:
+                dtm = round(debt / mcap, 4) if mcap > 0 else -1.0
+                log.debug(f"L2 interest-income veto {symbol}: {interest_ratio:.1%} >= 30%")
+                return True, dtm
+
         if mcap > 0:
             dtm = round(debt / mcap, 4)
             return dtm >= 0.33, dtm
@@ -1127,7 +1167,8 @@ def _halal_l3_ethical_score(symbol: str, sector: str) -> int:
 
 
 def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> dict:
-    """Layer 4: LLM business model analysis via Claude Sonnet (optional)."""
+    """Layer 4: LLM business model analysis via Claude Sonnet (optional).
+    FIX-A5: prompt extended with illiquid_asset_risk to catch derivative-heavy models."""
     if not _ANTHROPIC_OK:
         return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "DISABLED"}
 
@@ -1148,11 +1189,14 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
         '"business_concern": "brief concern or NONE", '
         '"revenue_model": "fee_based|interest_based|mixed|manufacturing|services", '
         '"subsidiary_risk": "LOW|MEDIUM|HIGH", '
+        '"illiquid_asset_risk": "LOW|MEDIUM|HIGH", '
         '"manual_review_needed": true|false}\n\n'
         "1.0 = clearly permissible, 0.0 = clearly impermissible. "
-        "Be conservative — when uncertain, lower confidence."
+        "Be conservative — when uncertain, lower confidence.\n"
+        "illiquid_asset_risk: HIGH if >20% of assets/revenue derive from derivatives, "
+        "futures, speculative trading, or non-productive financial instruments."
     )
-    raw = _call_claude(prompt, max_tokens=300)
+    raw = _call_claude(prompt, max_tokens=350)
     if not raw:
         return {"llm_confidence": 0.5, "llm_flags": [], "llm_source": "FAILED"}
 
@@ -1160,12 +1204,13 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
         txt = raw.strip().replace("```json", "").replace("```", "")
         parsed = json.loads(txt)
         result = {
-            "llm_confidence":       max(0.0, min(1.0, float(parsed.get("halal_confidence", 0.5)))),
-            "llm_business_concern": str(parsed.get("business_concern", ""))[:100],
-            "llm_revenue_model":    str(parsed.get("revenue_model", "unknown")),
-            "llm_subsidiary_risk":  str(parsed.get("subsidiary_risk", "MEDIUM")),
-            "llm_manual_review":    bool(parsed.get("manual_review_needed", False)),
-            "llm_source":           CLAUDE_MODEL,
+            "llm_confidence":        max(0.0, min(1.0, float(parsed.get("halal_confidence", 0.5)))),
+            "llm_business_concern":  str(parsed.get("business_concern", ""))[:100],
+            "llm_revenue_model":     str(parsed.get("revenue_model", "unknown")),
+            "llm_subsidiary_risk":   str(parsed.get("subsidiary_risk", "MEDIUM")),
+            "llm_illiquid_risk":     str(parsed.get("illiquid_asset_risk", "LOW")),  # FIX-A5
+            "llm_manual_review":     bool(parsed.get("manual_review_needed", False)),
+            "llm_source":            CLAUDE_MODEL,
         }
         _llm_store_cache(cache_key, "halal_l4", json.dumps(result), CLAUDE_MODEL)
         return result
@@ -1269,6 +1314,16 @@ def halal_ai_screen(symbol: str, sector: str = "DIVERSIFIED",
     if _ANTHROPIC_OK:
         llm_delta = int((llm_conf - 0.5) * 20)
         base_score = max(0, min(100, base_score + llm_delta))
+
+        # FIX-A5: illiquid_asset_risk penalty — HIGH = -15, MEDIUM = -5, LOW = 0
+        # Catches derivative-heavy or speculative businesses that pass debt/interest screens.
+        illiquid_risk = llm.get("llm_illiquid_risk", "LOW")
+        if illiquid_risk == "HIGH":
+            base_score = max(0, base_score - 15)
+            log.debug(f"L4 illiquid_asset_risk HIGH for {sym} — -15 score penalty")
+        elif illiquid_risk == "MEDIUM":
+            base_score = max(0, base_score - 5)
+
         if llm_conf < 0.30:
             result = {"score": 0, "veto": True, "tier": "HARAM",
                       "debt_to_mcap": debt_to_mcap, "business_model": llm_model,
@@ -2077,8 +2132,16 @@ def fetch_history(symbol: str, days: int = 300,
         if len(df) >= MIN_HIST_BARS:
             return df
 
-    # NSE API (skip entirely if we already know it is down)
-    if _NSE_HISTORY_OK is not False:
+    # NSE API (skip entirely if we already know it is down or IP-blocked)
+    # FIX-A1: Check _NSE_IP_BLOCKED first — when GitHub Actions IP is banned,
+    # every symbol previously burned 3 retries + session rebuild, producing
+    # 3 JSONDecodeError warnings between each ✅ and the next FORTRESS line.
+    # Now we skip NSE the instant the circuit trips (_NSE_IP_BLOCKED=True after
+    # _NSE_FAIL_THRESHOLD consecutive failures) rather than waiting for
+    # _NSE_HISTORY_OK=False (which only trips after the first individual call fails).
+    with _NSE_FAIL_LOCK:
+        _nse_globally_blocked = _NSE_IP_BLOCKED
+    if _NSE_HISTORY_OK is not False and not _nse_globally_blocked:
         try:
             if sess is None:
                 sess = _get_nse_session()
@@ -6084,6 +6147,67 @@ def calibrated_ai_judge(pick: dict, halal: dict, macro: dict,
 # [PATCH-D]  NO-RESPONSE = SKIPPED  (v4.0-M — Step 8 EOD auto-log)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _auto_expire_stale_positions():
+    """
+    FIX-A8: Mark pick_outcomes rows that are still 'open' but older than
+    MC_HORIZON + 2 days as 'expired'. This prevents the capacity guard from
+    being permanently blocked by ghost positions that were never replied to.
+
+    Root cause: picks with no Telegram reply stay status='open' forever.
+    _auto_log_skipped_picks() marks trade_decisions as SKIPPED but does NOT
+    update pick_outcomes.status. After MC_HORIZON days those picks can never
+    hit a target, so they should expire automatically.
+
+    Called at the START of run() — before capacity guard — so today's run
+    is not blocked by yesterday's (or last month's) unresolved positions.
+    """
+    cutoff = (datetime.today() - timedelta(days=MC_HORIZON + 2)).strftime("%Y-%m-%d")
+    try:
+        with _db_conn(write=True) as con:
+            expired = con.execute(
+                "UPDATE pick_outcomes SET status='expired', exit_date=?, updated_at=? "
+                "WHERE status='open' AND run_date < ?",
+                (datetime.today().strftime("%Y-%m-%d"),
+                 datetime.today().isoformat(), cutoff)
+            ).rowcount
+        if expired:
+            log.info(f"Auto-expired {expired} stale open position(s) older than {MC_HORIZON}d")
+        else:
+            log.debug("Auto-expire: no stale positions found")
+    except Exception as e:
+        log.debug(f"Auto-expire stale positions: {e}")
+
+
+def _backup_db_to_sheets():
+    """
+    FIX-A6: Export last 500 pick_outcomes rows to a BACKUP tab in Google Sheets.
+    Called from _weekly_ai_status_agent() so history survives GitHub Actions
+    cache eviction (7-day TTL by default). Read-only — never mutates DB.
+    """
+    if not _sheets_ok():
+        log.debug("DB backup to Sheets skipped — Sheets not configured")
+        return
+    try:
+        with _db_conn() as con:
+            rows = con.execute(
+                "SELECT run_date, symbol, grade, fused_score, status, "
+                "exit_price, pnl_pct, days_held, hit_target, story "
+                "FROM pick_outcomes "
+                "ORDER BY run_date DESC LIMIT 500"
+            ).fetchall()
+        if not rows:
+            log.info("DB backup: no pick_outcomes rows to export")
+            return
+        header = [["run_date","symbol","grade","fused_score","status",
+                   "exit_price","pnl_pct","days_held","hit_target","story",
+                   f"exported_at: {datetime.today().isoformat()}"]]
+        data   = [list(r) for r in rows]
+        _push_sheet("DB_BACKUP", header + data)
+        log.info(f"DB backup: {len(rows)} pick_outcomes rows → Sheets DB_BACKUP ✅")
+    except Exception as e:
+        log.warning(f"DB backup to Sheets failed: {e}")
+
+
 def _auto_log_skipped_picks(date_label: str):
     """
     Auto-log all today's AI-passed picks that received no Telegram reply as SKIPPED.
@@ -6222,7 +6346,13 @@ def _weekly_ai_status_agent():
     Step 10: Weekly AI Status Agent.
     Reads performance data, generates observations via GPT-4o (batch).
     NEVER mutates DB or parameters. Falls back to _send_weekly_review() if no LLM key.
+    FIX-A6: also triggers DB backup to Sheets so pick history survives cache eviction.
     """
+    # FIX-A6: Backup DB to Sheets at the start of weekly review.
+    # GitHub Actions cache TTL is 7 days — the weekly run is the perfect trigger
+    # to ensure history is preserved before it can expire.
+    _backup_db_to_sheets()
+
     if not (_ANTHROPIC_OK or _OPENAI_OK):
         _send_weekly_review()
         return
@@ -6504,6 +6634,10 @@ def run():
         _NSE_CONSECUTIVE_FAILS = 0
         _NSE_IP_BLOCKED        = False
     _NSE_HISTORY_OK = None   # re-probe NSE at start of each run
+
+    # FIX-A8: Expire stale ghost positions FIRST — must run before capacity guard
+    # and before _run_outcome_engine() so counts are accurate throughout this run.
+    _auto_expire_stale_positions()
 
     # FEEDBACK LOOP (run first -- update yesterday before scoring today)
     # ---------------------------------------------------------------
@@ -6968,13 +7102,17 @@ def run():
     log.info(f"\n{'='*70}")
     log.info(f"⚔️  TOP {len(top_picks)} PICKS")
     log.info(f"{'='*70}")
+    # FIX-A9: show (COLD) label when meta-model is not yet trained so users
+    # understand why all Cal% values are identical — it's expected, not broken.
+    _meta_model_trained = _load_meta_model() is not None
+    _cold_label = "" if _meta_model_trained else " (COLD)"
     for rank, r in enumerate(top_picks, 1):
         vn = "" if r.get("vol_reliable",True) else " [NO-VOL]"
         log.info(f"  #{rank} {r['symbol']:12s} | Fused {r['fused']}/100 | Fort {r['fort_pct']:.0f}% "
                  f"| APEX {r['apex_composite']}/100 | {r['grade']}{vn} "
                  f"| AI {round(r.get('meta_prob',0.55)*100)}% [{r.get('worth_flag','—')}] "
-                 f"| Halal: {r.get('halal_detail',{}).get('tier','?')}/{r.get('halal_detail',{}).get('score','?')}"  
-                 f"| Cal: {r.get('calibrated_confidence',r.get('meta_prob',0)):.0%} | Size: {r.get('position_size_tier','?')}")
+                 f"| Halal: {r.get('halal_detail',{}).get('tier','?')}/{r.get('halal_detail',{}).get('score','?')}"
+                 f"| Cal: {r.get('calibrated_confidence',r.get('meta_prob',0)):.0%}{_cold_label} | Size: {r.get('position_size_tier','?')}")
         log.info(f"       Buy ₹{r['buy_lo']}-{r['buy_hi']} | SL ₹{r['stop_loss']} | "
                  f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
         log.info(f"       {r['story'][:80]}")
