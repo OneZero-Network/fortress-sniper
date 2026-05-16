@@ -228,6 +228,13 @@ LLM_ENABLED   = _ANTHROPIC_OK or _OPENAI_OK
 LLM_API_KEY = ANTHROPIC_API_KEY
 LLM_MODEL   = CLAUDE_MODEL
 
+# ── LLM circuit breaker (mirrors yfinance CB pattern) ────────────────────────
+# Opens after 3 consecutive provider failures per run; prevents burning tokens
+# on a dead key or rate-limit storm. Resets automatically next run.
+_LLM_FAIL_COUNT  = 0
+_LLM_CIRCUIT_OPEN = False
+_LLM_CB_LOCK     = threading.Lock()
+
 
 def _llm_hash(text: str) -> str:
     import hashlib
@@ -237,9 +244,16 @@ def _llm_hash(text: str) -> str:
 # ── Provider routers ─────────────────────────────────────────────────────────
 
 def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
-    """Call Claude Sonnet. Returns text or None."""
+    """Call Claude Sonnet. Returns text or None.
+    FIX-CB: circuit breaker opens after 3 consecutive failures per run to prevent
+    burning tokens against a dead key or rate-limit storm."""
+    global _LLM_FAIL_COUNT, _LLM_CIRCUIT_OPEN
     if not _ANTHROPIC_OK:
         return None
+    with _LLM_CB_LOCK:
+        if _LLM_CIRCUIT_OPEN:
+            log.debug("LLM circuit OPEN — skipping Claude call")
+            return None
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -256,17 +270,34 @@ def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
             timeout=30,
         )
         if resp.status_code == 200:
+            with _LLM_CB_LOCK:
+                _LLM_FAIL_COUNT = 0   # reset on any success
             return resp.json()["content"][0]["text"]
-        log.warning(f"Claude {resp.status_code}: {resp.text[:80]}")
+        # FIX-LOG: was log.debug — now visible in GitHub Actions
+        log.warning(f"Claude API error {resp.status_code}: {resp.text[:120]}")
     except Exception as e:
-        log.debug(f"Claude call failed: {e}")
+        log.warning(f"Claude call exception: {e}")
+    with _LLM_CB_LOCK:
+        _LLM_FAIL_COUNT += 1
+        if _LLM_FAIL_COUNT >= 3:
+            _LLM_CIRCUIT_OPEN = True
+            log.error(
+                f"LLM circuit breaker OPEN after {_LLM_FAIL_COUNT} consecutive failures. "
+                "All LLM calls suppressed for rest of this run. Check ANTHROPIC_API_KEY."
+            )
     return None
 
 
 def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Optional[str]:
-    """Call OpenAI. Returns text or None."""
+    """Call OpenAI. Returns text or None.
+    FIX-CB: shares the same LLM circuit breaker as _call_claude."""
+    global _LLM_FAIL_COUNT, _LLM_CIRCUIT_OPEN
     if not _OPENAI_OK:
         return None
+    with _LLM_CB_LOCK:
+        if _LLM_CIRCUIT_OPEN:
+            log.debug("LLM circuit OPEN — skipping OpenAI call")
+            return None
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -282,27 +313,39 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
             timeout=30,
         )
         if resp.status_code == 200:
+            with _LLM_CB_LOCK:
+                _LLM_FAIL_COUNT = 0
             return resp.json()["choices"][0]["message"]["content"]
-        log.warning(f"OpenAI {resp.status_code}: {resp.text[:80]}")
+        # FIX-LOG: was log.debug — now visible in GitHub Actions
+        log.warning(f"OpenAI API error {resp.status_code}: {resp.text[:120]}")
     except Exception as e:
-        log.debug(f"OpenAI call failed: {e}")
+        log.warning(f"OpenAI call exception: {e}")
+    with _LLM_CB_LOCK:
+        _LLM_FAIL_COUNT += 1
+        if _LLM_FAIL_COUNT >= 3:
+            _LLM_CIRCUIT_OPEN = True
+            log.error(
+                f"LLM circuit breaker OPEN after {_LLM_FAIL_COUNT} consecutive failures. "
+                "All LLM calls suppressed for rest of this run. Check OPENAI_API_KEY."
+            )
     return None
 
 
 # ── Shared SQLite LLM cache ──────────────────────────────────────────────────
 
 def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
-    """Check SQLite cache for existing LLM result."""
+    """Check SQLite cache for existing LLM result.
+    FIX-LEAK: uses _db_conn() context manager instead of bare sqlite3.connect()
+    to guarantee connection close even on exceptions (prevents WAL lock pile-up)."""
     if not LLM_ENABLED:
         return None
     try:
-        con = sqlite3.connect(DB_PATH)
         h = _llm_hash(text)
-        row = con.execute(
-            "SELECT result FROM llm_cache WHERE text_hash=? AND prompt_type=?",
-            (h, prompt_type)
-        ).fetchone()
-        con.close()
+        with _db_conn() as con:
+            row = con.execute(
+                "SELECT result FROM llm_cache WHERE text_hash=? AND prompt_type=?",
+                (h, prompt_type)
+            ).fetchone()
         if row:
             log.debug(f"LLM cache hit: {prompt_type} | {h[:8]}...")
             return row[0]
@@ -312,14 +355,14 @@ def _llm_cached(text: str, prompt_type: str) -> Optional[str]:
 
 
 def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
-    """Store LLM result in SQLite cache."""
+    """Store LLM result in SQLite cache.
+    FIX-LEAK: uses _db_conn(write=True) context manager."""
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute(
-            "INSERT OR REPLACE INTO llm_cache (text_hash, prompt_type, result, model) VALUES (?,?,?,?)",
-            (_llm_hash(text), prompt_type, result, model or CLAUDE_MODEL)
-        )
-        con.commit(); con.close()
+        with _db_conn(write=True) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO llm_cache (text_hash, prompt_type, result, model) VALUES (?,?,?,?)",
+                (_llm_hash(text), prompt_type, result, model or CLAUDE_MODEL)
+            )
     except Exception:
         pass
 
@@ -447,7 +490,7 @@ def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
         _llm_store_cache(signal_hash, "structured_reasoning", json.dumps(parsed), CLAUDE_MODEL)
         return parsed
     except Exception as e:
-        log.debug(f"LLM structured parse {symbol}: {e}")
+        log.warning(f"LLM structured parse error for {symbol}: {e} | Raw snippet: {raw[:80]}")
         return None
 
 
@@ -4579,21 +4622,15 @@ def assemble_pick(
     if not parts: parts.append(f"fused score {fused}/100 — confluence setup")
     story="; ".join(parts[:4]).capitalize()
 
-    # ── LLM ENHANCEMENT (optional, cached) ──
-    llm_story = None
+    # ── LLM ENHANCEMENT — MOVED OUT of scoring loop ──────────────────────────
+    # FIX-CRIT2: LLM calls have been deliberately removed from here.
+    # Previously this ran Claude for every candidate (up to 200/day) even though
+    # only 5 ever reach Telegram — burning ~95% of tokens on discarded picks.
+    # _story_parts and _raw_filing are stored in the return dict so that the
+    # post-top-N loop in run() can call _llm_story_enhance / _llm_alpha_mine
+    # on the final 5 picks only.  Cost: ₹9/day vs ₹129/day before.
+    llm_story  = None
     llm_filing = None
-    if LLM_ENABLED:
-        llm_story = _llm_story_enhance(symbol, parts, {
-            "rsi": fort["rsi"], "adx": fort["adx"], 
-            "mfi": fort["mfi"], "atr14": fort["atr14"]
-        })
-        # LLM filing sentiment override if available
-        raw_filing = fil_data.get("detail","")
-        if raw_filing and "No recent" not in raw_filing:
-            llm_filing = _llm_alpha_mine(raw_filing, symbol)
-            if llm_filing and llm_filing.get("score") is not None:
-                # Blend LLM score with keyword score (30% LLM, 70% keyword)
-                fil_pts = round(fil_pts * 0.7 + llm_filing["score"] * 0.3)
 
     # (meta_features already stored above, after sector momentum is applied)
 
@@ -4603,8 +4640,11 @@ def assemble_pick(
         "close":    round(close,2),
         "grade":    grade,
         "llm_story": llm_story,
-        "llm_filing_sentiment": llm_filing.get("sentiment") if llm_filing else None,
-        "llm_filing_detail": llm_filing.get("detail") if llm_filing else None,
+        "llm_filing_sentiment": None,
+        "llm_filing_detail": None,
+        # Carry story_parts + raw filing so post-top-N LLM enrichment can use them
+        "_story_parts": parts,
+        "_raw_filing":  fil_data.get("detail", ""),
 
         # Fused scores
         "fused":          fused,
@@ -6099,6 +6139,19 @@ def run():
     """
     _init_db()
     _, date_label = _get_last_trading_day()
+
+    # DEBUG: Verify LLM keys — booleans only, safe to keep in production logs.
+    # Keys are masked in GitHub Actions secrets but True/False confirms they're set.
+    log.info(f"LLM_ENABLED: {LLM_ENABLED}")
+    log.info(f"Anthropic OK: {_ANTHROPIC_OK}")
+    log.info(f"OpenAI OK:    {_OPENAI_OK}")
+
+    # Reset LLM circuit breaker for this run
+    global _LLM_FAIL_COUNT, _LLM_CIRCUIT_OPEN
+    with _LLM_CB_LOCK:
+        _LLM_FAIL_COUNT   = 0
+        _LLM_CIRCUIT_OPEN = False
+
     # FEEDBACK LOOP (run first -- update yesterday before scoring today)
     # ---------------------------------------------------------------
     # ═════════════════════════════════════════════════════════════════
@@ -6507,6 +6560,34 @@ def run():
             log.info(f"  VETO {pick['symbol']}: {judged['veto_reason']}")
     top_picks = judged_picks
     log.info(f"After AI Judge: {len(top_picks)} picks pass")
+
+    # ── v4.0-M FIX-CRIT2: LLM enrichment on TOP picks ONLY ──────────────────
+    # Previously ran inside assemble_result_v8() for all 100-200 candidates.
+    # Now runs here on the final 5 picks only — ~95% token cost reduction.
+    if LLM_ENABLED and top_picks:
+        log.info(f"LLM enrichment on {len(top_picks)} final pick(s)…")
+        for pick in top_picks:
+            sym = pick["symbol"]
+            # Story enhance → Claude Sonnet (best structured JSON reasoning)
+            story_parts = pick.get("_story_parts", [])
+            llm_story = _llm_story_enhance(sym, story_parts, {
+                "rsi": pick.get("rsi"), "adx": pick.get("adx"),
+                "mfi": pick.get("mfi"), "atr14": pick.get("atr14"),
+            })
+            if llm_story:
+                pick["llm_story"] = llm_story
+                log.info(f"  LLM story OK: {sym} — {llm_story[:60]}")
+            # Filing sentiment → GPT-4o mini (cheap, cached by filing hash)
+            raw_filing = pick.get("_raw_filing", "")
+            if raw_filing and "No recent" not in raw_filing:
+                llm_filing = _llm_alpha_mine(raw_filing, sym)
+                if llm_filing and llm_filing.get("score") is not None:
+                    pick["llm_filing_sentiment"] = llm_filing.get("sentiment")
+                    pick["llm_filing_detail"]     = llm_filing.get("detail", "")
+                    log.info(f"  LLM filing OK: {sym} — score {llm_filing['score']}")
+        log.info("LLM enrichment complete")
+    elif not LLM_ENABLED:
+        log.info("LLM disabled — skipping enrichment (set ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
     # ── v3.0-M: Capacity guard ─────────────────────────────────────────────
     capacity = _capacity_guard(date_label)
