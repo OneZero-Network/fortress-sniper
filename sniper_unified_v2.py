@@ -4673,9 +4673,10 @@ def send_telegram_v3(picks: list, macro: dict, fii_data: dict,
 
     # Footer
     lines.append("─" * 35)
-    lines.append("Reply to log your decision:")
+    lines.append("ℹ️ SKIPPED is no longer needed.")
+    lines.append("Just don't reply — the system auto-logs silence as SKIPPED at EOD.")
+    lines.append("Only reply if you TOOK or PARTIALLY took a position.")
     lines.append("  TAKEN TCS @ 3445")
-    lines.append("  SKIPPED TCS earnings close")
     lines.append("  PARTIAL TCS 50    ← if taking half size")
     lines.append("")
     lines.append(f"FII/DII: {fii_data.get('label','—')} | {fii_data.get('detail','')[:60]}")
@@ -5510,17 +5511,20 @@ def _auto_log_skipped_picks(date_label: str):
     """
     try:
         with _db_conn() as con:
-            all_picks = con.execute(
-                "SELECT symbol FROM sniper_results WHERE run_date=?",
+            # DISTINCT: sniper_results has no UNIQUE constraint, reruns insert duplicates
+            all_picks_rows = con.execute(
+                "SELECT DISTINCT symbol FROM sniper_results WHERE run_date=?",
                 (date_label,)
             ).fetchall()
+            # trade_decisions has UNIQUE(run_date,symbol) so set is fine
             logged = {row[0] for row in con.execute(
                 "SELECT symbol FROM trade_decisions WHERE run_date=?",
                 (date_label,)
             ).fetchall()}
 
-        unresponded = [r[0] for r in all_picks if r[0] not in logged]
+        unresponded = [r[0] for r in all_picks_rows if r[0] not in logged]
         if not unresponded:
+            log.debug("Auto-log: all picks already have decisions — nothing to log")
             return
 
         log.info(f"Auto-logging {len(unresponded)} unresponded picks as SKIPPED")
@@ -5581,6 +5585,10 @@ CREATE TABLE IF NOT EXISTS strategy_approved (
     approved_at     TEXT NOT NULL,
     sandbox_id      INTEGER
 );
+
+-- Prevent duplicate sniper_results rows (reruns should not create duplicates)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sniper_results_date_symbol
+    ON sniper_results(run_date, symbol);
 """
 
 
@@ -6195,9 +6203,9 @@ def run():
     try:
         with _db_conn(write=True) as con:
             for r in top_picks:
-                # Existing sniper_results
+                # Existing sniper_results (OR IGNORE prevents dupe on rerun)
                 con.execute(
-                    "INSERT INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story,sector) "
+                    "INSERT OR IGNORE INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story,sector) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
                      r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
