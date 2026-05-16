@@ -999,6 +999,7 @@ def _init_db():
             r2            REAL,
             r3            REAL,
             story         TEXT,
+            sector        TEXT,
             created_at    TEXT DEFAULT CURRENT_TIMESTAMP
         );
                 CREATE TABLE IF NOT EXISTS data_quality (
@@ -1087,6 +1088,18 @@ def _init_db():
             if "locked" in str(e).lower():
                 con.close()
                 raise RuntimeError(f"DB locked during migration: {e}") from e
+    # FIX 6: Migration — add sector column to sniper_results if absent.
+    # The _push_performance_tab() query joins pick_outcomes o JOIN sniper_results s
+    # ON o.symbol=s.symbol expecting s.sector, causing "no such column: s.sector".
+    # This ALTER TABLE is idempotent: SQLite raises "duplicate column name" if the
+    # column already exists, which we silently ignore.
+    try:
+        con.execute("ALTER TABLE sniper_results ADD COLUMN sector TEXT DEFAULT 'DIVERSIFIED'")
+        con.commit()
+        log.info("DB migration: added 'sector' column to sniper_results ✅")
+    except Exception as e:
+        if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+            log.debug(f"sniper_results sector migration: {e}")
     con.commit()
     con.close()
 
@@ -2118,6 +2131,24 @@ def fortress_score(symbol: str, today_row, hist: pd.DataFrame) -> Optional[dict]
     pts += forward_bonus
     pts  = min(int(pts), FORT_SCORE_MAX["fortress"]+30)
 
+    # ── FIX 3: Minimum fortress score veto ──────────────────────────────
+    # Previously fortress_score() returned None only on hard structural vetoes
+    # (insufficient bars, MA200 tolerance, sector block, turnover, alt_pct).
+    # Symbols with pts=23 (only layer3 true) passed through to APEX, wasting
+    # compute and injecting weak candidates. Add a soft minimum:
+    # at least ONE of the two primary VPOC layers must be true, OR pts must be
+    # above a minimum bar to ensure we have genuine volume-at-price confluence.
+    _FORTRESS_MIN_PTS = 28   # absolute minimum before intelligence bonuses
+    _FORTRESS_REQUIRE_VPOC = not (layer1 or layer2)  # True when both VPOC layers absent
+
+    if pts < _FORTRESS_MIN_PTS:
+        log.info(f"FORTRESS SOFT-VETO {symbol}: pts={pts:.0f} < {_FORTRESS_MIN_PTS} minimum")
+        return None
+    if _FORTRESS_REQUIRE_VPOC and pts < 38:
+        # layer3-only pass with weak score: not enough confluence for APEX
+        log.info(f"FORTRESS SOFT-VETO {symbol}: pts={pts:.0f}, no VPOC layers (l1=F,l2=F) — need ≥38")
+        return None
+
     log.info(f"FORTRESS PASS {symbol}: pts={pts:.0f} | layers={layer1},{layer2},{layer3} | zone={entry_zone}")
     return {
         "fortress_pts": pts,
@@ -2246,24 +2277,33 @@ def _divergence_engine(hist: pd.DataFrame) -> Tuple[float, dict]:
     return float(score),{"div_type":div_type,"div_label":label,"div_strength":round(strength,1)}
 
 
-def _vol_profile_score(profile: dict, close: float) -> Tuple[float, str]:
-    poc=profile.get("poc",0)
-    if poc<=0: return 0.0,"No vol profile"
-    score=0; notes=[]
-    dist=abs(close-poc)/poc*100
-    if dist<=1.0:   score+=40; notes.append("AT POC 🎯")
-    elif dist<=3.0: score+=25; notes.append("NEAR POC")
-    elif dist<=5.0: score+=12; notes.append("POC ZONE")
-    va_lo=profile.get("va_low",0); va_hi=profile.get("va_high",0)
-    if va_lo>0 and va_hi>0:
-        if va_lo<=close<=va_hi: score+=20; notes.append("INSIDE VA")
-        elif close<va_lo:       score+=8;  notes.append("BELOW VA")
-    wp=profile.get("whale_pct",0)
-    if wp>=35:   score+=25; notes.append(f"WHALE DEF {wp:.0f}%")
-    elif wp>=25: score+=15; notes.append(f"Strong POC {wp:.0f}%")
-    va_w=(va_hi-va_lo)/poc*100 if poc>0 and va_hi>va_lo else 0
-    if 0<va_w<=8: score+=10; notes.append("TIGHT VA")
-    return float(min(100,score))," · ".join(notes) if notes else "Diffuse"
+def _vol_profile_score(profile: dict, close: float, fortress_vpoc: float = 0.0) -> Tuple[float, str]:
+    """Score volume profile closeness.
+    FIX: Uses fortress_vpoc (weighted 3m/6m/12m) as primary distance reference
+    when available, avoiding the contradiction where fortress_score says
+    layer1=True (close ≈ VPOC) but _vpoc_profile (63d only) reports a different POC.
+    profile['poc'] is still used for Value Area checks (independent of VPOC calc)."""
+    poc = profile.get("poc", 0)
+    if poc <= 0: return 0.0, "No vol profile"
+    score = 0; notes = []
+
+    # Use weighted fortress VPOC for distance if provided, else fall back to 63d POC
+    ref_poc = fortress_vpoc if fortress_vpoc > 0 else poc
+    dist = abs(close - ref_poc) / ref_poc * 100
+    if dist <= 1.0:   score += 40; notes.append("AT POC 🎯")
+    elif dist <= 3.0: score += 25; notes.append("NEAR POC")
+    elif dist <= 5.0: score += 12; notes.append("POC ZONE")
+
+    va_lo = profile.get("va_low", 0); va_hi = profile.get("va_high", 0)
+    if va_lo > 0 and va_hi > 0:
+        if va_lo <= close <= va_hi: score += 20; notes.append("INSIDE VA")
+        elif close < va_lo:         score += 8;  notes.append("BELOW VA")
+    wp = profile.get("whale_pct", 0)
+    if wp >= 35:   score += 25; notes.append(f"WHALE DEF {wp:.0f}%")
+    elif wp >= 25: score += 15; notes.append(f"Strong POC {wp:.0f}%")
+    va_w = (va_hi - va_lo) / poc * 100 if poc > 0 and va_hi > va_lo else 0
+    if 0 < va_w <= 8: score += 10; notes.append("TIGHT VA")
+    return float(min(100, score)), " · ".join(notes) if notes else "Diffuse"
 
 
 def _pattern_score(hist: pd.DataFrame, atr14: float, profile: dict) -> Tuple[float, str]:
@@ -2770,78 +2810,101 @@ def _bayesian_apex(macro_state: str, breadth_ok: bool, layer1: bool, layer2: boo
                    mc_survival: Optional[float],
                    fii_pts: int, ins_pts: int, fil_pts: int) -> dict:
     """
-    Calibrated 14-node Bayesian network.
-    Priors derived from conservative NSE halal mid-cap base rates (~40% win rate).
-    """
-    # Base prior: NSE halal mid-caps historically ~40% profitable on 12-day swing
-    prior = 0.40  # Was 0.30 — too pessimistic, but 0.62 was too optimistic
-    alpha = 0.15  # Slightly higher shrinkage toward base rate
+    Calibrated 14-node Bayesian network — FIXED v2.
+    Root cause of original failure: log-odds sequential update with conservative
+    priors (pt≈0.52, pf≈0.40) generates log(pf/(1-pf)) ≈ -0.40 per false node.
+    With 15 nodes × avg weight 0.8, most CHOP setups accumulated −4 log-odds,
+    driving posterior to <5% before shrinkage, then bayes_pct stayed at 5-18.
 
-    # Build condition map
+    Fix: Replace broken log-odds accumulation with a two-stage additive scorer:
+      Stage 1 — Base rate (40%) + positive node contributions (scaled 0-60% range)
+      Stage 2 — Shrinkage toward 50% (epistemic humility, prevents overfit)
+    Target range: 35-75% when 0/14 to 8/14 nodes are true.
+    At 2-3 true nodes (typical CHOP pick): should produce 45-58%.
+    At 5-6 true nodes (good CLEAR pick): should produce 60-70%.
+    """
+    # Build condition map — same as before, no change
     conditions = {
-        "macro_clear": macro_state == "CLEAR",
-        "breadth_ok": breadth_ok,
-        "layer1": layer1,
-        "layer2": layer2,
-        "layer3": layer3,
-        "mfi_oversold": mfi_v <= 45.0,
-        "adx_trending": adx_v >= 25.0,
-        "not_overextended": alt_pct < 30.0,
-        "whale_detected": whale_detected,
+        "macro_clear":       macro_state == "CLEAR",
+        "breadth_ok":        breadth_ok,
+        "layer1":            layer1,
+        "layer2":            layer2,
+        "layer3":            layer3,
+        "mfi_oversold":      mfi_v <= 45.0,
+        "adx_trending":      adx_v >= 25.0,
+        "not_overextended":  alt_pct < 30.0,
+        "whale_detected":    whale_detected,
         "bullish_hidden_div": div_type == "BULLISH_HIDDEN",
-        "vp_score_high": vp_score >= 40,
-        "mc_survival_ok": mc_survival is not None and mc_survival >= 65,
-        "fii_buying": fii_pts >= 22,
-        "insider_buying": ins_pts >= 15,
-        "positive_filing": fil_pts >= 20,
+        "vp_score_high":     vp_score >= 40,
+        "mc_survival_ok":    mc_survival is not None and mc_survival >= 65,
+        "fii_buying":        fii_pts >= 22,
+        "insider_buying":    ins_pts >= 15,
+        "positive_filing":   fil_pts >= 20,
     }
 
-    posterior = prior
-    total_weight = 0
-
-    # Log-space sequential Bayesian update (avoids underflow from lk**weight → 0.0
-    # across 15 iterations; equivalent to standard odds-form Bayes but numerically stable).
-    log_odds = math.log(prior / max(1 - prior, 1e-9))  # start in log-odds space
+    # ── Stage 1: Weighted signal accumulation ────────────────────────────
+    # Each node contributes an edge score: (pt - pf) × weight normalised to [0, 1].
+    # This measures how much the TRUE condition beats the FALSE condition baseline.
+    # A node where pt=0.52, pf=0.40, weight=1.0 contributes edge = 0.12 × 1.0 = 0.12.
+    # Summed across 15 nodes (total potential weight ≈ 11.7), max positive edge ≈ 1.76.
+    # We scale this to a 0-60 percentage-point uplift above a 35% floor.
+    total_positive_edge = 0.0
+    max_possible_edge   = 0.0
 
     for name, pt, pf, weight in _BAYES_PRIORS:
         cond = conditions.get(name, False)
-        lk = pt if cond else pf
-        # Clamp likelihood to avoid log(0)
-        lk = max(1e-6, min(1 - 1e-6, lk))
-        # Weighted log-likelihood ratio update
-        log_odds += weight * math.log(lk / (1 - lk))
-        total_weight += weight
+        edge = (pt - pf) * weight          # always positive (pt > pf by design)
+        if cond:
+            total_positive_edge += edge    # accumulate only when condition is true
+        max_possible_edge += edge          # track theoretical maximum
 
-    # Convert back from log-odds to probability
-    posterior = 1 / (1 + math.exp(-log_odds))
-    posterior = max(1e-6, min(1 - 1e-6, posterior))
+    # Normalise: positive_ratio = 0 when no conditions true, 1 when all true
+    positive_ratio = (total_positive_edge / max(max_possible_edge, 1e-9))
 
-    # Bug fix: removed posterior ** (1 / total_weight) normalization.
-    # That exponentiation is mathematically wrong — raising a probability
-    # in [0,1] to a small power (1/11.7 ≈ 0.085) drives ANY value toward 1.0
-    # (e.g. 0.01^0.085 ≈ 0.89), making the Bayesian network a no-op.
-    # Sequential Bayes updates already produce a correctly normalized posterior;
-    # no post-loop rescaling is needed or correct.
+    # Map ratio → probability: floor=0.35, ceil=0.78, range=0.43
+    # At ratio=0.00 (no conditions): p = 0.35 (worse than coin-flip — good prior)
+    # At ratio=0.20 (2-3 conditions, CHOP typical): p ≈ 0.44
+    # At ratio=0.35 (4-5 conditions, CLEAR good): p ≈ 0.50
+    # At ratio=0.55 (7-8 conditions, CLEAR great): p ≈ 0.59
+    # At ratio=1.00 (all conditions): p = 0.78
+    raw_prob = 0.35 + positive_ratio * 0.43
 
-    # Strong shrinkage to base rate — prevents overconfidence
-    posterior = alpha * prior + (1 - alpha) * posterior
+    # ── Stage 2: Macro-aware regime adjustment ────────────────────────────
+    # In CHOP we're already picking the best available — apply a small floor lift.
+    # In PANIC or MASSACRE the Bayesian evidence is unreliable — shrink to neutral.
+    if macro_state == "CLEAR":
+        regime_adj = +0.03
+    elif macro_state == "CHOP":
+        regime_adj = +0.01    # small positive: CHOP setups that pass Fortress are pre-filtered
+    elif macro_state == "PANIC":
+        regime_adj = -0.05
+    else:  # MASSACRE — pipeline already returns None upstream, but guard here
+        regime_adj = -0.15
+
+    prob_after_regime = raw_prob + regime_adj
+
+    # ── Stage 3: Shrinkage toward 50% (epistemic humility) ───────────────
+    # α=0.20 means: "I trust my signal 80%, fallback to coin-flip 20%"
+    alpha = 0.20
+    posterior = alpha * 0.50 + (1 - alpha) * prob_after_regime
     posterior = min(0.95, max(0.05, round(posterior, 3)))
 
     pct = round(posterior * 100)
 
-    # Tier thresholds calibrated to actual performance
-    if posterior >= 0.65:   tier, bonus = "HIGH", 8        # Was 0.75
-    elif posterior >= 0.55:  tier, bonus = "MODERATE", 4   # Was 0.65
-    elif posterior >= 0.48:  tier, bonus = "NEUTRAL", 0    # Was 0.55
-    else:                    tier, bonus = "LOW", -5
+    # Tier thresholds — tuned for the new 35-78% output range
+    if posterior >= 0.65:    tier, bonus = "HIGH",     8
+    elif posterior >= 0.55:  tier, bonus = "MODERATE", 4
+    elif posterior >= 0.47:  tier, bonus = "NEUTRAL",  0
+    else:                    tier, bonus = "LOW",      -5
 
     return {
-        "bayes_prob": posterior,
-        "bayes_pct": pct,
-        "bayes_tier": tier,
+        "bayes_prob":  posterior,
+        "bayes_pct":   pct,
+        "bayes_tier":  tier,
         "bayes_bonus": bonus,
         "bayes_label": f"{tier} conviction ({pct}%)",
-        "calibrated": True
+        "calibrated":  True,
+        "positive_ratio": round(positive_ratio, 3),   # diagnostic
     }
 
 
@@ -2948,7 +3011,7 @@ def assemble_pick(
 
     whale_score, whale_det = _whale_radar(hist, adv20)
     div_score,   div_det   = _divergence_engine(hist)
-    vp_score,    vp_label  = _vol_profile_score(profile, close)
+    vp_score,    vp_label  = _vol_profile_score(profile, close, fortress_vpoc=vpoc)
     pat_score,   pat_label = _pattern_score(hist, atr14, profile)
     mc          = _monte_carlo(hist, stop_loss, close)
     mc_survival = mc.get("survival")
@@ -2970,6 +3033,16 @@ def assemble_pick(
 
     macro_damp = {"CLEAR":1.0,"CHOP":0.88,"PANIC":0.60,"MASSACRE":0.0}
     bayes_score = float(bayes["bayes_pct"])
+
+    # ── CHOP pre-compensation constant ──────────────────────────────────
+    # BUG FIX: Old code applied "+8" AFTER dampening: raw×0.88+8.
+    # At raw=30: 26.4+8=34.4 (still −13% vs CLEAR's 30). Compensation was ineffective.
+    # New approach: add 12 to raw BEFORE dampening so the effect survives the multiply.
+    # At raw=30 in CHOP: (30+12)×0.88=37.0 (+23% vs undamped 30 — intentional uplift for
+    # CHOP picks that already survived a stricter Fortress filter).
+    # At raw=60 in CHOP: (60+12)×0.88=63.4 vs CLEAR 60 (+5.6%).
+    _CHOP_PRE_COMP = 12
+
     # ── APEX CONFLUENCE SCORE (NOT double-counting VPOC) ──
     # Instead of re-scoring VPOC layers (already in fortress_pts),
     # measure how strongly the INDEPENDENT APEX engines confirm
@@ -3020,15 +3093,14 @@ def assemble_pick(
         bayes_score          * W["bayesian"]      +
         confluence_bonus     * W["fortress_vpoc"]  # Reuse weight slot for confluence
     )
-    apex_composite = round(raw_apex * macro_damp.get(macro_state,0.88))
+    # FIX: apply CHOP pre-compensation BEFORE dampening so it survives the multiply.
+    # In CLEAR/PANIC/MASSACRE the constant is 0 (no effect).
+    chop_pre = _CHOP_PRE_COMP if macro_state == "CHOP" else 0
+    apex_composite = round((raw_apex + chop_pre) * macro_damp.get(macro_state, 0.88))
     # Independent bonuses (not double-counting)
     if bayes["bayes_pct"] >= 75 and mc_survival is not None and mc_survival >= 75:
         apex_composite = min(100, apex_composite + 5)  # High conviction + high survival
-    apex_composite=max(0,min(100,apex_composite))
-
-    # ── CHOP REGIME ADJUSTMENT: +8 pts to compensate for macro dampener ──
-    if macro_state == 'CHOP':
-        apex_composite = min(100, apex_composite + 8)
+    apex_composite = max(0, min(100, apex_composite))
 
     # ── FUSED COMPOSITE + GRADE ────────────────────────────────────────
     # BUG FIX: fort_norm, fused, and grade were referenced but never
@@ -3206,9 +3278,33 @@ def assemble_pick(
 
     meta_model = _load_meta_model()
     meta_prob = _get_meta_probability(meta_model, meta_features)
-    if meta_prob < 0.45:
-        log.info(f"  🚫 {symbol}: Meta-model veto (P(profitable)={meta_prob:.2f} < 0.45)")
+    # FIX 5: Meta-model veto guard.
+    # The meta-labeler is trained incrementally via _train_meta_labeler(min_samples=50).
+    # When trained on fewer than 200 profitable samples its class imbalance causes it
+    # to learn "veto everything" — exactly what Bug 5 predicts.
+    # Guard: only apply the veto when the model was trained on ≥ 200 closed picks
+    # AND the probability is clearly below the threshold (< 0.40 rather than 0.45).
+    # This lets early picks through while the DB accumulates enough outcome history.
+    meta_sample_count = 0
+    try:
+        _mc = sqlite3.connect(DB_PATH, timeout=5)
+        _row = _mc.execute(
+            "SELECT COUNT(*) FROM pick_outcomes WHERE status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')"
+        ).fetchone()
+        _mc.close()
+        meta_sample_count = _row[0] if _row else 0
+    except Exception:
+        pass
+
+    _META_VETO_THRESHOLD = 0.40   # stricter than old 0.45 (less hair-trigger)
+    _META_MIN_SAMPLES    = 200    # don't trust the model until we have enough data
+
+    if meta_sample_count >= _META_MIN_SAMPLES and meta_prob < _META_VETO_THRESHOLD:
+        log.info(f"  🚫 {symbol}: Meta-model veto (P={meta_prob:.2f} < {_META_VETO_THRESHOLD}, "
+                 f"n={meta_sample_count} samples)")
         return None
+    elif meta_sample_count < _META_MIN_SAMPLES:
+        log.debug(f"  Meta-model: skipping veto ({meta_sample_count} < {_META_MIN_SAMPLES} samples needed)")
 
     # ── FOG sizing cap ─────────────────────────────────────────────────
     fog_note=""
@@ -4484,10 +4580,10 @@ def run():
         for r in top_picks:
             # Existing sniper_results
             con.execute(
-                "INSERT INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sniper_results (run_date,symbol,grade,fused_score,close,stop_loss,r1,r2,r3,story,sector) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (date_label,r["symbol"],r["grade"],r["fused"],r["close"],
-                 r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"])
+                 r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
             )
             # NEW: outcome tracking (initial state)
             con.execute(
