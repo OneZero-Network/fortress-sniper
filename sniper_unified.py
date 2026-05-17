@@ -686,15 +686,6 @@ def _get_nse_history_ok():
 # Each task routes to the cheapest capable model.
 # To enable: set the relevant API key env var. Keys absent → rule-based fallback.
 
-# Claude (Anthropic) — signal coherence + halal screening
-ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-# FIX-MODEL: env var was set to stale "claude-sonnet-4-20250514" — correct name is
-# "claude-sonnet-4-5". If CLAUDE_MODEL env var exists, validate it; strip known stale names.
-_raw_claude_model  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
-_STALE_MODEL_NAMES = {"claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022",
-                      "claude-3-sonnet-20240229", "claude-3-haiku-20240307"}
-CLAUDE_MODEL       = ("claude-sonnet-4-5" if _raw_claude_model in _STALE_MODEL_NAMES
-                      else _raw_claude_model)
 
 # OpenAI — filing sentiment (mini) + sandbox/weekly (batch)
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
