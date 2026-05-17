@@ -132,7 +132,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.6-FIXES"  # v4.6: 9 targeted fixes — _batch_market_caps hang, NSE fail unification, session rebuild guard, MC rescue, llm_cache TTL, walkforward weights, live Bayes priors, Telegram reply handler, DB_BACKUP verification
+VERSION = "UNIFIED v4.7"  # v4.7: FIX-DEADLOCK (_batch_market_caps double-lock) | FIX-UNIVERSE (MAX_PRICE 800→3000, MAX_CANDIDATES 200→350) | FIX-RERUN (score_cache: same-day reruns skip fortress+APEX re-score, FAST_RERUN=true env var) | FIX-B2 (_today_label ddmmyyyy vs date_label yyyy-mm-dd mismatch — same-day DELETEs were silent no-ops)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-2.6 — SecureSecretsManager
@@ -534,10 +534,15 @@ MC_FAT_DF  = 5          # Student-t df — heavier tails for NSE gap risk
 MC_HORIZON = 12         # swing horizon (days)
 
 MIN_PRICE          = 50
-MAX_PRICE          = 800
+MAX_PRICE          = int(os.getenv("MAX_PRICE", "800"))  # FIX-UNIVERSE: was 800, excluding TCS/RELIANCE/HDFC/etc.
 MIN_TURNOVER_LAKHS = 150
-MAX_CANDIDATES     = 200
+MAX_CANDIDATES     = int(os.getenv("MAX_CANDIDATES", "300"))  # FIX-UNIVERSE: was 200
 MIN_HIST_BARS      = 30
+
+# FIX-RERUN: when True, scoring loop reads from score_cache instead of
+# re-running fortress_score + APEX for symbols already scored today.
+# Set FAST_RERUN=true for 2nd/3rd same-day manual runs to save time & API cost.
+FAST_RERUN = os.getenv("FAST_RERUN", "false").lower() in ("1", "true", "yes")
 
 # Scoring weights — APEX 7-engine
 W = dict(
@@ -885,6 +890,60 @@ def _llm_call(prompt: str, prompt_type: str, max_tokens: int = None) -> Optional
     if raw:
         _llm_store_cache(prompt, prompt_type, raw)
     return raw
+
+
+# ── FIX-RERUN: per-symbol daily score cache ──────────────────────────────────
+# Stores assemble_pick() results keyed by (symbol, run_date, bhavcopy_close).
+# On same-day reruns with identical bhavcopy data, FAST_RERUN=true lets the
+# scoring loop read from this cache instead of re-downloading 300-day histories
+# and re-running all 7 APEX engines (saves ~10-20 min CPU + network per rerun).
+# The close price is part of the key so that if bhavcopy refreshes mid-day
+# (price moves), we automatically re-score rather than serving stale signals.
+def _score_cache_get(symbol: str, run_date: str, close: float) -> Optional[dict]:
+    """Return cached assemble_pick result dict if (symbol, run_date, close) matches."""
+    try:
+        with _db_conn() as con:
+            row = con.execute(
+                "SELECT result_json FROM score_cache "
+                "WHERE symbol=? AND run_date=? AND ABS(bhavcopy_close - ?)< 0.005",
+                (symbol.upper(), run_date, close)
+            ).fetchone()
+        if row:
+            return json.loads(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def _score_cache_put(symbol: str, run_date: str, close: float, result: dict) -> None:
+    """Persist assemble_pick result into score_cache. Silent on failure."""
+    try:
+        # Strip internal-only keys (_story_parts, _raw_filing) before caching —
+        # they are large and only needed for LLM enrichment (which runs post-loop
+        # on top-N picks and already has its own llm_cache).
+        compact = {k: v for k, v in result.items() if not k.startswith("_")}
+        with _db_conn(write=True) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO score_cache "
+                "(symbol, run_date, bhavcopy_close, result_json) VALUES (?,?,?,?)",
+                (symbol.upper(), run_date, close, json.dumps(compact, default=str))
+            )
+    except Exception:
+        pass
+
+
+def _score_cache_purge_old(keep_days: int = 5) -> None:
+    """Remove score_cache rows older than keep_days to prevent unbounded growth."""
+    try:
+        cutoff = (datetime.today() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        with _db_conn(write=True) as con:
+            n = con.execute(
+                "DELETE FROM score_cache WHERE run_date < ?", (cutoff,)
+            ).rowcount
+        if n:
+            log.info(f"score_cache: purged {n} rows older than {keep_days} days")
+    except Exception:
+        pass
 
 
 # ── Task-specific callers ────────────────────────────────────────────────────
@@ -2222,6 +2281,17 @@ def _init_db():
             created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
             expires_at  TEXT  -- FIX-5: TTL per prompt type (alpha_mine=30d, halal_l4=7d, structured_reasoning=90d)
         );
+        CREATE TABLE IF NOT EXISTS score_cache (
+            symbol       TEXT NOT NULL,
+            run_date     TEXT NOT NULL,
+            bhavcopy_close REAL NOT NULL,
+            result_json  TEXT NOT NULL,
+            created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (symbol, run_date)
+        );
+        -- Index so FAST_RERUN lookup (symbol, run_date, close) is O(1)
+        CREATE INDEX IF NOT EXISTS idx_score_cache_lookup
+            ON score_cache (symbol, run_date, bhavcopy_close);
         CREATE TABLE IF NOT EXISTS bayes_calibration (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             prior_name      TEXT,
@@ -7091,6 +7161,17 @@ def _migrate_db_v4():
                 log.debug(f"llm_cache expires_at migration: {_e}")
         log.info("DB v4.0-M migration complete")
         _deduplicate_pick_outcomes()   # DUPLICATE FIX: clean existing dupes before index is enforced
+        # FIX-RERUN: create score_cache table for existing DBs that predate this table.
+        # CREATE TABLE IF NOT EXISTS is already in _DB_SCHEMA_V4; this also creates the index.
+        try:
+            with _db_conn(write=True) as con:
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_score_cache_lookup "
+                    "ON score_cache (symbol, run_date, bhavcopy_close)"
+                )
+            log.info("DB migration: score_cache index ensured ✅")
+        except Exception as _e:
+            log.debug(f"score_cache index migration: {_e}")
     except Exception as e:
         log.debug(f"DB v4 migration: {e}")
 
@@ -7506,21 +7587,35 @@ def run():
     # wipe the stale results so the latest run is always the source of truth.
     # Clears: sniper_results, pick_outcomes (open only), data_quality, meta_features.
     # Does NOT clear: pick_outcomes with status != 'open' (closed trades keep history),
-    #                 halal_ai_cache (TTL-managed separately), trade_decisions (user replies).
+    #                 halal_ai_cache (TTL-managed separately), trade_decisions (user replies),
+    #                 score_cache (intentionally preserved for FAST_RERUN mode).
+    # FIX-RERUN: when FAST_RERUN=true we SKIP this clear so the scoring loop can
+    # serve results from score_cache without re-running all 7 engines.
+    # FIX-B2 (_today_label bug): the previous code called _get_last_trading_day() a
+    # second time and unpacked `_, _today_label` — receiving ddmmyyyy (the FIRST
+    # return value) while all DB inserts use date_label = yyyy-mm-dd (the SECOND).
+    # The DELETE never matched any rows because "17052026" != "2026-05-17".
+    # Fix: reuse date_label (already correctly set on line above) everywhere.
     try:
-        _, _today_label = _get_last_trading_day()
-        with _db_conn(write=True) as _clear_con:
-            _rows_sr  = _clear_con.execute("DELETE FROM sniper_results  WHERE run_date=?", (_today_label,)).rowcount
-            _rows_po  = _clear_con.execute("DELETE FROM pick_outcomes   WHERE run_date=? AND status='open'", (_today_label,)).rowcount
-            _rows_dq  = _clear_con.execute("DELETE FROM data_quality    WHERE run_date=?", (_today_label,)).rowcount
-            _rows_mf  = _clear_con.execute("DELETE FROM meta_features   WHERE run_date=?", (_today_label,)).rowcount
-            _clear_con.commit()
-        if any([_rows_sr, _rows_po, _rows_dq, _rows_mf]):
-            log.info(f"Same-day rerun detected — cleared stale data for {_today_label}: "
-                     f"sniper_results={_rows_sr}, pick_outcomes={_rows_po}, "
-                     f"data_quality={_rows_dq}, meta_features={_rows_mf}")
+        if FAST_RERUN:
+            log.info(f"FAST_RERUN=true — skipping same-day clear for {date_label}. "
+                     f"Scoring loop will read from score_cache for symbols already scored today.")
+            _rows_sr = _rows_po = _rows_dq = _rows_mf = 0
         else:
-            log.info(f"Fresh run for {_today_label} — no stale data to clear")
+            with _db_conn(write=True) as _clear_con:
+                _rows_sr  = _clear_con.execute("DELETE FROM sniper_results  WHERE run_date=?", (date_label,)).rowcount
+                _rows_po  = _clear_con.execute("DELETE FROM pick_outcomes   WHERE run_date=? AND status='open'", (date_label,)).rowcount
+                _rows_dq  = _clear_con.execute("DELETE FROM data_quality    WHERE run_date=?", (date_label,)).rowcount
+                _rows_mf  = _clear_con.execute("DELETE FROM meta_features   WHERE run_date=?", (date_label,)).rowcount
+                _clear_con.commit()
+            if any([_rows_sr, _rows_po, _rows_dq, _rows_mf]):
+                log.info(f"Same-day rerun detected — cleared stale data for {date_label}: "
+                         f"sniper_results={_rows_sr}, pick_outcomes={_rows_po}, "
+                         f"data_quality={_rows_dq}, meta_features={_rows_mf}")
+            else:
+                log.info(f"Fresh run for {date_label} — no stale data to clear")
+        # Always purge score_cache rows older than 5 days (keep DB tidy)
+        _score_cache_purge_old(keep_days=5)
     except Exception as _e:
         log.warning(f"Same-day clear failed (non-fatal): {_e}")
 
@@ -7753,6 +7848,19 @@ def run():
                     "No manual env var change needed."
                 )
         try:
+            # FIX-RERUN: check score_cache first when FAST_RERUN=true.
+            # Cache key = (symbol, run_date, close) — if bhavcopy price changed
+            # since last run the cache misses and we re-score normally.
+            _sym_close = float(row.get("close", 0))
+            if FAST_RERUN:
+                _cached_r = _score_cache_get(sym, date_label, _sym_close)
+                if _cached_r is not None:
+                    # Restore private keys that LLM enrichment may need
+                    _cached_r.setdefault("_story_parts", [])
+                    _cached_r.setdefault("_raw_filing", "")
+                    results.append(_cached_r)
+                    log.debug(f"  ⚡ {sym:12s} — score_cache hit (fused={_cached_r.get('fused','-')})")
+                    continue
             hist = fetch_history(sym, days=300, sess=sess, yf_cache=hist_cache)
             if len(hist) < MIN_HIST_BARS:
                 log.debug(f"{sym}: only {len(hist)} bars — skip"); continue
@@ -7760,6 +7868,8 @@ def run():
             if r:
                 results.append(r)
                 log.info(f"  ✅ {sym:12s} | fused={r['fused']}/100 | {r['grade'][:10]} | {r['story'][:60]}")
+                # FIX-RERUN: persist to score_cache so subsequent same-day reruns are instant
+                _score_cache_put(sym, date_label, _sym_close, r)
         except Exception as e:
             log.debug(f"{sym}: {e}")
 
@@ -7888,19 +7998,22 @@ def run():
                 executor.shutdown(wait=False, cancel_futures=True)  # FIX-1.2: don't block on hung workers
 
             # 3. Cache to SQLite — serialised write to avoid "database is locked"
-            with _SQLITE_WRITE_LOCK:
-                try:
-                    with _db_conn(write=True) as con:
-                        today_iso = datetime.today().isoformat()
-                        for sym, mcap in result.items():
-                            if sym in need_fetch:
-                                con.execute(
-                                    "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
-                                    (sym, mcap, today_iso)
-                                )
-                        con.commit()
-                except Exception:
-                    pass
+            # FIX-DEADLOCK: removed outer `with _SQLITE_WRITE_LOCK:` — _db_conn(write=True)
+            # already acquires _SQLITE_WRITE_LOCK internally. Wrapping with it again causes
+            # a deadlock because threading.Lock() is NOT reentrant: the same thread
+            # blocks forever trying to acquire a lock it already holds.
+            try:
+                with _db_conn(write=True) as con:
+                    today_iso = datetime.today().isoformat()
+                    for sym, mcap in result.items():
+                        if sym in need_fetch:
+                            con.execute(
+                                "INSERT OR REPLACE INTO mcap_cache (symbol, mcap, fetched_at) VALUES (?,?,?)",
+                                (sym, mcap, today_iso)
+                            )
+                    con.commit()
+            except Exception:
+                pass
 
             return result
 
