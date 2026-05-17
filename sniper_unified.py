@@ -132,7 +132,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.8"  # v4.8: FIX-EXCEL (save_excel uses top_picks not results) | FIX-PERF (sector denormalized into pick_outcomes, no JOIN sniper_results) | FIX-DOUBLE-SCALE (send_telegram_v3 reads calibrated_confidence not raw meta_prob) | LLM-UNIFIED (single synthesis prompt per run, not per pick)
+VERSION = "UNIFIED v4.9"  # v4.9: FIX-EXCEL-FLATTEN (halal_detail dict crashed openpyxl) | FIX-DOUBLE-SCALE-ROOT (meta_prob stored pre-scaled, judge scaled again 0.55→0.43) | v4.8: FIX-EXCEL (save_excel uses top_picks not results) | FIX-PERF (sector denormalized into pick_outcomes, no JOIN sniper_results) | FIX-DOUBLE-SCALE (send_telegram_v3 reads calibrated_confidence not raw meta_prob) | LLM-UNIFIED (single synthesis prompt per run, not per pick)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-2.6 — SecureSecretsManager
@@ -6054,13 +6054,31 @@ def send_telegram(picks: list, macro: dict, fii_data: dict,
 # SECTION 15 — OUTPUT: EXCEL, HTML, GOOGLE SHEETS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _flatten_for_excel(rows: list) -> list:
+    """Stringify nested dict/list values so openpyxl can write every cell.
+    Without this, columns like halal_detail (a dict) cause a TypeError inside
+    openpyxl and the entire ExcelWriter context silently fails — the file is
+    created but empty.  Root cause: pd.DataFrame(picks) includes halal_detail
+    as an object column; openpyxl raises ValueError on dict cells."""
+    flat = []
+    for row in rows:
+        flat_row = {}
+        for k, v in row.items():
+            if isinstance(v, (dict, list)):
+                flat_row[k] = json.dumps(v, default=str)
+            else:
+                flat_row[k] = v
+        flat.append(flat_row)
+    return flat
+
+
 def save_excel(picks: list, all_results: list, fii_data: dict, date_label: str, data_source: str, bhavcopy: pd.DataFrame):
     if not picks and not all_results: return
     try:
         EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl") as w:
-            pd.DataFrame(picks).to_excel(w, sheet_name="Top Picks",   index=False)
-            pd.DataFrame(all_results).to_excel(w, sheet_name="All Results", index=False)
+            pd.DataFrame(_flatten_for_excel(picks)).to_excel(w, sheet_name="Top Picks",   index=False)
+            pd.DataFrame(_flatten_for_excel(all_results)).to_excel(w, sheet_name="All Results", index=False)
             pd.DataFrame([fii_data]).to_excel(w, sheet_name="FII_DII", index=False)
             
             # NEW: Data Quality sheet
@@ -8146,8 +8164,13 @@ def run():
             "primary_fused_score": r.get("fused", 0),
         }
         meta_prob = _get_meta_probability(meta_model_live, meta_features_v3)
-        r["meta_prob"]   = _regime_scaled_confidence(meta_prob, macro["macro_state"], macro.get("vix_val", 18.0))
-        r["worth_flag"]  = _confidence_flag(r["meta_prob"])
+        # FIX-DOUBLE-SCALE: store RAW meta_prob so calibrated_ai_judge() can scale it
+        # exactly once via _regime_scaled_confidence(). Previously we stored the
+        # already-scaled value here, then calibrated_ai_judge() scaled it again:
+        #   0.55 × 0.88 (here) × 0.88 (in judge) ≈ 0.43 → every pick = 43% SKIP.
+        r["meta_prob"]   = meta_prob
+        _scaled_for_flag = _regime_scaled_confidence(meta_prob, macro["macro_state"], macro.get("vix_val", 18.0))
+        r["worth_flag"]  = _confidence_flag(_scaled_for_flag)
         r["macro_state"] = macro.get("macro_state", "CHOP")   # propagate for profile display
 
     # ── STEP 4: Halal AI Screen (4-layer) — architecture-aligned ───────────────
