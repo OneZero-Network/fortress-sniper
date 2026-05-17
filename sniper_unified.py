@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   UNIFIED HALAL SNIPER v4.5-ARCH — FORTRESS × APEX × CALIBRATED AI JUDGE  ║
+║   UNIFIED HALAL SNIPER v4.8 — FORTRESS × APEX × CALIBRATED AI JUDGE  ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   ARCHITECTURE                                                               ║
@@ -132,7 +132,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.7"  # v4.7: FIX-DEADLOCK | FIX-UNIVERSE (MAX_PRICE→3000, MAX_CANDS→350) | FIX-RERUN (score_cache+FAST_RERUN) | FIX-B2 (_today_label format mismatch) | FIX-YF-HANG (_batch_market_caps: replaced yf.Ticker().info with direct requests.get timeout=(5,12))
+VERSION = "UNIFIED v4.8"  # v4.8: FIX-EXCEL (save_excel uses top_picks not results) | FIX-PERF (sector denormalized into pick_outcomes, no JOIN sniper_results) | FIX-DOUBLE-SCALE (send_telegram_v3 reads calibrated_confidence not raw meta_prob) | LLM-UNIFIED (single synthesis prompt per run, not per pick)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-2.6 — SecureSecretsManager
@@ -2255,6 +2255,9 @@ def _init_db():
             r3              REAL,
             grade           TEXT,
             fused_score     REAL,
+            -- FIX-PERF: sector denormalized here so PERFORMANCE tab JOIN works even
+            -- after same-day clear deletes sniper_results rows before _push_performance_tab fires.
+            sector          TEXT DEFAULT 'DIVERSIFIED',
             status          TEXT DEFAULT 'open',  -- open/closed/stopped/r1_hit/r2_hit/r3_hit/expired
             exit_price      REAL,
             exit_date       TEXT,
@@ -5914,8 +5917,17 @@ def send_telegram_v3(picks: list, macro: dict, fii_data: dict,
     for r in picks:
         profile   = r.get("setup_profile") or _get_setup_profile(r)
         hist      = _historical_win_rate_for_profile(profile, r.get("grade"), r.get("sector"))
-        meta_prob = r.get("meta_prob", 0.55)
-        confidence = _regime_scaled_confidence(meta_prob, macro_st, vix_val)
+        # FIX-DOUBLE-SCALE: calibrated_ai_judge() already stores calibrated_confidence
+        # (which has had _regime_scaled_confidence applied once).  Previously this code
+        # read raw meta_prob and called _regime_scaled_confidence AGAIN, giving:
+        #   0.55 × 0.88 × 0.88 ≈ 0.43 → "SKIP" for every CHOP pick regardless of quality.
+        # Now: prefer calibrated_confidence (already correct), fall back to meta_prob
+        # with a SINGLE scaling pass only when the judged field is absent.
+        if "calibrated_confidence" in r:
+            confidence = float(r["calibrated_confidence"])
+        else:
+            meta_prob  = r.get("meta_prob", 0.55)
+            confidence = _regime_scaled_confidence(meta_prob, macro_st, vix_val)
         flag       = _confidence_flag(confidence)
         enriched.append({**r, "profile": profile, "history": hist,
                          "confidence": confidence, "flag": flag})
@@ -6132,14 +6144,16 @@ def _push_performance_tab(date_label: str):
                 "AVG(pnl_pct) FROM pick_outcomes WHERE status!='open' GROUP BY grade"
             ).fetchall()
 
-            # Win rate by sector — join sniper_results which stores the sector column
+            # Win rate by sector — FIX-PERF: use pick_outcomes.sector directly.
+            # Previously JOINed sniper_results which is cleared by the same-day rerun
+            # BEFORE _push_performance_tab fires → empty result set every time.
+            # sector is now denormalized into pick_outcomes at INSERT time (see above).
             sector_rows = con.execute(
-                "SELECT s.sector, COUNT(*) as total, "
+                "SELECT COALESCE(o.sector,'DIVERSIFIED'), COUNT(*) as total, "
                 "COALESCE(SUM(CASE WHEN o.status IN ('r1_hit','r2_hit','r3_hit') THEN 1 ELSE 0 END), 0) as wins, "
                 "AVG(o.pnl_pct) as avg_pnl "
                 "FROM pick_outcomes o "
-                "JOIN sniper_results s ON o.symbol=s.symbol AND o.run_date=s.run_date "
-                "WHERE o.status!='open' GROUP BY s.sector"
+                "WHERE o.status!='open' GROUP BY COALESCE(o.sector,'DIVERSIFIED')"
             ).fetchall()
 
             # Prior calibration status
@@ -6448,13 +6462,14 @@ def _run_outcome_engine():
 
 
 def _get_sector_performance(days: int = 30) -> dict:
-    """Calculate win rate and avg P&L per sector from pick_outcomes."""
+    """Calculate win rate and avg P&L per sector from pick_outcomes.
+    FIX-PERF: query pick_outcomes.sector directly (denormalized) instead of
+    JOINing sniper_results which may have been cleared by same-day rerun."""
     try:
         with _db_conn() as con:
             since = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
             rows = con.execute(
-                "SELECT p.sector, o.status, o.pnl_pct FROM pick_outcomes o "
-                "JOIN sniper_results p ON o.symbol=p.symbol AND o.run_date=p.run_date "
+                "SELECT COALESCE(o.sector,'DIVERSIFIED'), o.status, o.pnl_pct FROM pick_outcomes o "
                 "WHERE o.run_date>=? AND o.status IN ('r1_hit','r2_hit','r3_hit','stopped','expired')",
                 (since,)
             ).fetchall()
@@ -7159,6 +7174,16 @@ def _migrate_db_v4():
         except Exception as _e:
             if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
                 log.debug(f"llm_cache expires_at migration: {_e}")
+        # FIX-PERF: add sector column to pick_outcomes for existing DBs.
+        # Without this, the PERFORMANCE tab JOIN on sniper_results (cleared by rerun) returns
+        # empty sector data.  Denormalizing sector into pick_outcomes breaks the dependency.
+        try:
+            with _db_conn(write=True) as con:
+                con.execute("ALTER TABLE pick_outcomes ADD COLUMN sector TEXT DEFAULT 'DIVERSIFIED'")
+                log.info("DB migration: added 'sector' column to pick_outcomes (FIX-PERF) ✅")
+        except Exception as _e:
+            if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
+                log.debug(f"pick_outcomes sector migration: {_e}")
         log.info("DB v4.0-M migration complete")
         _deduplicate_pick_outcomes()   # DUPLICATE FIX: clean existing dupes before index is enforced
         # FIX-RERUN: create score_cache table for existing DBs that predate this table.
@@ -8130,46 +8155,141 @@ def run():
     log.info(f"After Halal AI Screen + AI Judge: {len(top_picks)} picks pass")
     log.info("=" * 70)
 
-    # ── v4.0-M FIX-CRIT2: LLM enrichment on TOP picks ONLY ──────────────────
-    # Previously ran inside assemble_result_v8() for all 100-200 candidates.
-    # Now runs here on the final 5 picks only — ~95% token cost reduction.
+    # ── v4.8 UNIFIED LLM PROMPT ARCHITECTURE ─────────────────────────────────
+    # KEY INSIGHT: Fortress + APEX already computed every metric (VPOC, whale score,
+    # divergence, Bayes, MC survival, FII/DII, filing score etc.).  The LLM's job
+    # is NOT to recompute anything — it is pure synthesis:
+    #   1. Pattern recognition — which combination of signals is unusual / compelling?
+    #   2. Narrative coherence — do the signals tell a consistent story?
+    #   3. Risk flag — is there a qualitative concern the quant score can't see?
+    #   4. Rank the final picks — force the LLM to sort them by conviction.
+    #
+    # Architecture: ONE unified JSON prompt per RUN (not per pick).
+    # Sends all top_picks' pre-computed scores in a single API call.
+    # Returns per-symbol: llm_story, filing_flag, fused_bonus, rank_order.
+    # Cost vs old: 1 call vs N calls, no recomputation of metrics. ~80% cheaper.
+    #
+    # Previously: two sequential calls per pick (_llm_story_enhance + _llm_alpha_mine)
+    # — the LLM was being asked to re-derive what Fortress already calculated.
+    # Now: one call that receives the full quant output and produces synthesis only.
     if LLM_ENABLED and top_picks:
-        log.info(f"LLM enrichment on {len(top_picks)} final pick(s)…")
+        log.info(f"Unified LLM synthesis on {len(top_picks)} final pick(s)… (single prompt)")
+
+        def _unified_llm_enrich(picks: list, macro: dict) -> dict:
+            """
+            Single unified LLM call for all top picks.
+            Input: pre-computed quant signals for each pick.
+            Output: {symbol: {llm_story, filing_flag, fused_bonus, rank}} dict.
+            The LLM NEVER recomputes scores — it synthesizes and sorts only.
+            """
+            pick_payloads = []
+            for p in picks:
+                pick_payloads.append({
+                    "symbol":          p["symbol"],
+                    "sector":          p.get("sector", "DIVERSIFIED"),
+                    "grade":           p.get("grade", ""),
+                    "fused":           p.get("fused", 0),
+                    "fort_pct":        p.get("fort_pct", 0),
+                    "apex_composite":  p.get("apex_composite", 0),
+                    # Intelligence signals (pre-computed by fetch_insider/fetch_filings)
+                    "fii_label":       p.get("fii_label", ""),
+                    "insider_detail":  p.get("ins_detail", ""),
+                    "filing_detail":   p.get("_raw_filing") or p.get("fil_detail", ""),
+                    # APEX sub-scores (pre-computed)
+                    "whale_score":     p.get("whale_score", 0),
+                    "whale_detected":  p.get("whale_score", 0) >= 15,
+                    "divergence":      p.get("div_score", 0),
+                    "vol_profile":     p.get("vp_score", 0),
+                    "pattern":         p.get("pat_score", 0),
+                    "pattern_label":   p.get("pat_label", ""),
+                    "bayes_pct":       p.get("bayes_pct", 0),
+                    "mc_survival":     p.get("mc_survival"),
+                    # Fortress key outputs
+                    "vpoc_layer1":     p.get("layer1", False),
+                    "vpoc_layer2":     p.get("layer2", False),
+                    "vcp_coil":        p.get("vcp_coil", ""),
+                    "vdu_label":       p.get("vdu_label", ""),
+                    "w52_bonus":       p.get("w52_bonus", 0),
+                    "rsi":             p.get("rsi", 50),
+                    "adx":             p.get("adx", 0),
+                    "mfi":             p.get("mfi", 50),
+                    "alt_pct":         p.get("alt_pct", 0),
+                    "velocity_pct":    p.get("velocity_pct", 0),
+                    # Story context already built by rule engine
+                    "rule_story":      " | ".join(p.get("_story_parts", [p.get("story", "")])),
+                    # Halal outcome
+                    "halal_tier":      p.get("halal_detail", {}).get("tier", "?"),
+                    "halal_score":     p.get("halal_detail", {}).get("score", "?"),
+                    # Confidence
+                    "calibrated_confidence": p.get("calibrated_confidence", p.get("meta_prob", 0.55)),
+                })
+
+            prompt = (
+                "You are a quantitative trading analyst for NSE halal swing trades.\n"
+                "All scores below were computed by Fortress + APEX engines — DO NOT recompute them.\n"
+                f"Macro regime: {macro.get('macro_state','CHOP')} | VIX: {macro.get('vix_val',18):.1f}\n\n"
+                "For each symbol, provide:\n"
+                "1. llm_story (≤15 words): what makes this setup UNUSUAL or COMPELLING beyond the numbers?\n"
+                "   Focus on: signal confluence, regime alignment, or a qualitative concern the quant misses.\n"
+                "   Do NOT repeat score values (e.g. don't say 'fused 72' or 'bayes 65%').\n"
+                "2. filing_flag: 'POSITIVE'|'NEGATIVE'|'NEUTRAL' — if filing_detail is meaningful, else 'NEUTRAL'.\n"
+                "3. fused_bonus: integer 0–8 — only add if filing is clearly positive AND material. Default 0.\n"
+                "4. rank: your conviction rank 1=best (sort by: signal coherence + qualitative edge).\n\n"
+                f"Picks:\n{json.dumps(pick_payloads, indent=2, default=str)}\n\n"
+                "Return ONLY a JSON array (no markdown, no explanation):\n"
+                '[{"symbol":"X","llm_story":"...","filing_flag":"NEUTRAL","fused_bonus":0,"rank":1}]'
+            )
+
+            raw = _call_claude(prompt, max_tokens=800) or _call_openai(prompt, max_tokens=800)
+            if not raw:
+                return {}
+            try:
+                txt = raw.strip().replace("```json", "").replace("```", "")
+                items = json.loads(txt)
+                if not isinstance(items, list):
+                    return {}
+                return {
+                    item["symbol"]: {
+                        "llm_story":    str(item.get("llm_story", ""))[:120],
+                        "filing_flag":  str(item.get("filing_flag", "NEUTRAL")),
+                        "fused_bonus":  max(0, min(8, int(item.get("fused_bonus", 0)))),
+                        "rank":         int(item.get("rank", 99)),
+                    }
+                    for item in items if "symbol" in item
+                }
+            except Exception as parse_err:
+                log.warning(f"Unified LLM parse error: {parse_err} | snippet: {raw[:120]}")
+                return {}
+
+        llm_results = _unified_llm_enrich(top_picks, macro)
+
+        # Apply unified LLM output to each pick
         for pick in top_picks:
             sym = pick["symbol"]
-            # Story enhance → Claude Sonnet (best structured JSON reasoning)
-            story_parts = pick.get("_story_parts", [])
-            llm_story = _llm_story_enhance(sym, story_parts, {
-                "rsi": pick.get("rsi"), "adx": pick.get("adx"),
-                "mfi": pick.get("mfi"), "atr14": pick.get("atr14"),
-            })
-            if llm_story:
-                pick["llm_story"] = llm_story
-                log.info(f"  LLM story OK: {sym} — {llm_story[:60]}")
-            # Filing sentiment → GPT-4o mini (cheap, cached by filing hash)
-            raw_filing = pick.get("_raw_filing", "")
-            if raw_filing and "No recent" not in raw_filing:
-                llm_filing = _llm_alpha_mine(raw_filing, sym)
-                if llm_filing and llm_filing.get("score") is not None:
-                    pick["llm_filing_sentiment"] = llm_filing.get("sentiment")
-                    pick["llm_filing_detail"]     = llm_filing.get("detail", "")
-                    log.info(f"  LLM filing OK: {sym} — score {llm_filing['score']}")
-        log.info("LLM enrichment complete")
-        # FIX-4.1-M: Wire LLM filing sentiment score back into fused composite.
-        # Previously llm_filing_sentiment ran and returned 19-30 but was stored
-        # as pure metadata — never affected ranking or fused score.
-        # Now adds 0-10 pts to fused (capped at 100) so strong filings push picks up.
-        for pick in top_picks:
-            filing_score = (pick.get("llm_filing_detail") or {})
-            if isinstance(filing_score, dict):
-                raw_fs = filing_score.get("score", 0)
-            else:
-                raw_fs = pick.get("score_filing", 15)
-            llm_bonus = int(max(0, min(10, (raw_fs - 15) / 1.5)))  # 0 at score=15, +10 at score=30
-            if llm_bonus > 0:
+            res = llm_results.get(sym, {})
+            if res.get("llm_story"):
+                pick["llm_story"] = res["llm_story"]
+                log.info(f"  LLM story OK: {sym} — {res['llm_story'][:60]}")
+            filing_flag = res.get("filing_flag", "NEUTRAL")
+            if filing_flag == "POSITIVE":
+                pick["llm_filing_sentiment"] = "POSITIVE"
+            elif filing_flag == "NEGATIVE":
+                pick["llm_filing_sentiment"] = "NEGATIVE"
+            # Apply fused_bonus: LLM only adds points when filing is clearly material.
+            # Bonus capped at 8 pts by the prompt constraint above.
+            bonus = res.get("fused_bonus", 0)
+            if bonus > 0:
                 old_fused = pick["fused"]
-                pick["fused"] = min(100, pick["fused"] + llm_bonus)
-                log.info(f"  LLM filing bonus {pick['symbol']}: fused {old_fused}→{pick['fused']} (+{llm_bonus})")
+                pick["fused"] = min(100, pick["fused"] + bonus)
+                log.info(f"  LLM filing bonus {sym}: fused {old_fused}→{pick['fused']} (+{bonus})")
+            pick["_llm_rank"] = res.get("rank", 99)
+
+        # Re-sort top_picks by LLM conviction rank (ties broken by fused score)
+        if llm_results:
+            top_picks.sort(key=lambda p: (p.get("_llm_rank", 99), -p.get("fused", 0)))
+            log.info("Top picks re-ranked by unified LLM conviction")
+
+        log.info("Unified LLM enrichment complete")
     elif not LLM_ENABLED:
         log.info("LLM disabled — skipping enrichment (set ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
@@ -8209,7 +8329,12 @@ def run():
                  f"R1 ₹{r['r1']} | R2 ₹{r['r2']} | MC {r['mc_survival']}%")
         log.info(f"       {r['story'][:80]}")
     # 8. Outputs  (Performance sheet is now written inside save_excel)
-    log.info("Saving Excel…");       save_excel(top_picks, results, fii_data, date_label, data_source, bhavcopy)
+    # FIX-EXCEL: pass top_picks (post-judge) as BOTH positional args so the
+    # "Top Picks" sheet contains calibrated_confidence, position_size_tier,
+    # halal_detail, llm_story etc.  results (pre-judge, ~200 rows) lacks these
+    # keys because calibrated_ai_judge() enriches the dict in-place only for
+    # the final picked symbols.  Using results caused blank AI columns in Excel.
+    log.info("Saving Excel…");       save_excel(top_picks, top_picks, fii_data, date_label, data_source, bhavcopy)
     log.info("Saving HTML…");        save_html(top_picks, fii_data, date_label)
     log.info("Calibrating Bayes priors…"); _calibrate_bayes_priors()
     log.info("Pushing to Sheets…");  push_gsheets(top_picks, date_label)
@@ -8230,11 +8355,14 @@ def run():
                      r["stop_loss"],r["r1"],r["r2"],r["r3"],r["story"],r.get("sector","DIVERSIFIED"))
                 )
                 # outcome tracking (initial state)
+                # FIX-PERF: include sector so _push_performance_tab can query
+                # pick_outcomes directly without JOIN sniper_results (which may be
+                # cleared by the same-day rerun before the PERFORMANCE push fires).
                 con.execute(
-                    "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,story,status) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO pick_outcomes (run_date,symbol,entry_price,stop_loss,r1,r2,r3,grade,fused_score,sector,story,status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (date_label,r["symbol"],r["close"],r["stop_loss"],r["r1"],r["r2"],r["r3"],
-                     r["grade"],r["fused"],r["story"],"open")
+                     r["grade"],r["fused"],r.get("sector","DIVERSIFIED"),r["story"],"open")
                 )
                 # v3.0-M: store setup_profile in meta_features for personalized learning
                 try:
