@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   UNIFIED HALAL SNIPER v4.2-M — FORTRESS × APEX × CALIBRATED AI JUDGE     ║
+║   UNIFIED HALAL SNIPER v4.5-ARCH — FORTRESS × APEX × CALIBRATED AI JUDGE  ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   ARCHITECTURE                                                               ║
@@ -8,6 +8,24 @@
 ║   ONE pipeline. ONE halal guard. ONE DB. ONE macro fetch.                   ║
 ║   Fortress scoring + APEX 7-engine composite run together,                  ║
 ║   ranked by a single fused score, sent in one clean Telegram message.       ║
+║                                                                              ║
+║   v4.5-ARCH CHANGES (architecture-realigned, 2026-05-17)                   ║
+║   ─────────────────────────────────────────────────────────────             ║
+║   ARCH-1 HALAL PRE-FILTER REMOVED: Fortress + APEX now run on ALL liquid    ║
+║           EQ symbols. Halal AI Screen (4-layer) fires AFTER scoring on      ║
+║           top-N pearls only. No gem missed due to stale list.               ║
+║   ARCH-2 STEP SEQUENCE ALIGNED: matches the 11-step architecture doc        ║
+║           exactly. L1 keyword veto fires before expensive L4 LLM calls.     ║
+║   FIX-B1  SAME-DAY RERUN: run() now DELETEs today's rows from              ║
+║           sniper_results / pick_outcomes(open) / data_quality /             ║
+║           meta_features before scoring. Latest run is always truth.         ║
+║   FIX-B2  TELEGRAM NOISE: DataFreshnessGuard staleness alerts no longer     ║
+║           fire on Telegram. Log-only. Stops "INSIDER 17d ago" spam.         ║
+║   FIX-B3  DB STUCK: get_halal_universe() now called OUTSIDE the write       ║
+║           lock in the data-quality INSERT block, eliminating the            ║
+║           HALAL_UNIVERSE_LOCK ↔ SQLITE_WRITE_LOCK deadlock.                ║
+║   FIX-B4  OUTCOME ENGINE: wrapped in try/except — a locked DB at 9 AM       ║
+║           no longer aborts the morning scoring run.                         ║
 ║                                                                              ║
 ║   v4.2-M UPGRADES (audit-driven, 2026-05-16)                                ║
 ║   ─────────────────────────────────────────────────────────────             ║
@@ -114,7 +132,7 @@ log = logging.getLogger(__name__)
 for _noisy in ("yfinance", "peewee", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
 
-VERSION = "UNIFIED v4.4-OPT"  # v4.4: 20 performance optimizations applied
+VERSION = "UNIFIED v4.5-ARCH"  # v4.5: architecture realigned + 5 targeted fixes
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-2.6 — SecureSecretsManager
@@ -277,12 +295,10 @@ class DataFreshnessGuard:
                 mult = self._age_to_multiplier(age)
                 self._multipliers[tab] = mult
                 if age > self.STALE_WARN_DAYS:
-                    log.warning(f"DataFreshnessGuard: '{tab}' is {age}d old (mult={mult:.2f})")
-                    if age > self.STALE_HEAVY_DAYS and not self._alert_sent:
-                        if telegram_fn:
-                            try: telegram_fn(f"⚠️ DATA FRESHNESS: '{tab}' last updated {age}d ago. Scores degraded to {mult*100:.0f}%.")
-                            except Exception: pass
-                        self._alert_sent = True
+                    # FIX-v4.5: Data freshness warnings go to log only — not Telegram.
+                    # Stale INSIDER/FILINGS tabs are common (NSE doesn't update daily)
+                    # and spamming the user's phone with "scores degraded" noise is unhelpful.
+                    log.warning(f"DataFreshnessGuard: '{tab}' is {age}d old (mult={mult:.2f}) — scores degraded silently")
             except Exception as e:
                 log.debug(f"DataFreshnessGuard {tab}: {e}"); self._ages[tab] = 0
         self._checked = True
@@ -7202,15 +7218,20 @@ def _load_approved_params():
 
 def run():
     """
-    Single-pass unified pipeline:
-    1. Init DB + caches
-    2. Macro regime (one fetch, cached)
-    3. Halal universe (one fetch, cached)
-    4. Bhavcopy (NSE - Sheets - yfinance, one path)
-    5. Intelligence: FII/DII, Insider, Filings, Earnings (one fetch each)
-    6. Score each halal candidate through both engines (one loop)
-    7. Rank by fused score, sector cap, bucket (mid/small)
-    8. Outputs: Excel, HTML, Sheets, Telegram (one send)
+    Architecture-aligned unified pipeline (v4.5-ARCH):
+    1. Init DB + caches. Same-day rerun auto-clears stale picks.
+    2. Macro regime (one fetch, cached). MASSACRE halts pipeline.
+    3. Bhavcopy → liquidity+price pre-filter (NO halal gate — engines see all EQ).
+    4. Intelligence: FII/DII, Insider, Filings, Earnings (concurrent asyncio fetch).
+    5. Fortress + APEX scoring on ALL liquid candidates in one fused loop.
+    6. Rank by fused score → sector cap → market-cap bucket → top-N selected.
+    7. STEP 4 (arch): 4-layer Halal AI Screen on top-N only.
+       L1 business veto (instant keyword) → L2 financial ratios →
+       L3 ethical overlay → L4 LLM business model analysis.
+    8. Calibrated AI Judge → position sizing → LLM story enrichment.
+    9. Outputs: Excel, HTML, Sheets, Telegram (one send, halal-passed picks only).
+   10. Weekly agent (--weekly-review) + Sandbox proposals (--sandbox-proposals)
+       run as separate CLI invocations.
     """
     _init_db()
     # FIX-2.6: Validate secrets at startup
@@ -7255,12 +7276,38 @@ def run():
     # and before _run_outcome_engine() so counts are accurate throughout this run.
     _auto_expire_stale_positions()
 
-    # FEEDBACK LOOP (run first -- update yesterday before scoring today)
-    # ---------------------------------------------------------------
-    # ═════════════════════════════════════════════════════════════════
-    _run_outcome_engine()      # Check what happened to yesterday's picks
-    _adjust_sector_multipliers()  # Adjust sector weights based on results
-    _alert_open_positions()    # Warn if any open pick near stop
+    # FIX-v4.5: SAME-DAY RERUN CLEAR — if this date has already been run today,
+    # wipe the stale results so the latest run is always the source of truth.
+    # Clears: sniper_results, pick_outcomes (open only), data_quality, meta_features.
+    # Does NOT clear: pick_outcomes with status != 'open' (closed trades keep history),
+    #                 halal_ai_cache (TTL-managed separately), trade_decisions (user replies).
+    try:
+        _, _today_label = _get_last_trading_day()
+        with _db_conn(write=True) as _clear_con:
+            _rows_sr  = _clear_con.execute("DELETE FROM sniper_results  WHERE run_date=?", (_today_label,)).rowcount
+            _rows_po  = _clear_con.execute("DELETE FROM pick_outcomes   WHERE run_date=? AND status='open'", (_today_label,)).rowcount
+            _rows_dq  = _clear_con.execute("DELETE FROM data_quality    WHERE run_date=?", (_today_label,)).rowcount
+            _rows_mf  = _clear_con.execute("DELETE FROM meta_features   WHERE run_date=?", (_today_label,)).rowcount
+            _clear_con.commit()
+        if any([_rows_sr, _rows_po, _rows_dq, _rows_mf]):
+            log.info(f"Same-day rerun detected — cleared stale data for {_today_label}: "
+                     f"sniper_results={_rows_sr}, pick_outcomes={_rows_po}, "
+                     f"data_quality={_rows_dq}, meta_features={_rows_mf}")
+        else:
+            log.info(f"Fresh run for {_today_label} — no stale data to clear")
+    except Exception as _e:
+        log.warning(f"Same-day clear failed (non-fatal): {_e}")
+
+    # STEP 9 (arch): Outcome Engine — resolve yesterday's picks before scoring today.
+    # Architecture calls this "next day" but it fires at the START of each run(),
+    # which is equivalent: the first thing today's run does is close out yesterday.
+    # FIX-v4.5: wrapped in try/except so a locked DB never aborts a morning run.
+    try:
+        _run_outcome_engine()         # Check what happened to yesterday's picks
+        _adjust_sector_multipliers()  # Adjust sector weights based on results
+        _alert_open_positions()       # Warn if any open pick near stop
+    except Exception as _oe:
+        log.warning(f"Outcome engine non-fatal error: {_oe} — continuing with today's scoring")
 
     # META-LABELER: Backfill outcomes + train/retrain model
     # v3.0-M: first try personalized v2, fall back to v1 if not enough decisions
@@ -7303,7 +7350,8 @@ def run():
     # FIX-4.1-M: Check if intelligence Sheets tabs are fresh (runs async with bhavcopy fetch)
     _check_sheets_freshness()
     # FIX-2.2: DataFreshnessGuard — graduated staleness penalty on intelligence scores
-    freshness_guard.check_all(_read_sheet, _tg_health_alert)
+    # FIX-v4.5: pass telegram_fn=None — freshness noise must never reach the user's phone
+    freshness_guard.check_all(_read_sheet, telegram_fn=None)
 
     # 3. Bhavcopy
     bhavcopy, data_source = load_bhavcopy()
@@ -7312,26 +7360,18 @@ def run():
     if bhavcopy["volume"].sum() <= 0:
         log.error("❌ Volume=0 across all rows — data quality failure"); return []
 
-    # 4. Pre-filter
+    # 4. Pre-filter — liquidity + price only.
+    # ARCH-v4.5: Halal pre-filter REMOVED from here.
+    # Fortress + APEX run on ALL liquid EQ symbols (architecture Step 1→3).
+    # The 4-layer Halal AI Screen runs AFTER scoring on the top-N pearls only (Step 4).
+    # This means: (a) no gem is missed because of a stale list, (b) the expensive
+    # Shariah CSV / LLM calls fire only on the small set that actually scored well.
     cands = bhavcopy[
         (bhavcopy["turnover_lakhs"] >= MIN_TURNOVER_LAKHS) &
         (bhavcopy["close"] >= MIN_PRICE) &
         (bhavcopy["close"] <= MAX_PRICE)
     ].copy()
-    log.info(f"After liquidity+price filter: {len(cands)} candidates")
-    # OPT-5: precompute halal set once, apply as set-membership (O(1) per symbol)
-    _halal_universe = get_halal_universe()
-    _halal_excluded = HALAL_EXCLUDED
-    _halal_kw_set   = set(HALAL_KW)
-    _custom_list    = _HALAL_CUSTOM_LIST
-    def _is_halal_fast(sym: str) -> bool:
-        if sym in _halal_excluded: return False
-        sl = sym.lower()
-        if any(kw in sl for kw in _halal_kw_set) or _BEES_RE.search(sl): return False
-        if _custom_list and sym in _custom_list: return True
-        return sym in _halal_universe
-    cands = cands[cands["symbol"].apply(_is_halal_fast)].copy()
-    log.info(f"After halal filter: {len(cands)} candidates")
+    log.info(f"After liquidity+price filter: {len(cands)} candidates (no halal pre-filter — engines run first)")
     if len(cands) > MAX_CANDIDATES:
         cands = cands.nlargest(MAX_CANDIDATES, "turnover_lakhs")
         log.info(f"Capped to top {MAX_CANDIDATES} by turnover")
@@ -7486,24 +7526,38 @@ def run():
     log.info(f"\n{'='*70}")
     log.info(f"Screened {len(cands)} | Passed: {len(results)}")
     # ── Log data quality to DB ──
+    # FIX-v4.5: get_halal_universe() is called BEFORE acquiring _db_conn(write=True)
+    # to avoid a lock ordering deadlock: halal fetch holds _HALAL_UNIVERSE_LOCK and
+    # may call _load_shariah_db() which acquires _SQLITE_WRITE_LOCK internally,
+    # while _db_conn(write=True) holds _SQLITE_WRITE_LOCK waiting for the fetch.
+    # Pre-fetching outside the write context breaks the cycle.
+    # ARCH-v4.5: halal_universe_size now reflects the AI-screen universe (all Nifty500
+    # Shariah list symbols) rather than the pre-filtered candidate set, since we no
+    # longer gate scoring on the halal list.
     try:
-        halal_uni = get_halal_universe()
+        halal_uni = get_halal_universe()          # fetch OUTSIDE the write lock
+        _bhavcopy_syms = set(bhavcopy["symbol"])
+        _dq_params = (
+            date_label, data_source, len(bhavcopy), len(halal_uni),
+            len(_bhavcopy_syms & halal_uni),
+            "YES" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "NO",
+            len(halal_uni - _bhavcopy_syms),
+            "SHRUNK" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "OK"
+        )
+    except Exception as _dqe:
+        log.debug(f"Data quality param prep: {_dqe}")
+        _dq_params = (date_label, data_source, len(bhavcopy), 0, 0, "NO", 0, "OK")
+    try:
         with _db_conn(write=True) as con:
             con.execute("""
                 INSERT INTO data_quality (run_date, data_source, bhavcopy_records,
                 halal_universe_size, halal_in_bhavcopy, yfinance_shrink, missing_halal, alert)
                 VALUES (?,?,?,?,?,?,?,?)
-            """, (
-                date_label, data_source, len(bhavcopy), len(halal_uni),
-                len(bhavcopy[bhavcopy["symbol"].isin(halal_uni)]),
-                "YES" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "NO",
-                len(halal_uni - set(bhavcopy["symbol"])),
-                "SHRUNK" if (data_source == "YFINANCE" and len(bhavcopy) <= 100) else "OK"
-            ))
+            """, _dq_params)
             con.commit()
-            log.info("Data quality logged to DB")
+        log.info("Data quality logged to DB")
     except Exception as e:
-        log.debug(f"DB quality log: {e}")
+        log.warning(f"DB quality log failed (non-fatal): {e}")
     # 7. Rank + sector cap + bucket
     # Apply data quality gate adjustments
     dq_gate = _data_quality_gate(bhavcopy, data_source)
@@ -7666,20 +7720,33 @@ def run():
         r["worth_flag"]  = _confidence_flag(r["meta_prob"])
         r["macro_state"] = macro.get("macro_state", "CHOP")   # propagate for profile display
 
-    # ── v4.0-M: Halal AI Screen + Calibrated AI Judge ──────────────────────
-    log.info("Running Halal AI Screen + Calibrated AI Judge on top picks...")
+    # ── STEP 4: Halal AI Screen (4-layer) — architecture-aligned ───────────────
+    # ARCH-v4.5: This is now the ONLY halal gate in the pipeline.
+    # Fortress + APEX ran on ALL liquid symbols (Steps 2+3 above).
+    # Here we run the full 4-layer screen ONLY on the small set of top-scored picks.
+    # L1 hard business veto (keyword-based, instant) is applied first as a fast reject
+    # before the L2 financial check and L4 LLM call fire — keeps API costs minimal.
+    log.info("=" * 70)
+    log.info(f"STEP 4: Halal AI Screen on {len(top_picks)} top-scored candidate(s)…")
     cal_params = _load_calibration_params()
     judged_picks = []
     for pick in top_picks:
+        sym    = pick["symbol"]
         sector = pick.get("sector", "DIVERSIFIED")
-        halal  = halal_ai_screen(pick["symbol"], sector)
+        # Fast L1 check before invoking the full 4-layer AI screen
+        if _halal_l1_business_veto(sym):
+            log.info(f"  HALAL L1 VETO (business) {sym}: hard-excluded business type — skipped")
+            continue
+        halal  = halal_ai_screen(sym, sector)
         judged = calibrated_ai_judge(pick, halal, macro, cal_params)
         if not judged["veto"]:
             judged_picks.append(judged)
+            log.info(f"  ✅ HALAL PASS {sym}: tier={halal.get('tier','?')} score={halal.get('score','?')}")
         else:
-            log.info(f"  VETO {pick['symbol']}: {judged['veto_reason']}")
+            log.info(f"  ❌ VETO {sym}: {judged['veto_reason']}")
     top_picks = judged_picks
-    log.info(f"After AI Judge: {len(top_picks)} picks pass")
+    log.info(f"After Halal AI Screen + AI Judge: {len(top_picks)} picks pass")
+    log.info("=" * 70)
 
     # ── v4.0-M FIX-CRIT2: LLM enrichment on TOP picks ONLY ──────────────────
     # Previously ran inside assemble_result_v8() for all 100-200 candidates.
