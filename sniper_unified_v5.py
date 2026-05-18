@@ -634,7 +634,7 @@ ACCOUNT_EQUITY   = float(os.getenv("ACCOUNT_EQUITY", "500000"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "0.015"))
 
 SHARIAH_TTL_DAYS = int(os.getenv("SHARIAH_CACHE_TTL_DAYS", "7"))  # FIX-3: was 1 day; CI IPs blocked so daily re-fetch always fails; extend to 7d
-APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "5"))
+APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "3"))
 APEX_MIN_SCORE   = int(os.getenv("APEX_MIN_SCORE", "48"))
 NSE_MAX_RETRIES  = int(os.getenv("NSE_MAX_RETRIES", "3"))
 # FIX-4.1-M: Set NSE_MAX_RETRIES=1 in GitHub Actions env to cut log noise
