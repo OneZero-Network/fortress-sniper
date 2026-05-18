@@ -512,17 +512,26 @@ def fetch_history_with_proxy_fallback(symbol: str, days: int = 300, yf_cache=Non
 
 # ── FIX-A07 — Startup config validation ───────────────────────────────────────
 def _validate_startup_config() -> None:
-    """Validates numeric config parameters are within safe ranges."""
-    if not (0.001 <= ACCOUNT_RISK_PCT <= 0.05):
+    """Validates numeric config parameters are within safe ranges.
+
+    FIX-SEVERE-3: Explicitly cast env vars to float before arithmetic to prevent
+    TypeError when ACCOUNT_EQUITY/ACCOUNT_RISK_PCT are still strings from os.getenv().
+    Although globals are now cast at module load (float(os.getenv(...))), this
+    defensive cast ensures safety if called before module-level assignment settles.
+    """
+    _equity   = float(ACCOUNT_EQUITY)
+    _risk_pct = float(ACCOUNT_RISK_PCT)
+
+    if not (0.001 <= _risk_pct <= 0.05):
         raise ValueError(
-            f"ACCOUNT_RISK_PCT={ACCOUNT_RISK_PCT:.4f} outside safe range [0.001, 0.05]. "
-            f"Would risk ₹{ACCOUNT_EQUITY*ACCOUNT_RISK_PCT:,.0f} per trade."
+            f"ACCOUNT_RISK_PCT={_risk_pct:.4f} outside safe range [0.001, 0.05]. "
+            f"Would risk ₹{_equity * _risk_pct:,.0f} per trade."
         )
     if not (30 <= APEX_MIN_SCORE <= 90):
         raise ValueError(f"APEX_MIN_SCORE={APEX_MIN_SCORE} outside sane range [30, 90]")
     if MC_SIMS < 100:
         raise ValueError(f"MC_SIMS={MC_SIMS} too low for reliable Monte Carlo (min 100)")
-    log.info(f"Config validated: RISK={ACCOUNT_RISK_PCT*100:.1f}% EQUITY=₹{ACCOUNT_EQUITY:,.0f} APEX_MIN={APEX_MIN_SCORE} MC_SIMS={MC_SIMS}")
+    log.info(f"Config validated: RISK={_risk_pct*100:.1f}% EQUITY=₹{_equity:,.0f} APEX_MIN={APEX_MIN_SCORE} MC_SIMS={MC_SIMS}")
 
 
 # ── Event-Driven Pipeline Infrastructure ──────────────────────────────────────
@@ -634,7 +643,7 @@ ACCOUNT_EQUITY   = float(os.getenv("ACCOUNT_EQUITY", "500000"))
 ACCOUNT_RISK_PCT = float(os.getenv("ACCOUNT_RISK_PCT", "0.015"))
 
 SHARIAH_TTL_DAYS = int(os.getenv("SHARIAH_CACHE_TTL_DAYS", "7"))  # FIX-3: was 1 day; CI IPs blocked so daily re-fetch always fails; extend to 7d
-APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "3"))
+APEX_TOP_N       = int(os.getenv("APEX_TOP_N", "5"))
 APEX_MIN_SCORE   = int(os.getenv("APEX_MIN_SCORE", "48"))
 NSE_MAX_RETRIES  = int(os.getenv("NSE_MAX_RETRIES", "3"))
 # FIX-4.1-M: Set NSE_MAX_RETRIES=1 in GitHub Actions env to cut log noise
@@ -869,6 +878,79 @@ _CLAUDE_FAIL_COUNT  = 0
 _CLAUDE_CIRCUIT_OPEN = False
 _OPENAI_FAIL_COUNT  = 0
 _OPENAI_CIRCUIT_OPEN = False
+
+# ── CRITICAL-1: Token usage tracking & tier/model alerting ───────────────────
+# Tracks per-run token consumption so we can (a) sanity-check estimates,
+# (b) alert when monthly cost blows past ₹50, and (c) log which tier fired
+# which model so runaway Sonnet usage in Tier-1/2 is immediately visible.
+_LLM_USAGE_LOCK = threading.Lock()
+_LLM_USAGE: dict = {}          # provider → model → {input_tokens, output_tokens, calls, cost_inr}
+_LLM_MONTHLY_COST_INR = 0.0   # accumulated this process lifetime
+_LLM_COST_ALERT_INR   = float(os.getenv("LLM_COST_ALERT_INR", "50"))  # alert threshold ₹
+
+# Approximate pricing (USD per 1M tokens) — update when vendor pricing changes
+_PRICE_PER_1M: dict = {
+    "claude-sonnet-4-5":  {"in": 3.00,  "out": 15.00},
+    "claude-sonnet-4-6":  {"in": 3.00,  "out": 15.00},
+    "gpt-4.1-nano":       {"in": 0.10,  "out": 0.40},
+    "gpt-5-mini":         {"in": 0.40,  "out": 1.60},
+    "gpt-4o-mini":        {"in": 0.15,  "out": 0.60},
+    "gpt-4o":             {"in": 2.50,  "out": 10.00},
+}
+_USD_TO_INR = float(os.getenv("USD_TO_INR", "84"))
+
+
+def _llm_record_usage(provider: str, model: str, in_tok: int, out_tok: int, tier: str = "") -> None:
+    """Thread-safe accumulator for token counts and estimated cost.
+    Logs tier+model on every live call so runaway Sonnet-in-Tier1 is visible.
+    Fires a Telegram alert when estimated cost crosses _LLM_COST_ALERT_INR.
+    """
+    global _LLM_MONTHLY_COST_INR
+    model_key = model.lower().strip()
+
+    # Per-call tier log — helps catch CRITICAL-1 (Sonnet running in Tier-1/2)
+    log.info(f"LLM_CALL tier={tier or '?'} provider={provider} model={model_key} "
+             f"in={in_tok} out={out_tok}")
+
+    prices   = _PRICE_PER_1M.get(model_key, {"in": 1.0, "out": 4.0})
+    cost_inr = ((in_tok * prices["in"] + out_tok * prices["out"]) / 1_000_000) * _USD_TO_INR
+
+    with _LLM_USAGE_LOCK:
+        bucket = _LLM_USAGE.setdefault(provider, {}).setdefault(model_key, {
+            "input_tokens": 0, "output_tokens": 0, "calls": 0, "cost_inr": 0.0
+        })
+        bucket["input_tokens"]  += in_tok
+        bucket["output_tokens"] += out_tok
+        bucket["calls"]         += 1
+        bucket["cost_inr"]      += cost_inr
+        prev_total = _LLM_MONTHLY_COST_INR
+        _LLM_MONTHLY_COST_INR  += cost_inr
+
+        # Alert at each full multiple of the threshold (avoids spam)
+        if (int(prev_total / _LLM_COST_ALERT_INR) <
+                int(_LLM_MONTHLY_COST_INR / _LLM_COST_ALERT_INR)):
+            try:
+                _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                         f"\U0001f6a8 LLM COST ALERT: \u20b9{_LLM_MONTHLY_COST_INR:.1f} spent "
+                         f"this run (threshold \u20b9{_LLM_COST_ALERT_INR:.0f}). "
+                         f"Last call: {tier or '?'}/{provider}/{model_key}")
+            except Exception:
+                pass
+
+
+def _llm_usage_summary() -> str:
+    """Return a one-line usage summary string for end-of-run logging."""
+    with _LLM_USAGE_LOCK:
+        parts = []
+        for provider, models in _LLM_USAGE.items():
+            for model, stats in models.items():
+                parts.append(
+                    f"{provider}/{model}: {stats['calls']}calls "
+                    f"in={stats['input_tokens']} out={stats['output_tokens']} "
+                    f"\u2248\u20b9{stats['cost_inr']:.2f}"
+                )
+        return " | ".join(parts + [f"TOTAL\u2248\u20b9{_LLM_MONTHLY_COST_INR:.2f}"]) \
+               if parts else "no LLM calls this run"
 # Backward-compat alias used by a few inline checks
 _LLM_FAIL_COUNT  = 0      # kept for any external references
 _LLM_CIRCUIT_OPEN = False  # kept for any external references
@@ -909,7 +991,13 @@ def _call_claude(prompt: str, max_tokens: int = None) -> Optional[str]:
         if resp.status_code == 200:
             with _LLM_CB_LOCK:
                 _CLAUDE_FAIL_COUNT = 0
-            return resp.json()["content"][0]["text"]
+            rj = resp.json()
+            # CRITICAL-1: record token usage from API response
+            _u = rj.get("usage", {})
+            _llm_record_usage("claude", CLAUDE_MODEL,
+                              _u.get("input_tokens", 0), _u.get("output_tokens", 0),
+                              tier="direct")
+            return rj["content"][0]["text"]
         log.warning(f"Claude API error {resp.status_code}: {resp.text[:120]}")
         # 404 means wrong model name — open circuit immediately, don't retry
         if resp.status_code == 404:
@@ -960,7 +1048,13 @@ def _call_openai(prompt: str, model: str = None, max_tokens: int = None) -> Opti
         if resp.status_code == 200:
             with _LLM_CB_LOCK:
                 _OPENAI_FAIL_COUNT = 0
-            return resp.json()["choices"][0]["message"]["content"]
+            rj = resp.json()
+            # CRITICAL-1: record token usage from API response
+            _u = rj.get("usage", {})
+            _llm_record_usage("openai", model or OPENAI_MINI_MODEL,
+                              _u.get("prompt_tokens", 0), _u.get("completion_tokens", 0),
+                              tier="openai")
+            return rj["choices"][0]["message"]["content"]
         log.warning(f"OpenAI API error {resp.status_code}: {resp.text[:120]}")
     except Exception as e:
         log.warning(f"OpenAI call exception: {e}")
@@ -979,8 +1073,10 @@ def _call_tier1(prompt: str, max_tokens: int = 400) -> Optional[str]:
     """v5.1 TIER 1: GPT-4.1 Nano — high-volume cheap calls (Halal L4 screen).
     ARCH-D2: Falls back to Tier 2 (GPT-5 Mini) on Nano failure, not gpt-4o-mini,
     preserving the cost/quality tier hierarchy."""
+    log.debug(f"LLM_DISPATCH tier=tier1 model={LLM_TIER1_MODEL}")
     result = _call_openai(prompt, model=LLM_TIER1_MODEL, max_tokens=max_tokens)
     if result is None:
+        log.debug(f"LLM_DISPATCH tier=tier1 fallback→tier2 model={LLM_TIER2_MODEL}")
         result = _call_tier2(prompt, max_tokens=max_tokens)  # ARCH-D2: was OPENAI_MINI_MODEL
     return result
 
@@ -988,8 +1084,10 @@ def _call_tier1(prompt: str, max_tokens: int = 400) -> Optional[str]:
 def _call_tier2(prompt: str, max_tokens: int = 1000) -> Optional[str]:
     """v5.1 TIER 2: GPT-5 Mini — synthesis (1 call/run, per-pick context).
     Falls back to Claude Sonnet 4.5 if GPT-5 Mini unavailable."""
+    log.debug(f"LLM_DISPATCH tier=tier2 model={LLM_TIER2_MODEL}")
     result = _call_openai(prompt, model=LLM_TIER2_MODEL, max_tokens=max_tokens)
     if result is None:
+        log.debug(f"LLM_DISPATCH tier=tier2 fallback→claude model={CLAUDE_MODEL}")
         result = _call_claude(prompt, max_tokens=max_tokens)
     return result
 
@@ -1015,8 +1113,12 @@ def _call_tier3(prompt: str, max_tokens: int = 600) -> Optional[str]:
             timeout=45,
         )
         if resp.status_code == 200:
-            return resp.json()["content"][0]["text"]
-        # 404 = model not available — fall back to CLAUDE_MODEL
+            rj = resp.json()
+            _u = rj.get("usage", {})
+            _llm_record_usage("claude", LLM_TIER3_MODEL,
+                              _u.get("input_tokens", 0), _u.get("output_tokens", 0),
+                              tier="tier3")
+            return rj["content"][0]["text"]
         if resp.status_code == 404:
             log.debug(f"TIER3 model {LLM_TIER3_MODEL} not found — falling back to {CLAUDE_MODEL}")
             return _call_claude(prompt, max_tokens=max_tokens)
@@ -1107,16 +1209,23 @@ def _score_cache_get(symbol: str, run_date: str, close: float,
     BUG-3 FIX: original key was only (symbol, run_date, close). If FII/insider/filing data
     refreshed mid-day the cache served stale scores. intel_hash (from _intelligence_hash())
     is now part of the lookup so any intelligence change forces a rescore.
+
+    SEVERE-4 FIX: Query now uses PK equality on (symbol, run_date, intel_hash) so SQLite
+    uses the PRIMARY KEY index.  The ABS(bhavcopy_close - ?)<0.005 predicate was a
+    function on a column and could never use an index — moved to Python for the same
+    correctness with better query-plan clarity.
     """
     try:
         with _db_conn() as con:
             row = con.execute(
-                "SELECT result_json FROM score_cache "
-                "WHERE symbol=? AND run_date=? AND ABS(bhavcopy_close - ?)<0.005 AND intel_hash=?",
-                (symbol.upper(), run_date, close, intel_hash)
+                "SELECT result_json, bhavcopy_close FROM score_cache "
+                "WHERE symbol=? AND run_date=? AND intel_hash=?",
+                (symbol.upper(), run_date, intel_hash)
             ).fetchone()
         if row:
-            return json.loads(row[0])
+            # Python-side price tolerance — avoids ABS() function in SQL
+            if abs(row[1] - close) < 0.005:
+                return json.loads(row[0])
     except Exception:
         pass
     return None
@@ -2880,19 +2989,24 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
 
 
 def _halal_ai_cache_save(symbol: str, result: dict):
-    """Persist halal AI result to halal_ai_cache table."""
+    """Persist halal AI result to halal_ai_cache table.
+
+    SEVERE-5 FIX: now writes expires_at = assessed_date + HALAL_AI_TTL_DAYS so the
+    weekly cleanup job can purge stale rows instead of the table growing unbounded.
+    """
     try:
-        today = datetime.today().strftime("%Y-%m-%d")
+        today      = datetime.today().strftime("%Y-%m-%d")
+        expires_at = (datetime.today() + timedelta(days=HALAL_AI_TTL_DAYS)).strftime("%Y-%m-%d")
         with _db_conn(write=True) as con:
             con.execute("""
                 INSERT OR REPLACE INTO halal_ai_cache
                   (symbol, score, veto, tier, debt_to_mcap, business_model,
-                   ethical_score, llm_confidence, assessed_date, source)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ethical_score, llm_confidence, assessed_date, source, expires_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (symbol, result["score"], int(result["veto"]), result["tier"],
                   result["debt_to_mcap"], result["business_model"],
                   result["ethical_score"], result["llm_confidence"],
-                  today, result.get("source", "SCORED")))
+                  today, result.get("source", "SCORED"), expires_at))
     except Exception as e:
         log.debug(f"Halal AI cache save {symbol}: {e}")
 
@@ -3373,9 +3487,10 @@ def _init_db():
             created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (symbol, run_date, intel_hash)
         );
-        -- Index so FAST_RERUN lookup (symbol, run_date, close, intel_hash) is O(1)
-        CREATE INDEX IF NOT EXISTS idx_score_cache_lookup
-            ON score_cache (symbol, run_date, bhavcopy_close, intel_hash);
+        -- SEVERE-4 FIX: idx_score_cache_lookup dropped — redundant with PRIMARY KEY (symbol, run_date, intel_hash).
+        -- ABS(bhavcopy_close - ?)<0.005 is a function on a column and cannot use any index anyway.
+        -- The PK handles equality lookups on (symbol, run_date, intel_hash) perfectly.
+        -- For 300 symbols/day × 5 days = 1500 rows, a table scan on the PK remnant is negligible.
         CREATE TABLE IF NOT EXISTS bayes_calibration (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             prior_name      TEXT,
@@ -8735,7 +8850,8 @@ CREATE TABLE IF NOT EXISTS halal_ai_cache (
     llm_confidence  REAL DEFAULT 0.5,
     assessed_date   TEXT NOT NULL,
     source          TEXT DEFAULT 'SCORED',
-    llm_hash        TEXT
+    llm_hash        TEXT,
+    expires_at      TEXT  -- SEVERE-5 FIX: explicit TTL prevents unbounded table growth
 );
 
 CREATE TABLE IF NOT EXISTS platt_calibration (
@@ -8830,17 +8946,18 @@ def _migrate_db_v4():
                 log.debug(f"pick_outcomes sector migration: {_e}")
         log.info("DB v4.0-M migration complete")
         _deduplicate_pick_outcomes()   # DUPLICATE FIX: clean existing dupes before index is enforced
-        # FIX-RERUN: create score_cache table for existing DBs that predate this table.
-        # CREATE TABLE IF NOT EXISTS is already in _DB_SCHEMA_V4; this also creates the index.
+        # SEVERE-4 FIX: idx_score_cache_lookup was redundant with the PK — do NOT recreate it.
+        # score_cache PK (symbol, run_date, intel_hash) already provides O(1) lookup.
+
+        # SEVERE-5 FIX: add expires_at column to halal_ai_cache for existing DBs.
+        # Without this column the table grows unbounded — assessed_date alone has no purge path.
         try:
             with _db_conn(write=True) as con:
-                con.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_score_cache_lookup "
-                    "ON score_cache (symbol, run_date, bhavcopy_close)"
-                )
-            log.info("DB migration: score_cache index ensured ✅")
+                con.execute("ALTER TABLE halal_ai_cache ADD COLUMN expires_at TEXT")
+                log.info("DB migration: added 'expires_at' column to halal_ai_cache (SEVERE-5) ✅")
         except Exception as _e:
-            log.debug(f"score_cache index migration: {_e}")
+            if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
+                log.debug(f"halal_ai_cache expires_at migration: {_e}")
 
         # v5.1 CONVICTION HOLD: add columns to positions table
         _conv_alters = [
@@ -8969,6 +9086,19 @@ def _weekly_ai_status_agent():
                 pass
     except Exception as _ce:
         log.debug(f"llm_cache cleanup: {_ce}")
+
+    # SEVERE-5 FIX: purge expired halal_ai_cache rows weekly.
+    # Without this the table grew unbounded (no expiry path existed before this fix).
+    try:
+        with _db_conn(write=True) as _hac_con:
+            h_deleted = _hac_con.execute(
+                "DELETE FROM halal_ai_cache "
+                "WHERE expires_at IS NOT NULL AND expires_at <= date('now')"
+            ).rowcount
+        if h_deleted:
+            log.info(f"SEVERE-5: Pruned {h_deleted} expired halal_ai_cache row(s)")
+    except Exception as _hce:
+        log.debug(f"halal_ai_cache cleanup: {_hce}")
 
     if not (_ANTHROPIC_OK or _OPENAI_OK):
         _send_weekly_review()
@@ -10068,6 +10198,8 @@ def run():
             log.info("Top picks re-ranked by LLM confidence (architecture Step 9 §5)")
 
         log.info("Unified LLM enrichment complete")
+        # CRITICAL-1: log token usage summary so runaway Sonnet calls are visible in CI logs
+        log.info(f"LLM_USAGE_SUMMARY {_llm_usage_summary()}")
     elif not LLM_ENABLED:
         log.info("LLM disabled — skipping enrichment (set ANTHROPIC_API_KEY or OPENAI_API_KEY)")
 
