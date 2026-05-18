@@ -26,7 +26,7 @@ name: Fortress Sniper v5.0
 on:
   schedule:
     # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
-    - cron: "0 3 * * 1-5"
+    - cron: "0 0 * * 1-5"
     # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST
     - cron: "*/10 3-10 * * 1-5"
     # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
