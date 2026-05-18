@@ -1,5 +1,3 @@
-name: Fortress Sniper v5.0
-
 # ══════════════════════════════════════════════════════════════════════
 # UNIFIED HALAL SNIPER v5.0 — GitHub Actions Workflow
 # Bismillah — In the name of Allah, the Most Gracious, the Most Merciful
@@ -26,7 +24,7 @@ name: Fortress Sniper v5.0
 on:
   schedule:
     # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
-    - cron: "0 0 * * 1-5"
+    - cron: "0 3 * * 1-5"
     # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST
     - cron: "*/10 3-10 * * 1-5"
     # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
@@ -118,8 +116,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ github.run_id }}
-          restore-keys: sniper-db-
+          # UNIQUE key per run — never collides with parallel runs
+          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
+          # Fallback chain: try same run previous attempt, then any recent sniper-db
+          restore-keys: |
+            sniper-db-${{ github.run_id }}-
+            sniper-db-
 
       - name: Validate startup config
         run: python -c "import sys; sys.path.insert(0,''); from sniper_unified_v5 import _validate_startup_config; _validate_startup_config()"
@@ -147,15 +149,14 @@ jobs:
           ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY || '500000' }}
           ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
           FAST_RERUN:        ${{ inputs.fast_rerun || 'false' }}
-          # v5.0: parallel scoring uses 8 workers — no extra config needed
-          # v5.0: DB-backed offset — no tg_offset.txt dependency
 
       - name: Save DB cache
         if: always()
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ github.run_id }}
+          # UNIQUE save key — never collides
+          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload Excel report artifact
         if: always()
@@ -199,8 +200,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: reply-db-${{ github.run_id }}
-          # FIX-V5-3: offset now in DB — no tg_offset.txt restore needed
+          key: reply-db-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sniper-db-
             reply-db-
@@ -218,7 +218,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: reply-db-${{ github.run_id }}
+          key: reply-db-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ── JOB 3: Outcome engine — 3:30 PM IST (after market close) ────────
   outcome-check:
@@ -252,7 +252,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: outcome-db-${{ github.run_id }}
+          key: outcome-db-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sniper-db-
             reply-db-
@@ -281,7 +281,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: outcome-db-${{ github.run_id }}
+          key: outcome-db-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ── JOB 4: Weekly review — every Monday ─────────────────────────────
   weekly-review:
@@ -315,7 +315,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: weekly-db-${{ github.run_id }}
+          key: weekly-db-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sniper-db-
             outcome-db-
@@ -336,13 +336,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: weekly-db-${{ github.run_id }}
+          key: weekly-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # ── JOB 5: Sandbox proposals (manual only) ───────────────────────────
-
-  # -- JOB 6: RAG Backfill -- embed historical closed trades (manual only) --
+  # ── JOB 5: RAG Backfill (manual only) ───────────────────────────
   rag-backfill:
-    name: "RAG Historical Backfill"
+    name: "🔍 RAG Historical Backfill"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: >
@@ -371,15 +369,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: rag-db-${{ github.run_id }}
+          key: rag-db-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sniper-db-
             outcome-db-
             reply-db-
 
       - name: Run RAG historical backfill
-        # Embeds all closed pick_outcomes that lack trade_embeddings rows.
-        # Idempotent -- safe to run multiple times. Sends Telegram summary.
         run: python sniper_unified_v5.py --rag-backfill
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
@@ -394,9 +390,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: rag-db-${{ github.run_id }}
+          key: rag-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-
+  # ── JOB 6: Sandbox proposals (manual only) ───────────────────────────
   sandbox:
     name: "🧪 Sandbox Parameter Proposals"
     runs-on: ubuntu-latest
@@ -427,6 +423,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
+          key: sandbox-db-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: sniper-db-
 
       - name: Generate sandbox proposals
@@ -437,3 +434,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           CACHE_PATH:        outputs/sniper_cache.db
+
+      - name: Save DB after sandbox
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sandbox-db-${{ github.run_id }}-${{ github.run_attempt }}
