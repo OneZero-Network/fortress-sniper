@@ -24,7 +24,7 @@ env:
   SUPPRESS_HEALTH_ALERTS: "1"
   FORCE_YFINANCE:         "false"
   REPLY_TIMEOUT_MINUTES:  "30"
-  APEX_MIN_SCORE:         "40"
+  APEX_MIN_SCORE:         "48"
   APEX_TOP_N:             "5"
   CAPACITY_MAX_OPEN:      "4"
   CAPACITY_MAX_WEEK:      "6"
@@ -56,6 +56,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Install survival model dependencies
+        # FIX-v5.4: install scikit-survival so the survival meta-model is ready
+        # to activate when 100+ closed picks are accumulated. The pip cache
+        # action above means this only incurs the ~45s install cost once.
+        run: |
+          pip install -r requirements-survival.txt || \
+            echo "⚠️  scikit-survival install failed — survival model will run in fallback mode"
+
       - name: Restore DB
         uses: actions/cache@v4
         with:
@@ -75,6 +83,8 @@ jobs:
           ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY || '500000' }}
           ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
           FAST_RERUN:        ${{ inputs.fast_rerun || 'false' }}
+          # FIX-v5.4: explicit model pin — removes dependency on default in code
+          CLAUDE_MODEL:      "claude-sonnet-4-6"
 
       - name: Save DB
         if: always()
@@ -90,6 +100,18 @@ jobs:
           name: sniper-report-${{ github.run_id }}
           path: outputs/
           retention-days: 14
+
+      # FIX-v5.4: Persistent DB artifact — survives GitHub Actions cache eviction
+      # (cache is purged after 7 days of no access; artifacts are kept for retention-days).
+      # This is a safety net: even if the cache is evicted mid-week, you can restore
+      # from the last artifact and re-prime the cache manually.
+      - name: Upload DB as persistent artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sniper-db-latest
+          path: outputs/sniper_cache.db
+          retention-days: 90
 
   reply-handler:
     name: "📱 Reply Handler"
