@@ -10499,7 +10499,7 @@ def _weekly_ai_status_agent():
             "- Flag halal tier correlation if noteworthy\n"
             "- Keep under 300 words"
         )
-        report = (_call_openai(prompt, model=OPENAI_BATCH_MODEL, max_tokens=400) or
+        report = (_call_tier3(prompt, max_tokens=400) or
                   _call_claude(prompt, max_tokens=400))
 
         if not report:
@@ -10602,7 +10602,7 @@ def _generate_sandbox_proposal():
             "- Changes must be modest (+-10% max)\n"
             "- Require >=5% win rate improvement as justification"
         )
-        raw = (_call_openai(prompt, model=OPENAI_BATCH_MODEL, max_tokens=500) or
+        raw = (_call_tier3(prompt, max_tokens=500) or
                _call_claude(prompt, max_tokens=500))
         if not raw: return
 
@@ -11511,7 +11511,7 @@ def run():
                 '"filing_flag":"POSITIVE","fused_bonus":3,"rank":1}]'
             )
 
-            raw = _call_openai(prompt, max_tokens=1000) or _call_claude(prompt, max_tokens=1000)
+            raw = _call_openai(prompt, model=LLM_TIER2_MODEL, max_tokens=1000) or _call_claude(prompt, max_tokens=1000)
             if not raw:
                 return {}
             try:
