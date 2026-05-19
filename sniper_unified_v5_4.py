@@ -666,7 +666,8 @@ MC_HORIZON = 12         # swing horizon (days)
 THREE_LANE_ENABLED      = os.getenv("THREE_LANE", "true").lower() in ("1","true","yes")
 # B-001 FIX: resolve FAST_RERUN now that THREE_LANE_ENABLED is known
 _FAST_RERUN_RAW = os.getenv("FAST_RERUN", "false").lower() in ("1", "true", "yes")
-if THREE_LANE_ENABLED and _FAST_RERUN_RAW:    import logging as _log_b001
+if THREE_LANE_ENABLED and _FAST_RERUN_RAW:
+    import logging as _log_b001
     _log_b001.getLogger(__name__).warning(
         "B-001: FAST_RERUN=true is incompatible with THREE_LANE=true "
         "(cache only covers FUSED lane). Forcing FAST_RERUN=false."
@@ -694,11 +695,7 @@ MIN_HIST_BARS      = 30
 # FIX-RERUN: when True, scoring loop reads from score_cache instead of
 # re-running fortress_score + APEX for symbols already scored today.
 # Set FAST_RERUN=true for 2nd/3rd same-day manual runs to save time & API cost.
-# B-001 FIX: FAST_RERUN cache only reconstructs FUSED lane.
-# In THREE_LANE mode FORTRESS/APEX lanes get no cached data — silently empty.
-# Resolution: FAST_RERUN is automatically disabled when THREE_LANE_ENABLED=true.
-_FAST_RERUN_RAW = os.getenv("FAST_RERUN", "false").lower() in ("1", "true", "yes")
-FAST_RERUN = False  # resolved after THREE_LANE_ENABLED is defined below
+# B-001 FIX: FAST_RERUN is already resolved above using THREE_LANE_ENABLED.
 
 # ── v5.1: FORCE RUN mode — skips same-day cache/DB state check entirely ─────
 # Set via workflow_dispatch input `force: true` or env var FORCE_RUN=true
@@ -835,6 +832,13 @@ _NSE_IP_BLOCKED        = False       # True = skip ALL NSE calls this run
 _YF_BACKOFF_BASE   = 2.0   # C3: base for exponential back-off (seconds)
 _YF_BACKOFF_MAX    = 60.0  # C3: cap per-attempt sleep
 _YF_MAX_ATTEMPTS   = 4     # C3: per-call retry budget
+
+# OPT-9: Meta-model singleton — load once per run, not per pick
+_META_MODEL_SINGLETON = None
+_META_MODEL_LOADED    = False
+
+# MEDIUM-1: Lock for shared yf_cache dict accessed by parallel scoring workers
+_YF_CACHE_LOCK = threading.Lock()
 
 _CNX500_CACHE        = None
 _CNX500_CACHE_TIME   = 0
@@ -6201,14 +6205,12 @@ def _prepopulate_halal_l1_cache() -> None:
                 try:
                     con.execute("""
                         INSERT OR IGNORE INTO halal_ai_cache
-                          (symbol, sector, verdict, tier, score, detail,
-                           assessed_date, expires_at, source)
-                        VALUES (?,?,?,?,?,?,?,?,'L1_PREPOP')
+                          (symbol, score, veto, tier, debt_to_mcap, business_model,
+                           ethical_score, llm_confidence, assessed_date, source, expires_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """, (
-                        sym.upper(), "HARAM_SECTOR",
-                        "VETOED", "HARAM", 0,
-                        "Pre-populated by L1 keyword veto (bank/finance/insurance/tobacco/etf)",
-                        today, expires
+                        sym.upper(), 0, 1, "HARAM", 0.0, "HARAM_BUSINESS",
+                        0, 0.0, today, "L1_PREPOP", expires
                     ))
                     inserted += 1
                 except Exception:
@@ -8983,9 +8985,8 @@ def _get_yesterday_picks() -> List[dict]:
                 "SELECT run_date, symbol, entry_price, stop_loss, r1, r2, r3, grade, fused_score, story "
                 "FROM pick_outcomes "
                 "WHERE status='open' AND run_date>=? "
-                "GROUP BY run_date, symbol "
-                "HAVING id = MAX(id)",
-                (since,)
+                "  AND id IN (SELECT MAX(id) FROM pick_outcomes WHERE status='open' AND run_date>=? GROUP BY run_date, symbol)",
+                (since, since)
             ).fetchall()
             return [dict(zip(["run_date","symbol","entry_price","stop_loss",
                               "r1","r2","r3","grade","fused_score","story"], r)) for r in rows]
@@ -10052,15 +10053,15 @@ def _backup_db_to_sheets():
     try:
         with _db_conn() as con:
             sig_rows = con.execute(
-                "SELECT run_date, symbol, grade, fused_score, fortress_score, "
-                "apex_composite, close_price, stop_loss, r1, r2, macro_state, created_at "
+                "SELECT run_date, symbol, grade, fused_score, "
+                "close, stop_loss, r1, r2, r3, sector, created_at "
                 "FROM sniper_results "
                 "ORDER BY created_at DESC LIMIT 200"
             ).fetchall()
         if sig_rows:
-            sig_header = [["run_date","symbol","grade","fused_score","fortress_score",
-                           "apex_composite","close_price","stop_loss","r1","r2",
-                           "macro_state","created_at",
+            sig_header = [["run_date","symbol","grade","fused_score",
+                           "close","stop_loss","r1","r2","r3",
+                           "sector","created_at",
                            f"exported_at: {exported_at}"]]
             _push_sheet("DB_SIGNALS", sig_header + [list(r) for r in sig_rows])
             log.info(f"ARCH-M2: {len(sig_rows)} sniper_results rows → Sheets DB_SIGNALS ✅")
