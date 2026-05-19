@@ -1226,15 +1226,16 @@ def _llm_store_cache(text: str, prompt_type: str, result: str, model: str = ""):
 
 def _llm_call(prompt: str, prompt_type: str, max_tokens: int = None) -> Optional[str]:
     """
-    Legacy single-provider call shim. Routes to Claude first, then OpenAI.
-    New code should call _call_claude / _call_openai directly.
+    Legacy single-provider call shim. Routes to OpenAI first, then Claude.
+    FIX-3: OpenAI is now primary; Claude is fallback only.
+    New code should call _call_openai / _call_claude directly.
     """
     if not LLM_ENABLED:
         return None
     cached = _llm_cached(prompt, prompt_type)
     if cached:
         return cached
-    raw = _call_claude(prompt, max_tokens) or _call_openai(prompt, max_tokens=max_tokens)
+    raw = _call_openai(prompt, max_tokens=max_tokens) or _call_claude(prompt, max_tokens)
     if raw:
         _llm_store_cache(prompt, prompt_type, raw)
     return raw
@@ -1470,9 +1471,9 @@ def _llm_structured_reasoning(symbol: str, signal_dict: dict) -> Optional[dict]:
         '"vol_profile": 0.0-1.0, "pattern": 0.0-1.0, "bayesian": 0.0-1.0}, '
         '"regime_note": "single sentence"}'
     )
-    # Route: Claude first (better at structured JSON), fall back to Tier 2 (GPT-5 Mini).
-    # ARCH-D2: was _call_openai(model=OPENAI_MINI_MODEL) — now correctly uses tier hierarchy.
-    raw = _call_claude(prompt, max_tokens=600) or _call_tier2(prompt, max_tokens=600)
+    # Route: Tier 2 (GPT-5 Mini) first, fall back to Claude (better at structured JSON).
+    # FIX-3: OpenAI is now primary provider; Claude is fallback only.
+    raw = _call_tier2(prompt, max_tokens=600) or _call_claude(prompt, max_tokens=600)
     if not raw:
         return None
     try:
@@ -10382,7 +10383,19 @@ def _weekly_ai_status_agent():
     Reads performance data, generates observations via GPT-4o (batch).
     NEVER mutates DB or parameters. Falls back to _send_weekly_review() if no LLM key.
     FIX-A6: also triggers DB backup to Sheets so pick history survives cache eviction.
+    FIX-W1: Only runs on Monday (weekday==0) unless FORCE_WEEKLY env var is set.
     """
+    # FIX-W1: Guard against accidental Tuesday runs (e.g. manual workflow_dispatch).
+    # Set FORCE_WEEKLY=true in GitHub Actions dispatch inputs to override.
+    _force = os.getenv("FORCE_WEEKLY", "").strip().lower() in ("1", "true", "yes")
+    if datetime.today().weekday() != 0 and not _force:
+        log.info(
+            "Weekly review skipped — today is not Monday "
+            "(weekday=%d). Set FORCE_WEEKLY=true to override.",
+            datetime.today().weekday()
+        )
+        return
+
     # FIX-A6: Backup DB to Sheets at the start of weekly review.
     # GitHub Actions cache TTL is 7 days — the weekly run is the perfect trigger
     # to ensure history is preserved before it can expire.
@@ -11498,7 +11511,7 @@ def run():
                 '"filing_flag":"POSITIVE","fused_bonus":3,"rank":1}]'
             )
 
-            raw = _call_claude(prompt, max_tokens=1000) or _call_openai(prompt, max_tokens=1000)
+            raw = _call_openai(prompt, max_tokens=1000) or _call_claude(prompt, max_tokens=1000)
             if not raw:
                 return {}
             try:
