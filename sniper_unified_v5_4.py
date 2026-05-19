@@ -710,7 +710,7 @@ FORCE_ADDON = os.getenv("FORCE_ADDON", "false").lower() in ("1", "true", "yes")
 # TIER 2 (Unified synthesis — per run, 1 call):   GPT-5 Mini (or Claude Sonnet 4.5 fallback)
 # TIER 3 (Weekly agent — complex reasoning):      Claude Sonnet 4.6
 LLM_TIER1_MODEL = os.getenv("LLM_TIER1_MODEL", "gpt-4.1-nano")   # Halal L4
-LLM_TIER2_MODEL = os.getenv("LLM_TIER2_MODEL", "gpt-5-mini")     # Synthesis
+LLM_TIER2_MODEL = os.getenv("LLM_TIER2_MODEL", "gpt-4o-mini")     # Synthesis — FIX-v5.4: was "gpt-5-mini" (unverified); gpt-4o-mini is confirmed available
 LLM_TIER3_MODEL = os.getenv("LLM_TIER3_MODEL", "claude-sonnet-4-6")  # Weekly agent
 
 # ── v5.1: RAG CONFIG ──────────────────────────────────────────────────────────
@@ -881,12 +881,18 @@ def _get_nse_history_ok():
 
 # Claude (Anthropic) — signal coherence + halal screening
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-# FIX-MODEL: env var was set to stale "claude-sonnet-4-20250514" — correct name is
-# "claude-sonnet-4-5". If CLAUDE_MODEL env var exists, validate it; strip known stale names.
-_raw_claude_model  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
-_STALE_MODEL_NAMES = {"claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022",
-                      "claude-3-sonnet-20240229", "claude-3-haiku-20240307"}
-CLAUDE_MODEL       = ("claude-sonnet-4-5" if _raw_claude_model in _STALE_MODEL_NAMES
+# FIX-MODEL-v5.4: "claude-sonnet-4-5" is now stale — correct live model is "claude-sonnet-4-6".
+# Added "claude-sonnet-4-5" to the stale set so any env var or hardcoded reference
+# auto-corrects. Default CLAUDE_MODEL falls through to "claude-sonnet-4-6".
+_raw_claude_model  = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+_STALE_MODEL_NAMES = {
+    "claude-sonnet-4-5",            # FIX-MODEL-v5.4: previously the "correct" default — now stale
+    "claude-sonnet-4-20250514",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+}
+CLAUDE_MODEL       = ("claude-sonnet-4-6" if _raw_claude_model in _STALE_MODEL_NAMES
                       else _raw_claude_model)
 
 # OpenAI — filing sentiment (mini) + sandbox/weekly (batch)
@@ -9115,7 +9121,8 @@ def _run_outcome_engine():
     """Check all open picks from previous days and update their outcomes.
     LOG-STORM FIX: when NSE is IP-blocked, batch-preload histories via yfinance
     instead of making per-symbol NSE calls that all fail after 3 retries each.
-    The deduplication in _get_yesterday_picks() ensures we process each symbol once."""
+    The deduplication in _get_yesterday_picks() ensures we process each symbol once.
+    FIX-v5.4: sends a concise EOD Telegram summary after resolving any outcomes."""
     log.info("=" * 70)
     log.info("OUTCOME ENGINE — Checking open picks…")
     log.info("=" * 70)
@@ -9140,6 +9147,9 @@ def _run_outcome_engine():
         log.info(f"  NSE IP-blocked — batch-loading {len(symbols)} histories via yfinance")
         yf_cache = _preload_histories_yf(symbols, days=30)
 
+    # ── Collect resolved outcomes for EOD summary ─────────────────────────
+    _resolved: list = []   # dicts with status + pnl_pct for closed picks
+
     for pick in open_picks:
         sym = pick["symbol"]
         try:
@@ -9152,6 +9162,13 @@ def _run_outcome_engine():
                     outcome["exit_price"], outcome["pnl_pct"],
                     outcome["days_held"], outcome["hit_target"]
                 )
+                _resolved.append({
+                    "symbol":  sym,
+                    "status":  outcome["status"],
+                    "pnl_pct": outcome.get("pnl_pct") or 0.0,
+                    "days":    outcome.get("days_held") or 0,
+                    "target":  outcome.get("hit_target") or "—",
+                })
             else:
                 log.info(f"  {sym}: still open ({outcome['days_held']} days | "
                          f"run_date={pick['run_date']})")
@@ -9161,6 +9178,38 @@ def _run_outcome_engine():
             log.debug(f"Outcome check {sym}: {e}")
 
     log.info("  Outcome engine complete")
+
+    # ── FIX-v5.4: EOD Telegram summary (only when picks are resolved) ─────
+    if _resolved:
+        try:
+            _WIN_STATUSES  = {"r1_hit", "r2_hit", "r3_hit"}
+            _LOSS_STATUSES = {"stopped", "expired"}
+            wins   = [r for r in _resolved if r["status"] in _WIN_STATUSES]
+            losses = [r for r in _resolved if r["status"] in _LOSS_STATUSES]
+            still_open = len(open_picks) - len(_resolved)
+            total_pnl  = sum(r["pnl_pct"] for r in _resolved)
+            avg_pnl    = total_pnl / len(_resolved)
+
+            lines = ["📊 <b>EOD Outcome Summary</b>"]
+            if wins:
+                lines.append(f"✅ <b>{len(wins)} win(s):</b>")
+                for r in wins:
+                    lines.append(f"   • {r['symbol']} {r['target']} +{r['pnl_pct']:.1f}% ({r['days']}d)")
+            if losses:
+                lines.append(f"🔴 <b>{len(losses)} loss(es):</b>")
+                for r in losses:
+                    lines.append(f"   • {r['symbol']} {r['status']} {r['pnl_pct']:+.1f}% ({r['days']}d)")
+            lines.append(
+                f"\n<b>Net P&amp;L this batch:</b> {total_pnl:+.1f}%  "
+                f"(avg {avg_pnl:+.1f}% per trade)"
+            )
+            if still_open:
+                lines.append(f"⏳ {still_open} position(s) still open")
+
+            _tg_post(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, "\n".join(lines))
+            log.info(f"EOD summary sent: {len(wins)}W / {len(losses)}L / {still_open} open")
+        except Exception as _tg_err:
+            log.debug(f"EOD Telegram summary (non-fatal): {_tg_err}")
 
 
 def _get_sector_performance(days: int = 30) -> dict:
@@ -10721,7 +10770,7 @@ def run():
     log.info(f"Anthropic OK: {_ANTHROPIC_OK}")
     log.info(f"OpenAI OK:    {_OPENAI_OK}")
     if _ANTHROPIC_OK:
-        _stale_flag = "⚠️ (was stale — auto-corrected to claude-sonnet-4-5)" if _raw_claude_model in _STALE_MODEL_NAMES else "✅"
+        _stale_flag = "⚠️ (was stale — auto-corrected to claude-sonnet-4-6)" if _raw_claude_model in _STALE_MODEL_NAMES else "✅"
         log.info(f"Claude model: {CLAUDE_MODEL} {_stale_flag}")
 
     # Reset LLM circuit breakers (per-provider) for this run — FIX-4.1-M
