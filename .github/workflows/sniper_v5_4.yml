@@ -1,31 +1,10 @@
-# ══════════════════════════════════════════════════════════════════════
-# UNIFIED HALAL SNIPER v5.0 — GitHub Actions Workflow
-# Bismillah — In the name of Allah, the Most Gracious, the Most Merciful
-#
-# SCHEDULE:
-#   Job 1 — sniper-run:    Daily at 8:30 AM IST (3:00 AM UTC) Mon-Fri
-#   Job 2 — reply-handler: Every 10 min, 8:30 AM–4 PM IST (3-10 AM UTC)
-#   Job 3 — outcome-check: Daily at 3:30 PM IST (10:00 AM UTC) Mon-Fri
-#   Job 4 — weekly-review: Every Monday 9:00 AM IST (3:30 AM UTC)
-#
-# MANUAL TRIGGER (workflow_dispatch):
-#   Runs both sniper-run AND reply-handler in one click.
-#   Use for testing or catch-up runs.
-#
-# v5.0 CHANGES vs v4.x:
-#   - Parallel scoring (PERF-1): 8 workers — no workflow change needed
-#   - DB-backed offset (FIX-V5-3): offset no longer stored in flat file,
-#     so tg_offset.txt removed from cache restore key
-#   - daily_shortlist_analysis table included in DB cache
-#   - outcome-check job added (3:30 PM IST) for same-day outcome tracking
-#   - REPLY_TIMEOUT_MINUTES env var wired (default 30)
-# ══════════════════════════════════════════════════════════════════════
+name: "UNIFIED HALAL SNIPER v5.4"
 
 on:
   schedule:
     # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
-    - cron: "0 0 * * 1-5"
-    # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST
+    - cron: "0 3 * * 1-5"
+    # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00 AM–10:30 AM UTC
     - cron: "*/10 3-10 * * 1-5"
     # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
     - cron: "0 10 * * 1-5"
@@ -34,57 +13,25 @@ on:
 
   workflow_dispatch:
     inputs:
-      stage:
-        description: "Stage to run"
-        required: false
-        default: "all"
-        type: choice
-        options:
-          - all
-          - bhavcopy
-          - fortress
-          - apex
-          - halal
-          - telegram
-          - weekly
-          - sandbox
-          - outcome
-          - rag-backfill
-      date:
-        description: "Target date (blank = today, YYYY-MM-DD)"
-        required: false
-        default: ""
-      source:
-        description: "Data source override"
-        required: false
-        default: "auto"
-        type: choice
-        options:
-          - auto
-          - nse
-          - sheets
-          - yf
       fast_rerun:
         description: "Fast rerun (use score cache)"
         required: false
         default: "false"
         type: boolean
 
-# ── Global env vars ──────────────────────────────────────────────────
 env:
-  NSE_MAX_RETRIES:       "1"       # Cuts log noise when NSE IP is blocked
-  SUPPRESS_HEALTH_ALERTS: "1"     # Suppress Shariah CSV noise in CI
-  FORCE_YFINANCE:        "false"   # Flip to "true" if NSE is down
-  REPLY_TIMEOUT_MINUTES: "30"     # Auto-SKIP after 30 min of silence
-  APEX_MIN_SCORE:        "48"
-  APEX_TOP_N:            "5"
-  CAPACITY_MAX_OPEN:     "4"
-  CAPACITY_MAX_WEEK:     "6"
-  MC_SIMS:               "600"
+  NSE_MAX_RETRIES:        "1"
+  SUPPRESS_HEALTH_ALERTS: "1"
+  FORCE_YFINANCE:         "false"
+  REPLY_TIMEOUT_MINUTES:  "30"
+  APEX_MIN_SCORE:         "48"
+  APEX_TOP_N:             "5"
+  CAPACITY_MAX_OPEN:      "4"
+  CAPACITY_MAX_WEEK:      "6"
+  MC_SIMS:                "600"
 
 jobs:
 
-  # ── JOB 1: Main sniper engine — runs once daily at market open ─────
   sniper-run:
     name: "⚔️ Sniper Daily Run"
     runs-on: ubuntu-latest
@@ -94,15 +41,12 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1-5')
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip dependencies
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -112,32 +56,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore DB from previous run
+      - name: Restore DB
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          # UNIQUE key per run — never collides with parallel runs
           key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
-          # Fallback chain: try same run previous attempt, then any recent sniper-db
           restore-keys: |
-            sniper-db-${{ github.run_id }}-
             sniper-db-
+            reply-db-
 
-      - name: Validate startup config
-        run: python -c "import sys; sys.path.insert(0,''); from sniper_unified_v5 import _validate_startup_config; _validate_startup_config()"
-        env:
-          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
-          CACHE_PATH:        outputs/sniper_cache.db
-          ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY || '500000' }}
-          ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
-
-      - name: Run Sniper v5.0
-        run: python sniper_unified_v5.py
+      - name: Run Sniper v5.4
+        run: python sniper_unified_v5_4.py   # ← FIXED filename
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -150,27 +79,23 @@ jobs:
           ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
           FAST_RERUN:        ${{ inputs.fast_rerun || 'false' }}
 
-      - name: Save DB cache
+      - name: Save DB
         if: always()
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          # UNIQUE save key — never collides
           key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Upload Excel report artifact
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sniper-report-${{ github.run_id }}
-          path: |
-            outputs/sniper_report.xlsx
-            outputs/sniper_report.html
+          path: outputs/
           retention-days: 14
 
-  # ── JOB 2: Telegram reply poller — every 10 min during market hours ─
   reply-handler:
-    name: "📱 Reply Handler Poll"
+    name: "📱 Reply Handler"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: >
@@ -178,15 +103,12 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '*/10 3-10 * * 1-5')
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip dependencies
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -205,40 +127,36 @@ jobs:
             sniper-db-
             reply-db-
 
-      - name: Poll Telegram replies
-        run: python reply_handler_v5.py
+      - name: Poll Telegram
+        run: python reply_handler_v5_4.py   # ← FIXED filename
         env:
           TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
           CACHE_PATH:            outputs/sniper_cache.db
           REPLY_TIMEOUT_MINUTES: "30"
 
-      - name: Save DB cache with updated offset
+      - name: Save DB
         if: always()
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
           key: reply-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # ── JOB 3: Outcome engine — 3:30 PM IST (after market close) ────────
   outcome-check:
-    name: "📊 Outcome Engine (Market Close)"
+    name: "📊 Outcome Engine"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: >
       (github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5') ||
-      (github.event_name == 'workflow_dispatch' && inputs.stage == 'outcome')
+      github.event_name == 'workflow_dispatch'
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip dependencies
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -257,51 +175,43 @@ jobs:
             sniper-db-
             reply-db-
 
-      - name: Run outcome engine + auto-SKIP EOD
+      - name: Run outcome engine
         run: |
           python - <<'EOF'
-          from sniper_unified_v5 import _init_db, _run_outcome_engine, _auto_log_skipped_picks, _get_last_trading_day
+          from sniper_unified_v5_4 import _init_db, _run_outcome_engine, _auto_log_skipped_picks, _get_last_trading_day
           _init_db()
           _, date_label = _get_last_trading_day()
           _run_outcome_engine()
           _auto_log_skipped_picks(date_label)
-          print(f"Outcome engine complete for {date_label}")
+          print(f"Outcome complete for {date_label}")
           EOF
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           CACHE_PATH:        outputs/sniper_cache.db
 
-      - name: Save DB after outcome
+      - name: Save DB
         if: always()
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
           key: outcome-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # ── JOB 4: Weekly review — every Monday ─────────────────────────────
   weekly-review:
-    name: "📈 Weekly AI Review + Trend Analysis"
+    name: "📈 Weekly Review"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: >
       (github.event_name == 'schedule' && github.event.schedule == '30 3 * * 1') ||
-      (github.event_name == 'workflow_dispatch' && inputs.stage == 'weekly')
+      github.event_name == 'workflow_dispatch'
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip dependencies
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -320,8 +230,8 @@ jobs:
             sniper-db-
             outcome-db-
 
-      - name: Run weekly review + shortlist trend analysis (OUT-3)
-        run: python sniper_unified_v5.py --weekly-review
+      - name: Run weekly review
+        run: python sniper_unified_v5_4.py --weekly-review   # ← FIXED
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -331,113 +241,9 @@ jobs:
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           CACHE_PATH:        outputs/sniper_cache.db
 
-      - name: Save DB after weekly
+      - name: Save DB
         if: always()
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
           key: weekly-db-${{ github.run_id }}-${{ github.run_attempt }}
-
-  # ── JOB 5: RAG Backfill (manual only) ───────────────────────────
-  rag-backfill:
-    name: "🔍 RAG Historical Backfill"
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: >
-      github.event_name == 'workflow_dispatch' && inputs.stage == 'rag-backfill'
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-${{ runner.os }}-
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Restore DB
-        uses: actions/cache@v4
-        with:
-          path: outputs/sniper_cache.db
-          key: rag-db-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sniper-db-
-            outcome-db-
-            reply-db-
-
-      - name: Run RAG historical backfill
-        run: python sniper_unified_v5.py --rag-backfill
-        env:
-          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CACHE_PATH:        outputs/sniper_cache.db
-          RAG_ENABLED:       "true"
-          RAG_MIN_TRADES:    "3"
-
-      - name: Save DB after backfill
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: outputs/sniper_cache.db
-          key: rag-db-${{ github.run_id }}-${{ github.run_attempt }}
-
-  # ── JOB 6: Sandbox proposals (manual only) ───────────────────────────
-  sandbox:
-    name: "🧪 Sandbox Parameter Proposals"
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    if: >
-      github.event_name == 'workflow_dispatch' && inputs.stage == 'sandbox'
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-${{ runner.os }}-
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Restore DB
-        uses: actions/cache@v4
-        with:
-          path: outputs/sniper_cache.db
-          key: sandbox-db-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: sniper-db-
-
-      - name: Generate sandbox proposals
-        run: python sniper_unified_v5.py --sandbox-proposals
-        env:
-          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
-          CACHE_PATH:        outputs/sniper_cache.db
-
-      - name: Save DB after sandbox
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: outputs/sniper_cache.db
-          key: sandbox-db-${{ github.run_id }}-${{ github.run_attempt }}
