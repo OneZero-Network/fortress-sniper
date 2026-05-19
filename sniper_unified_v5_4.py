@@ -665,8 +665,8 @@ MC_HORIZON = 12         # swing horizon (days)
 # =====================================================================================
 THREE_LANE_ENABLED      = os.getenv("THREE_LANE", "true").lower() in ("1","true","yes")
 # B-001 FIX: resolve FAST_RERUN now that THREE_LANE_ENABLED is known
-if THREE_LANE_ENABLED and _FAST_RERUN_RAW:
-    import logging as _log_b001
+_FAST_RERUN_RAW = os.getenv("FAST_RERUN", "false").lower() in ("1", "true", "yes")
+if THREE_LANE_ENABLED and _FAST_RERUN_RAW:    import logging as _log_b001
     _log_b001.getLogger(__name__).warning(
         "B-001: FAST_RERUN=true is incompatible with THREE_LANE=true "
         "(cache only covers FUSED lane). Forcing FAST_RERUN=false."
