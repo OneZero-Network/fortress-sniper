@@ -3,7 +3,7 @@ name: "UNIFIED HALAL SNIPER v5.4"
 on:
   schedule:
     # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
-    - cron: "0 0 * * 1-5"
+    - cron: "0 3 * * 1-5"           # ← FIXED: was 0 0
     # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00 AM–10:30 AM UTC
     - cron: "*/10 3-10 * * 1-5"
     # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
@@ -121,6 +121,12 @@ jobs:
           path: outputs/sniper_cache.db
           key: sniper-db-persistent
 
+      - name: Restore offset
+        uses: actions/cache@v4
+        with:
+          path: tg_offset.txt
+          key: tg-offset-persistent
+
       - name: Poll Telegram
         run: python reply_handler_v5_4.py
         env:
@@ -128,6 +134,13 @@ jobs:
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
           CACHE_PATH:            outputs/sniper_cache.db
           REPLY_TIMEOUT_MINUTES: "30"
+
+      - name: Save offset
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: tg_offset.txt
+          key: tg-offset-persistent
 
       - name: Save DB
         if: always()
