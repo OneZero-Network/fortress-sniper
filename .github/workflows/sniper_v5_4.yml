@@ -60,13 +60,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sniper-db-
-            reply-db-
+          key: sniper-db-persistent
 
       - name: Run Sniper v5.4
-        run: python sniper_unified_v5_4.py   # ← FIXED filename
+        run: python sniper_unified_v5_4.py
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -84,7 +81,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db-persistent
 
       - name: Upload reports
         if: always()
@@ -122,13 +119,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: reply-db-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sniper-db-
-            reply-db-
+          key: sniper-db-persistent
 
       - name: Poll Telegram
-        run: python reply_handler_v5_4.py   # ← FIXED filename
+        run: python reply_handler_v5_4.py
         env:
           TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -140,7 +134,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: reply-db-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db-persistent
 
   outcome-check:
     name: "📊 Outcome Engine"
@@ -170,10 +164,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: outcome-db-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sniper-db-
-            reply-db-
+          key: sniper-db-persistent
 
       - name: Run outcome engine
         run: |
@@ -195,7 +186,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: outcome-db-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db-persistent
 
   weekly-review:
     name: "📈 Weekly Review"
@@ -225,13 +216,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: weekly-db-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sniper-db-
-            outcome-db-
+          key: sniper-db-persistent
 
       - name: Run weekly review
-        run: python sniper_unified_v5_4.py --weekly-review   # ← FIXED
+        run: python sniper_unified_v5_4.py --weekly-review
         env:
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -246,4 +234,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: outputs/sniper_cache.db
-          key: weekly-db-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db-persistent
