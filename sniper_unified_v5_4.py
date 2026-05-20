@@ -710,7 +710,7 @@ FAST_RERUN = _FAST_RERUN_RAW and not THREE_LANE_ENABLED
 LANE_FORTRESS_MIN       = int(os.getenv("LANE_FORTRESS_MIN", "55"))   # fort_pts gate
 LANE_APEX_MIN           = int(os.getenv("LANE_APEX_MIN", "55"))       # apex_composite gate
 LANE_FUSED_MIN          = int(os.getenv("LANE_FUSED_MIN", "65"))      # fused gate
-LANE_TOP_N              = int(os.getenv("LANE_TOP_N", "5"))           # top-N per lane pre-dedup
+LANE_TOP_N              = int(os.getenv("LANE_TOP_N", "8"))           # top-N per lane pre-dedup
 MC_PROJECTION_ENABLED   = os.getenv("MC_PROJECTION_ENABLED", "true").lower() in ("1","true","yes")
 MC_PROJECTION_SIMS      = int(os.getenv("MC_PROJECTION_SIMS", "600"))
 MC_DIVERGENCE_SIGMA_TH  = float(os.getenv("MC_DIVERGENCE_SIGMA_TH", "2.0"))  # >2sigma triggers LLM
@@ -823,6 +823,10 @@ _RENEWABLE_SYMBOLS = {
     "WAAREEENER","PREMIER","OLECTRA","GREENKO","STERLINWIL","ACME",
     "GOLDENSORL","JINDALSTE",   # solar manufacturing
     "KAYNES","DIXON",           # EV electronics supply chain
+    "JAINREC",                  # Jain Irrigation – clearly halal, LLM confidence too strict
+    # Optional: add any other symbols that were vetoed incorrectly,
+    # but note that this set is intended for renewable/clean energy.
+    # For non‑renewable halal symbols, consider a separate whitelist.
 }
 
 SECTOR_ATR_MULT = {
@@ -3030,22 +3034,24 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
         except Exception:
             pass
 
-    prompt = (
-        "You are an Islamic finance compliance analyst. Assess this Indian listed company.\n"
-        f"Symbol: {symbol}\nSector: {sector}\n"
-        f"Business description: {business_desc[:500] or 'Not available'}\n\n"
-        "Assess Shariah compliance. Return ONLY JSON (no markdown):\n"
-        '{"halal_confidence": 0.0-1.0, '
-        '"business_concern": "brief concern or NONE", '
-        '"revenue_model": "fee_based|interest_based|mixed|manufacturing|services", '
-        '"subsidiary_risk": "LOW|MEDIUM|HIGH", '
-        '"illiquid_asset_risk": "LOW|MEDIUM|HIGH", '
-        '"manual_review_needed": true|false}\n\n'
-        "1.0 = clearly permissible, 0.0 = clearly impermissible. "
-        "Be conservative — when uncertain, lower confidence.\n"
-        "illiquid_asset_risk: HIGH if >20% of assets/revenue derive from derivatives, "
-        "futures, speculative trading, or non-productive financial instruments."
-    )
+prompt = (
+    "You are an Islamic finance compliance analyst. Assess this Indian listed company.\n"
+    f"Symbol: {symbol}\nSector: {sector}\n"
+    f"Business description: {business_desc[:500] or 'Not available'}\n\n"
+    "Assess Shariah compliance. Return ONLY JSON (no markdown):\n"
+    '{"halal_confidence": 0.0-1.0, '
+    '"business_concern": "brief concern or NONE", '
+    '"revenue_model": "fee_based|interest_based|mixed|manufacturing|services", '
+    '"subsidiary_risk": "LOW|MEDIUM|HIGH", '
+    '"illiquid_asset_risk": "LOW|MEDIUM|HIGH", '
+    '"manual_review_needed": true|false}\n\n'
+    "1.0 = clearly permissible, 0.0 = clearly impermissible. "
+    "Be conservative — when uncertain, lower confidence.\n"
+    "illiquid_asset_risk: HIGH if >20% of assets/revenue derive from derivatives, "
+    "futures, speculative trading, or non-productive financial instruments.\n"
+    "If the business is clearly manufacturing / agriculture / IT services and not financial, "
+    "default to confidence ≥0.60 unless strong evidence of high financial depth (>33% of revenue/interest) otherwise."
+)
     # v5.1 TIER 1: GPT-4.1 Nano for Halal L4 (high-volume cheap calls)
     raw = _call_tier1(prompt, max_tokens=350)
     if not raw:
@@ -3220,7 +3226,7 @@ def halal_ai_screen(symbol: str, sector: str = "DIVERSIFIED",
             result = {"score": 0, "veto": True, "tier": "HARAM",
                       "debt_to_mcap": debt_to_mcap, "business_model": llm_model,
                       "ethical_score": ethical_score, "llm_confidence": llm_conf,
-                      "veto_reason": f"L4: LLM confidence {llm_conf:.0%} < 30%",
+                      "veto_reason": f"L4: LLM confidence {llm_conf:.0%} < 25%",
                       "source": "L4"}
             _halal_ai_cache_save(sym, result)
             return result
