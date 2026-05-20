@@ -3018,12 +3018,8 @@ def _halal_l4_sheet_fallback(symbol: str) -> dict:
 
 
 def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> dict:
-    """Layer 4: LLM business model analysis via Claude Sonnet (optional).
-    FIX-A5: prompt extended with illiquid_asset_risk to catch derivative-heavy models.
-    ARCH-D3: When LLM is unavailable or fails, falls back to Shariah universe from
-    Sheets/CSV as a confidence proxy instead of returning a flat neutral 0.5."""
+    """Layer 4: LLM business model analysis via Claude Sonnet (optional)."""
     if not _ANTHROPIC_OK and not _OPENAI_OK:
-        # ARCH-D3: LLM entirely unavailable — use Shariah universe as confidence proxy
         return _halal_l4_sheet_fallback(symbol)
 
     cache_key = f"halal_l4:{symbol}:{_llm_hash(sector + business_desc[:200])}"
@@ -3034,32 +3030,51 @@ def _halal_l4_llm_screen(symbol: str, sector: str, business_desc: str = "") -> d
         except Exception:
             pass
 
-prompt = (
-    "You are an Islamic finance compliance analyst. Assess this Indian listed company.\n"
-    f"Symbol: {symbol}\nSector: {sector}\n"
-    f"Business description: {business_desc[:500] or 'Not available'}\n\n"
-    "Assess Shariah compliance. Return ONLY JSON (no markdown):\n"
-    '{"halal_confidence": 0.0-1.0, '
-    '"business_concern": "brief concern or NONE", '
-    '"revenue_model": "fee_based|interest_based|mixed|manufacturing|services", '
-    '"subsidiary_risk": "LOW|MEDIUM|HIGH", '
-    '"illiquid_asset_risk": "LOW|MEDIUM|HIGH", '
-    '"manual_review_needed": true|false}\n\n'
-    "1.0 = clearly permissible, 0.0 = clearly impermissible. "
-    "Be conservative — when uncertain, lower confidence.\n"
-    "illiquid_asset_risk: HIGH if >20% of assets/revenue derive from derivatives, "
-    "futures, speculative trading, or non-productive financial instruments.\n"
-    "If the business is clearly manufacturing / agriculture / IT services and not financial, "
-    "default to confidence ≥0.60 unless strong evidence of high financial depth (>33% of revenue/interest) otherwise."
-)
+    # ⚠️ IMPORTANT: Use parentheses for multi-line string, NOT curly braces {}
+    prompt = (
+        "You are an Islamic finance compliance analyst. Assess this Indian listed company.\n"
+        f"Symbol: {symbol}\nSector: {sector}\n"
+        f"Business description: {business_desc[:500] or 'Not available'}\n\n"
+        "Assess Shariah compliance. Return ONLY JSON (no markdown):\n"
+        '{"halal_confidence": 0.0-1.0, '
+        '"business_concern": "brief concern or NONE", '
+        '"revenue_model": "fee_based|interest_based|mixed|manufacturing|services", '
+        '"subsidiary_risk": "LOW|MEDIUM|HIGH", '
+        '"illiquid_asset_risk": "LOW|MEDIUM|HIGH", '
+        '"manual_review_needed": true|false}\n\n'
+        "1.0 = clearly permissible, 0.0 = clearly impermissible. "
+        "Be conservative — when uncertain, lower confidence.\n"
+        "illiquid_asset_risk: HIGH if >20% of assets/revenue derive from derivatives, "
+        "futures, speculative trading, or non-productive financial instruments.\n"
+        "If the business is clearly manufacturing / agriculture / IT services and not financial, "
+        "default to confidence ≥0.60 unless strong evidence of high financial depth (>33% of revenue/interest) otherwise."
+    )
+
     # v5.1 TIER 1: GPT-4.1 Nano for Halal L4 (high-volume cheap calls)
     raw = _call_tier1(prompt, max_tokens=350)
     if not raw:
         raw = _call_claude(prompt, max_tokens=350)  # fallback to Claude
     if not raw:
-        # ARCH-D3: LLM failed at runtime — fall back to Shariah universe instead of flat 0.5
+        # ARCH-D3: LLM failed at runtime — fall back to Shariah universe
         return _halal_l4_sheet_fallback(symbol)
 
+    try:
+        txt = raw.strip().replace("```json", "").replace("```", "")
+        parsed = json.loads(txt)
+        result = {
+            "llm_confidence": max(0.0, min(1.0, float(parsed.get("halal_confidence", 0.5)))),
+            "llm_business_concern": str(parsed.get("business_concern", ""))[:100],
+            "llm_revenue_model": str(parsed.get("revenue_model", "unknown")),
+            "llm_subsidiary_risk": str(parsed.get("subsidiary_risk", "MEDIUM")),
+            "llm_illiquid_risk": str(parsed.get("illiquid_asset_risk", "LOW")),
+            "llm_manual_review": bool(parsed.get("manual_review_needed", False)),
+            "llm_source": CLAUDE_MODEL,
+        }
+        _llm_store_cache(cache_key, "halal_l4", json.dumps(result), CLAUDE_MODEL)
+        return result
+    except Exception as e:
+        log.debug(f"Halal L4 parse {symbol}: {e}")
+        return _halal_l4_sheet_fallback(symbol)
     try:
         txt = raw.strip().replace("```json", "").replace("```", "")
         parsed = json.loads(txt)
