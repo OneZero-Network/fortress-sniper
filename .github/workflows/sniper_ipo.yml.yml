@@ -2,9 +2,8 @@ name: SME IPO Snapshot v3.0
 
 on:
   schedule:
-    # Run daily at 10:00 AM IST (4:30 UTC)
     - cron: '30 4 * * *'
-  workflow_dispatch:   # allow manual trigger
+  workflow_dispatch:
 
 jobs:
   ipo-scan:
@@ -32,7 +31,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements-ipo-v3.txt
 
-      - name: Restore DB cache (IPO v3 DB)
+      - name: Restore DB cache
         uses: actions/cache@v4
         with:
           path: data
@@ -43,21 +42,11 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Optional for Google Trends (create a dedicated Gmail account)
-          GOOGLE_USERNAME: ${{ secrets.GOOGLE_USERNAME }}
-          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
         run: python ipo_scanner_v3.py
 
-      - name: Upload IPO DB as artifact
+      - name: Upload DB artifact
         uses: actions/upload-artifact@v4
         with:
           name: ipo-sniper-v3-db
           path: data/ipo_sniper_v3.db
-          retention-days: 7
-
-      - name: Upload backtest results
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-results
-          path: data/backtest/*.json
           retention-days: 7
