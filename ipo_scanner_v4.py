@@ -3,26 +3,8 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║          IPO SNIPER v5.0 — BULLETPROOF PRODUCTION EDITION                  ║
 ║  3-Source Fetch Chain · Quant Engine · Shariah Matrix · Telegram Alerts    ║
+║  FIXES: closed IPOs filtered, Telegram spam reduced, HTML errors fixed     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-
-FETCH CHAIN (in order of reliability):
-  A. NSE India Official API  (nseindia.com/api)
-  B. Chittorgarh HTML Scraper with Playwright browser rendering
-  C. Investorgain GMP Live Page
-
-QUANT ENGINE:
-  • Bayesian weight update (market-regime adaptive)
-  • Monte Carlo allotment simulation (50 000 runs)
-  • Wilson CI · Kelly Criterion · Syndicate EV optimisation
-
-GOVERNANCE:
-  • Shariah Governance Matrix (Najash + Qabda + Barakah)
-
-OUTPUT:
-  • Ranked console table
-  • SQLite persistence
-  • Telegram rich HTML alerts
-  • JSON export for dashboards
 """
 
 import os
@@ -36,7 +18,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -87,7 +69,6 @@ TODAY = datetime.today().date()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _flt(s, default: float = 0.0) -> float:
-    """Safe float extraction from arbitrary string."""
     try:
         m = re.search(r"[\d.]+", str(s).replace(",", ""))
         return float(m.group()) if m else default
@@ -170,7 +151,6 @@ NSE_WARMUP_URLS = [
 ]
 
 def _parse_nse_item(item: dict, sector: str) -> Optional[dict]:
-    """Convert a single NSE API record → normalised dict."""
     sym = str(item.get("symbol",
           item.get("companyName",
           item.get("issuerName",
@@ -189,7 +169,7 @@ def _parse_nse_item(item: dict, sector: str) -> Optional[dict]:
                item.get("amount", 50.0))))
     size = _flt(size_raw, 50.0)
     if size > 50_000:
-        size /= 1e7                         # convert raw rupees → crores
+        size /= 1e7
 
     lot = _int(item.get("lotSize", item.get("minBidQuantity", 0)))
     if lot <= 0:
@@ -224,7 +204,6 @@ def _parse_nse_item(item: dict, sector: str) -> Optional[dict]:
     }
 
 def fetch_source_a_nse() -> pd.DataFrame:
-    """SOURCE A: NSE Official API with full cookie warmup."""
     log.info("━━ SOURCE A: NSE India API ━━")
     sess = _make_session("https://www.nseindia.com/")
     sess.headers.update({
@@ -233,13 +212,12 @@ def fetch_source_a_nse() -> pd.DataFrame:
         "Referer":          "https://www.nseindia.com/market-data/upcoming-issues-ipo",
     })
 
-    # Warmup: populate cookies
     for url in NSE_WARMUP_URLS:
         try:
             r = sess.get(url, timeout=15)
             log.debug(f"NSE warmup [{r.status_code}] {url}")
-        except Exception as exc:
-            log.debug(f"NSE warmup skip: {exc}")
+        except Exception:
+            pass
         _jitter(1.5, 2.5)
 
     records: List[dict] = []
@@ -291,7 +269,6 @@ def _chitt_sector(ipo_type: str) -> str:
     return "Mainboard" if "main" in ipo_type.lower() or "mb" in ipo_type.lower() else "SME"
 
 def _parse_chitt_table(table, ipo_type: str) -> pd.DataFrame:
-    """Parse a BeautifulSoup <table> into normalised DataFrame."""
     sector = _chitt_sector(ipo_type)
     rows   = table.find_all("tr")
     if len(rows) < 2:
@@ -356,10 +333,8 @@ def _parse_chitt_table(table, ipo_type: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 def _fetch_chitt_http(url: str, ipo_type: str) -> pd.DataFrame:
-    """Direct HTTP fetch → table parse."""
     sess = _make_session("https://www.chittorgarh.com/")
     try:
-        # Warmup cookie
         sess.get("https://www.chittorgarh.com/", timeout=12)
         _jitter(1.5, 3.0)
         resp = sess.get(url, timeout=25)
@@ -372,7 +347,6 @@ def _fetch_chitt_http(url: str, ipo_type: str) -> pd.DataFrame:
             return pd.DataFrame()
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        # Try progressive CSS selectors
         for sel in [
             "table#report_table", "table.table-striped", "table.table-bordered",
             ".table-responsive table", "table[id*='ipo']", "table[class*='ipo']",
@@ -388,7 +362,6 @@ def _fetch_chitt_http(url: str, ipo_type: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _fetch_chitt_playwright(url: str, ipo_type: str) -> pd.DataFrame:
-    """Playwright rendering for JS-heavy pages."""
     if not PLAYWRIGHT_OK:
         return pd.DataFrame()
     log.info(f"  Chittorgarh Playwright [{ipo_type}] …")
@@ -406,7 +379,6 @@ def _fetch_chitt_playwright(url: str, ipo_type: str) -> pd.DataFrame:
             )
             page = ctx.new_page()
 
-            # Intercept AJAX data responses
             intercepted: List[dict] = []
             def _on_response(resp):
                 if resp.status == 200 and "chittorgarh" in resp.url:
@@ -429,7 +401,6 @@ def _fetch_chitt_playwright(url: str, ipo_type: str) -> pd.DataFrame:
                 pass
 
             if intercepted:
-                # Parse AJAX rows: each row is a list of HTML cell strings
                 sector = _chitt_sector(ipo_type)
                 records = []
                 for row_data in intercepted[:50]:
@@ -459,7 +430,6 @@ def _fetch_chitt_playwright(url: str, ipo_type: str) -> pd.DataFrame:
                 browser.close()
                 return pd.DataFrame(records)
 
-            # Fallback: parse rendered HTML
             html = page.content()
             soup = BeautifulSoup(html, "html.parser")
             for tbl in soup.find_all("table"):
@@ -474,7 +444,6 @@ def _fetch_chitt_playwright(url: str, ipo_type: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def fetch_source_b_chittorgarh() -> pd.DataFrame:
-    """SOURCE B: Chittorgarh — HTTP then Playwright fallback for each table."""
     log.info("━━ SOURCE B: Chittorgarh ━━")
     frames: List[pd.DataFrame] = []
     for ipo_type, url in CHITT_URLS.items():
@@ -500,7 +469,6 @@ def fetch_source_b_chittorgarh() -> pd.DataFrame:
 INVESTORGAIN_URL = "https://www.investorgain.com/report/live-ipo-gmp/331/"
 
 def fetch_source_c_investorgain() -> pd.DataFrame:
-    """SOURCE C: Investorgain live GMP table."""
     log.info("━━ SOURCE C: Investorgain GMP ━━")
     sess = _make_session("https://www.investorgain.com/")
     try:
@@ -546,7 +514,6 @@ def fetch_source_c_investorgain() -> pd.DataFrame:
                 return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else default
 
             symbol = cells[col["sym"]].get_text(strip=True).strip()
-            # strip any embedded HTML tags (links etc.)
             symbol = re.sub(r"<[^>]+>", "", symbol).strip()
             if not symbol or len(symbol) < 3:
                 continue
@@ -566,7 +533,7 @@ def fetch_source_c_investorgain() -> pd.DataFrame:
 
             records.append({
                 "Symbol":            symbol,
-                "Sector":            "SME",           # Investorgain is SME-heavy
+                "Sector":            "SME",
                 "IssueSizeCr":       round(size, 2),
                 "PriceBandLower":    lo,
                 "PriceBandUpper":    hi,
@@ -623,7 +590,6 @@ REQUIRED_COLS = {
 }
 
 def _validate_row(row: pd.Series) -> bool:
-    """Return True if this row passes all sanity checks."""
     sym = str(row.get("Symbol", "")).strip()
     if not sym or len(sym) < 2 or sym.lower() in ("unknown", "nan", "none"):
         return False
@@ -639,20 +605,16 @@ def _validate_row(row: pd.Series) -> bool:
     return True
 
 def _enrich(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure all required columns, recompute derived fields, validate rows."""
     for col, default in REQUIRED_COLS.items():
         if col not in df.columns:
             df[col] = default
 
-    # Coerce numeric
     for c in ("IssueSizeCr", "PriceBandLower", "PriceBandUpper", "LotSize",
               "GMP", "gmp_pct", "SubscriptionTimes", "DaysToClose"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(REQUIRED_COLS.get(c, 0))
 
-    # Recompute gmp_pct
     df["gmp_pct"] = df["GMP"].apply(lambda g: round(float(g) * 100, 2))
 
-    # Recompute DaysToClose from CloseDate
     def _days(x):
         try:
             d = datetime.strptime(str(x), "%Y-%m-%d").date()
@@ -661,7 +623,6 @@ def _enrich(df: pd.DataFrame) -> pd.DataFrame:
             return 7
     df["DaysToClose"] = df["CloseDate"].apply(_days)
 
-    # Validate
     mask = df.apply(_validate_row, axis=1)
     dropped = (~mask).sum()
     if dropped:
@@ -674,24 +635,17 @@ def _enrich(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_ipo_calendar(use_playwright: bool = True) -> pd.DataFrame:
-    """
-    Waterfall fetch across all three sources.
-    Merges by Symbol, deduplicates keeping highest-sub record.
-    Falls back to seed CSV only if all live sources fail.
-    """
     frames: List[pd.DataFrame] = []
 
-    # — A: NSE —
     a = fetch_source_a_nse()
     if not a.empty:
         frames.append(a)
 
-    # — B: Chittorgarh —
-    b = fetch_source_b_chittorgarh()
-    if not b.empty:
-        frames.append(b)
+    if use_playwright:
+        b = fetch_source_b_chittorgarh()
+        if not b.empty:
+            frames.append(b)
 
-    # — C: Investorgain —
     c = fetch_source_c_investorgain()
     if not c.empty:
         frames.append(c)
@@ -699,17 +653,19 @@ def fetch_ipo_calendar(use_playwright: bool = True) -> pd.DataFrame:
     if frames:
         raw = pd.concat(frames, ignore_index=True)
         enriched = _enrich(raw)
-        # Deduplicate by Symbol — prefer highest subscription record;
-        # then enrich GMP from the best (highest) GMP source
         best_gmp = (enriched.sort_values("gmp_pct", ascending=False)
                              .drop_duplicates(subset="Symbol", keep="first")[["Symbol", "GMP", "gmp_pct"]])
         deduped  = (enriched.sort_values("SubscriptionTimes", ascending=False)
                              .drop_duplicates(subset="Symbol", keep="first")
                              .reset_index(drop=True))
-        # Merge best GMP back
         deduped  = deduped.drop(columns=["GMP", "gmp_pct"]).merge(best_gmp, on="Symbol", how="left")
         deduped["GMP"]     = deduped["GMP"].fillna(0.0)
         deduped["gmp_pct"] = deduped["gmp_pct"].fillna(0.0)
+
+        # FIX: Remove closed IPOs (DaysToClose <= 0)
+        before = len(deduped)
+        deduped = deduped[deduped["DaysToClose"] > 0].reset_index(drop=True)
+        log.info(f"  🗑  Removed {before - len(deduped)} closed IPOs (DaysToClose <= 0)")
 
         log.info(f"✅ LIVE DATA: {len(deduped)} unique IPOs from {len(frames)} source(s)")
         return deduped
@@ -840,31 +796,27 @@ def run_shariah(row: pd.Series) -> ShariahVerdict:
     barakah = 100.0
     issues: List[str] = []
 
-    # Frame 1 — Najash (deceptive demand inflation)
     najash = gmp > 0.40 and sub > 80
     if najash:
         barakah -= 25
         issues.append("Najash Alert: GMP > 40% + Sub > 80× (speculative pump)")
 
-    # Frame 2 — Microcap liquidity hazard
     if size < 20:
         barakah -= 15
         issues.append("Microcap Hazard: Issue < ₹20 Cr (low liquidity)")
 
-    # Frame 2b — SME extreme subscription
     if sector == "SME" and sub > 200:
         barakah -= 10
         issues.append("SME Pump Risk: Sub > 200× (hyper-subscription)")
 
     halal_score = max(0.0, min(100.0, barakah))
     tier = "TIER_1_SHARIAH_COMPLIANT" if halal_score >= 80 else "TIER_2_CONDITIONAL"
-    qabda = (
-        "⚠️ QABDA MANDATORY: Shares must settle in Demat (T+2) before resale. "
-        "Listing-day flips before T+2 = Gharar (forbidden per OIC Fiqh Academy Res. 3/3/86)."
-    )
+    # Shortened Qabda to avoid HTML errors
+    qabda_short = "Shares must settle in Demat (T+2) before resale (No listing-day flips)."
+
     return ShariahVerdict(
         symbol=sym, tier=tier, barakah=halal_score,
-        najash=najash, qabda=qabda, issues=issues,
+        najash=najash, qabda=qabda_short, issues=issues,
         halal_score=halal_score,
         fatwa_ref="AAOIFI SS-21 / OIC Fiqh Academy Res. 3/3/86",
     )
@@ -905,7 +857,7 @@ def master_score(
     s_gmp  = min(100.0, gmp * 200)
     s_sub  = min(100.0, (sub / 100.0) * 100) * tf
     s_sent = sent.composite
-    s_trd  = 50.0   # trends placeholder
+    s_trd  = 50.0
     s_size = (100 if size <= 20 else 80 if size <= 50 else 50 if size <= 100 else 20)
     s_halal= shariah.halal_score
 
@@ -936,7 +888,7 @@ def init_db():
                 sector           TEXT,
                 final_score      REAL,
                 verdict          TEXT,
-                subscription_x   REAL,
+                subscription_x    REAL,
                 gmp_pct          REAL,
                 issue_size_cr    REAL,
                 price_upper      REAL,
@@ -993,11 +945,10 @@ def persist_to_db(df: pd.DataFrame, allots: dict, sents: dict, shariahs: dict):
     log.info(f"🗄  Persisted {len(df)} records to SQLite.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM (Reduced spam)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _tg_send(text: str, token: str, chat_id: str):
-    """Send a single Telegram message (max 4096 chars)."""
     text = text[:4096]
     try:
         resp = requests.post(
@@ -1010,77 +961,60 @@ def _tg_send(text: str, token: str, chat_id: str):
     except Exception as exc:
         log.error(f"  Telegram send failed: {exc}")
 
-def send_telegram_alerts(df: pd.DataFrame, allots: dict, sents: dict, shariahs: dict):
-    token   = os.getenv("TELEGRAM_TOKEN",   "")
+def send_telegram_alerts(df: pd.DataFrame, allots: dict, sents: dict, shariahs: dict, top_n: int = 5):
+    token = os.getenv("TELEGRAM_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     console_only = not (token and chat_id)
-    if console_only:
-        log.warning("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set — printing to console.")
 
     date_str = TODAY.strftime("%d %b %Y")
-    header   = (
-        f"⚔️ <b>{VERSION}</b>\n"
-        f"📅 <b>{date_str}</b>  |  {len(df)} IPOs analysed\n"
-        f"{'━' * 38}\n"
-    )
-
     ranked = df.sort_values("FinalScore", ascending=False)
 
-    # Summary table in header
+    # --- Summary table for all IPOs ---
+    summary_lines = [f"⚔️ <b>{VERSION}</b>  |  {date_str}  |  {len(df)} IPOs active"]
+    summary_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     for _, row in ranked.iterrows():
-        sym     = str(row["Symbol"])
-        score   = row["FinalScore"]
+        sym = row["Symbol"]
+        score = row["FinalScore"]
         verdict = row["Verdict"]
-        sub     = row["SubscriptionTimes"]
-        gmp_p   = row["gmp_pct"]
-        header += f"  {verdict} <b>{sym}</b> ({score:.0f})  {sub:.1f}× | GMP {gmp_p:.1f}%\n"
+        sub = row["SubscriptionTimes"]
+        gmp = row["gmp_pct"]
+        summary_lines.append(f"{verdict} <b>{sym}</b> ({score:.0f})  {sub:.1f}x | GMP {gmp:.1f}%")
+    summary_msg = "\n".join(summary_lines)
 
     if console_only:
-        print(f"\n[TELEGRAM CONSOLE]\n{header}\n{'─'*60}")
+        print(f"\n[TELEGRAM CONSOLE SUMMARY]\n{summary_msg}\n")
     else:
-        _tg_send(header, token, chat_id)
+        _tg_send(summary_msg, token, chat_id)
         _jitter(0.5, 1.0)
 
-    # Individual detailed alerts
-    for _, row in ranked.iterrows():
-        sym  = str(row["Symbol"])
-        a    = allots[sym]
-        s    = sents[sym]
-        sh   = shariahs[sym]
-        gmp_p = row["gmp_pct"]
-
-        # Verdict emoji
-        score = row["FinalScore"]
-        em = "🔥" if score >= 80 else "✅" if score >= 70 else "📈" if score >= 60 else "❌"
-
-        msg = (
-            f"{em} <b>{sym}</b> [{row['Sector']}]\n"
-            f"   🏆 Score: <b>{score:.1f}/100</b>  {row['Verdict']}\n"
-            f"\n"
-            f"   📊 Sub: <b>{row['SubscriptionTimes']:.1f}×</b>  |  GMP: <b>{gmp_p:.1f}%</b>  |  "
-            f"Size: ₹{row['IssueSizeCr']:.0f}Cr\n"
-            f"   💹 Price Band: ₹{row['PriceBandLower']:.0f}–₹{row['PriceBandUpper']:.0f}"
-            f"  |  Lot: {row['LotSize']}\n"
-            f"   📅 Closes: {row['CloseDate']}  ({row['DaysToClose']}d left)\n"
-            f"\n"
-            f"   🎲 P(Allotment): <b>{a.p_single_mc * 100:.3f}%</b> "
-            f"[95% CI: {a.ci_95[0]*100:.2f}–{a.ci_95[1]*100:.2f}%]\n"
-            f"   👥 Optimal Syndicate: <b>{a.optimal_syndicate} PANs</b>\n"
-            f"   💰 Kelly: {a.kelly_pct:.1f}%  |  EV: ₹{a.ev_inr:,.0f}  |  ROI: {a.roi_pct:.2f}%\n"
-            f"\n"
-            f"   🌡 Sentiment: <b>{s.label}</b> ({s.composite:.0f}/100)\n"
-            f"   🕌 <b>{sh.tier}</b>  (Barakah: {sh.barakah:.0f}/100)\n"
+    # --- Detailed alerts for top N only ---
+    detail_msg = f"\n🔥 <b>Top {top_n} IPOs – Detailed Analysis</b>\n"
+    detail_msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for _, row in ranked.head(top_n).iterrows():
+        sym = row["Symbol"]
+        a = allots[sym]
+        s = sents[sym]
+        sh = shariahs[sym]
+        detail_msg += (
+            f"<b>{sym}</b> [{row['Sector']}]  |  Score: {row['FinalScore']:.1f}  |  {row['Verdict']}\n"
+            f"   Sub: {row['SubscriptionTimes']:.1f}×  |  GMP: {row['gmp_pct']:.1f}%  |  "
+            f"Size: ₹{row['IssueSizeCr']:.0f}Cr  |  Lot: {row['LotSize']}\n"
+            f"   Price: ₹{row['PriceBandLower']:.0f}–₹{row['PriceBandUpper']:.0f}  |  "
+            f"Closes: {row['CloseDate']} ({row['DaysToClose']}d left)\n"
+            f"   P(Allot): {a.p_single_mc*100:.3f}%  |  Syndicate: {a.optimal_syndicate} PANs\n"
+            f"   Kelly: {a.kelly_pct:.1f}%  |  EV: ₹{a.ev_inr:,.0f}  |  ROI: {a.roi_pct:.2f}%\n"
+            f"   Sentiment: {s.label} ({s.composite:.0f})  |  {sh.tier} (Barakah: {sh.barakah:.0f})\n"
+            f"   📜 {sh.qabda}\n"
+            f"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
-        if sh.issues:
-            msg += f"   🚨 " + " | ".join(sh.issues) + "\n"
-        msg += f"   📜 {sh.qabda}\n"
-        msg += f"   🔗 Source: {row.get('Source', 'live')}"
-
-        if console_only:
-            print(f"\n[TELEGRAM CONSOLE]\n{msg}\n{'─'*60}")
-        else:
-            _tg_send(msg, token, chat_id)
+    if console_only:
+        print(f"\n[TELEGRAM CONSOLE DETAIL]\n{detail_msg}\n")
+    else:
+        for chunk in [detail_msg[i:i+4000] for i in range(0, len(detail_msg), 4000)]:
+            _tg_send(chunk, token, chat_id)
             _jitter(0.3, 0.8)
+
+    log.info(f"📨 Sent summary + top {top_n} detailed alerts")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN ORCHESTRATOR
@@ -1090,7 +1024,6 @@ def run():
     log.info(f"🚀  {VERSION}  [{TODAY}]")
     init_db()
 
-    # ── FETCH ──────────────────────────────────────────────────────────────
     df = fetch_ipo_calendar(use_playwright=True)
     if df.empty:
         log.error("❌ No IPO data from any source — aborting.")
@@ -1098,7 +1031,6 @@ def run():
 
     log.info(f"📦 Analysing {len(df)} unique IPOs …")
 
-    # ── QUANT ──────────────────────────────────────────────────────────────
     w = bayesian_weights(df)
     log.info(f"⚖️  Active weights: { {k: round(v, 3) for k, v in w.items()} }")
 
@@ -1126,15 +1058,13 @@ def run():
     df["halal_tier"]        = [shariahs[s].tier            for s in df["Symbol"]]
     df["najash_alert"]      = [shariahs[s].najash          for s in df["Symbol"]]
 
-    # ── PERSIST ────────────────────────────────────────────────────────────
     persist_to_db(df, allots, sents, shariahs)
 
-    # ── JSON EXPORT ────────────────────────────────────────────────────────
     JSON_EXPORT.parent.mkdir(parents=True, exist_ok=True)
     df.to_json(str(JSON_EXPORT), orient="records", indent=2)
     log.info(f"📄  JSON export → {JSON_EXPORT}")
 
-    # ── CONSOLE TABLE ──────────────────────────────────────────────────────
+    # Console output
     ranked = df.sort_values("FinalScore", ascending=False)
     print(f"\n{'═'*90}")
     print(f"  {VERSION}  |  {TODAY}")
@@ -1157,8 +1087,7 @@ def run():
         )
     print(f"{'═'*90}\n")
 
-    # ── TELEGRAM ───────────────────────────────────────────────────────────
-    send_telegram_alerts(df, allots, sents, shariahs)
+    send_telegram_alerts(df, allots, sents, shariahs, top_n=5)
 
     log.info("🏁  IPO Sniper v5.0 complete.")
     return df
