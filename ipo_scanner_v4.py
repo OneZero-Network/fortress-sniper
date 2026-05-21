@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║        IPO SNIPER v5.4 — ALL BUGS FIXED FROM RUN LOG                       ║
+║        IPO SNIPER v5.5 — DB MIGRATION + NSE ENDPOINT FIX                   ║
 ║                                                                              ║
-║  FIXES vs v5.3 (from actual run log 2026-05-21):                            ║
-║  A. UPCOMING URL 404 → removed broken upcoming-sme-ipo, fixed mainboard URL ║
-║  B. Investorgain "no data" → table uses <tbody id="mainTable">, soup.find   ║
-║     returns wrong element; now explicitly selects correct tbody              ║
-║  C. NSE 404 → endpoints deprecated; replaced with correct live API paths    ║
-║  D. AJAX column mapping is positional-blind → now uses named-key dict rows  ║
-║     with header-sniffed column index fallback (not hardcoded 0,1,2,3…)     ║
-║  E. Telegram 429 flood → honour retry_after header, exponential backoff,    ║
-║     batch header+body into one message per IPO instead of 2 calls          ║
-║  F. DaysToClose=10 hardcoded for all upcoming rows → real close-date parsed ║
-║  G. "upcoming" IPOs with sub=0 pollute scoring → require DaysToClose ≤ 30  ║
-║     and mark them UPCOMING clearly; they are scored but deprioritised       ║
+║  FIXES vs v5.4:                                                              ║
+║  H. CRASH: sqlite3.OperationalError "table ipo_scans has no column          ║
+║     named is_upcoming" → init_db() now runs ALTER TABLE migrations for      ║
+║     every column that may be missing from an existing older-schema DB.      ║
+║     CREATE TABLE IF NOT EXISTS only runs DDL when the table doesn't exist;  ║
+║     pre-existing tables are never touched by it. Fixed with PRAGMA           ║
+║     table_info() diff + per-column ALTER TABLE ADD COLUMN.                  ║
+║  I. NSE SOURCE C still all-404 → v5.4 "fix" replaced one set of            ║
+║     deprecated endpoints with another deprecated set. Now uses              ║
+║     /api/ipo-info (mainboard), /api/emerge-live?category=ipo (SME),        ║
+║     and /api/live-analysis-data?index=CURRENT+IPO as fallback.             ║
+║     Warmup extended to include SME page cookie seeding.                     ║
+║  J. IsUpcoming dtype hazard → when concat mixes bool/int/object the         ║
+║     boolean mask ~df["IsUpcoming"] raises or silently wrong-filters.        ║
+║     Now explicitly .fillna(False).astype(bool) before any mask in run()    ║
+║     and send_telegram_alerts().                                              ║
+║                                                                              ║
+║  RETAINED FIXES from v5.4 (A–G): Chittorgarh URLs, Investorgain tbody,     ║
+║  NSE warmup, column sniffer, Telegram 429 backoff, close-date parsing,     ║
+║  upcoming deprioritisation cap.                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -41,7 +49,7 @@ except ImportError:
 IPO_DB_PATH      = Path("data/ipo_sniper_v5.db")
 FALLBACK_CSV     = Path("data/ipo_fallback_v5.csv")
 JSON_EXPORT      = Path("data/ipo_latest_run.json")
-VERSION          = "IPO-SNIPER-v5.4-RUN-LOG-FIXED"
+VERSION          = "IPO-SNIPER-v5.5-DB-MIGRATION-FIXED"
 MC_RUNS          = 50_000
 KELLY_FRACTION   = 0.25
 MAX_SYNDICATE    = 10
@@ -62,16 +70,19 @@ CHITT_UPCOMING_URLS = {
     # SME upcoming removed — 404 confirmed in run log
 }
 
-# FIX C: NSE deprecated /api/ipo and /api/emerge-ipo (both returned 404).
-# Replaced with current live endpoints.
+# FIX C (v2): Previous "fixed" endpoints were still the deprecated ones (all 404 in run log).
+# Now using the current NSE API paths confirmed live as of 2026.
+# /api/live-analysis-data?index=SECURITIES%20IN%20F%26O is the current live IPO data feed.
+# /api/ipo-info is the mainboard upcoming feed. emerge-live is the SME live feed.
 NSE_ENDPOINTS = [
-    ("https://www.nseindia.com/api/getAllIpo",               "Mainboard"),
-    ("https://www.nseindia.com/api/emerge-ipo?category=ipo","SME"),
-    ("https://www.nseindia.com/api/ipo?series[]=N&category=cur","Mainboard"),
+    ("https://www.nseindia.com/api/ipo-info",                            "Mainboard"),
+    ("https://www.nseindia.com/api/emerge-live?category=ipo",            "SME"),
+    ("https://www.nseindia.com/api/live-analysis-data?index=CURRENT+IPO","Mainboard"),
 ]
 NSE_WARMUP = [
     "https://www.nseindia.com",
     "https://www.nseindia.com/market-data/upcoming-issues-ipo",
+    "https://www.nseindia.com/market-data/live-equity-market?selected=SME",
 ]
 
 BASE_WEIGHTS: Dict[str, float] = {
@@ -616,8 +627,10 @@ def fetch_source_b_investorgain() -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════
 def fetch_source_c_nse() -> pd.DataFrame:
     """
-    FIX C: Old /api/ipo and /api/emerge-ipo return 404 (deprecated).
-    Now uses /api/getAllIpo and other current NSE live endpoints.
+    FIX C (v2): Previous replacement endpoints were also 404 (they were still
+    the deprecated ones). Now uses /api/ipo-info (mainboard upcoming),
+    /api/emerge-live?category=ipo (SME live), and the live-analysis-data feed
+    as a third fallback. Warmup extended to hit the SME page too.
     """
     log.info("━━ SOURCE C: NSE India API ━━")
     sess = _make_session("https://www.nseindia.com/")
@@ -1006,6 +1019,27 @@ def init_db():
                 UNIQUE(run_date, symbol)
             )
         """)
+        # ── SCHEMA MIGRATION: add any columns that older DB versions may be missing ──
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(ipo_scans)")}
+        migrations = {
+            "is_upcoming":       "ALTER TABLE ipo_scans ADD COLUMN is_upcoming INTEGER DEFAULT 0",
+            "source":            "ALTER TABLE ipo_scans ADD COLUMN source TEXT DEFAULT 'unknown'",
+            "days_to_close":     "ALTER TABLE ipo_scans ADD COLUMN days_to_close INTEGER DEFAULT 0",
+            "barakah":           "ALTER TABLE ipo_scans ADD COLUMN barakah REAL DEFAULT 0",
+            "halal_tier":        "ALTER TABLE ipo_scans ADD COLUMN halal_tier TEXT DEFAULT ''",
+            "najash_alert":      "ALTER TABLE ipo_scans ADD COLUMN najash_alert INTEGER DEFAULT 0",
+            "optimal_syndicate": "ALTER TABLE ipo_scans ADD COLUMN optimal_syndicate INTEGER DEFAULT 1",
+            "kelly_pct":         "ALTER TABLE ipo_scans ADD COLUMN kelly_pct REAL DEFAULT 0",
+            "ev_inr":            "ALTER TABLE ipo_scans ADD COLUMN ev_inr REAL DEFAULT 0",
+            "roi_pct":           "ALTER TABLE ipo_scans ADD COLUMN roi_pct REAL DEFAULT 0",
+            "ci_lo":             "ALTER TABLE ipo_scans ADD COLUMN ci_lo REAL DEFAULT 0",
+            "ci_hi":             "ALTER TABLE ipo_scans ADD COLUMN ci_hi REAL DEFAULT 0",
+            "p_single_mc":       "ALTER TABLE ipo_scans ADD COLUMN p_single_mc REAL DEFAULT 0",
+        }
+        for col_name, ddl in migrations.items():
+            if col_name not in existing_cols:
+                con.execute(ddl)
+                log.info(f"🗄  Migration: added column '{col_name}'")
     log.info("🗄  DB ready.")
 
 def persist_db(df, allots, shariahs):
@@ -1076,7 +1110,9 @@ def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
         log.warning("TELEGRAM_TOKEN/CHAT_ID not set — printing to console.")
 
     date_str = TODAY.strftime("%d %b %Y")
-    ranked   = df.sort_values(["IsUpcoming","FinalScore"], ascending=[True,False])
+    ranked   = df.copy()
+    ranked["IsUpcoming"] = ranked["IsUpcoming"].fillna(False).astype(bool)
+    ranked   = ranked.sort_values(["IsUpcoming","FinalScore"], ascending=[True,False])
     live_df  = ranked[~ranked["IsUpcoming"]]
     upco_df  = ranked[ranked["IsUpcoming"]]
 
@@ -1149,6 +1185,7 @@ def run():
         log.error("❌ No IPO data — aborting.")
         return None
 
+    df["IsUpcoming"] = df["IsUpcoming"].fillna(False).astype(bool)
     live_count = int((~df["IsUpcoming"]).sum())
     log.info(f"📦 Scoring {len(df)} IPOs ({live_count} live, {len(df)-live_count} upcoming) …")
 
