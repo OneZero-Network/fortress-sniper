@@ -1,51 +1,41 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         IPO SNIPER v6.0 — SOURCE OVERHAUL + SCORING HARDENING              ║
+║         IPO SNIPER v7.0 — INDIRATRADE SOURCE + NSE/SCREENER SANDBOX FIX    ║
 ║                                                                              ║
-║  WHAT CHANGED vs v5.8                                                        ║
+║  WHAT CHANGED vs v6.0                                                        ║
 ║                                                                              ║
-║  [SRC-1]  Chittorgarh "most subscribed" (wrong URL) → REPLACED              ║
-║           New Source A = Screener.in /ipo/recent/   (current + upcoming)    ║
-║           Screener returns price=0 for unlisted IPOs → treated as upcoming  ║
+║  [SRC-D-REPLACE]  Chittorgarh REMOVED — serves stale historical data        ║
+║           even from its "live" subscription URL.  All 10 rows it returned   ║
+║           were already-closed SME IPOs with date-fallback flags set.        ║
+║           Root cause: Chittorgarh's tables show rolling history, not        ║
+║           strictly today's open subscriptions.                               ║
 ║                                                                              ║
-║  [SRC-2]  NSE India ERR_HTTP2_PROTOCOL_ERROR → REPLACED                    ║
-║           Old approach navigated to nseindia.com first (HSTS/H2 fails).     ║
-║           New Source C = NSE JSON API direct fetch with proper headers +     ║
-║           cookie pre-warm via a lightweight HTTP/1.1 GET to avoid H2 error. ║
-║           Endpoint: /api/getAllIpo (live + upcoming).                        ║
+║  [SRC-D-NEW]  Source D = IndiaTrade IPO Portal (ipo.indiratrade.com)       ║
+║           Clean HTML tables served without JS-render requirement.           ║
+║           Three sections parsed in one pass:                                 ║
+║             • "Open IPOs"     → IsUpcoming=False  (live, bidding now)       ║
+║             • "Upcoming IPOs" → IsUpcoming=True   (not yet open)            ║
+║             • "Closed IPOs"   → SKIPPED (already listed, irrelevant)        ║
+║           Columns: Company, Date (open–close range), Price range, Min qty   ║
+║           Sector detected: "(SME IPO)" in name → SME else Mainboard.        ║
+║           HTTP-only fetch (no Playwright needed); Playwright fallback        ║
+║           retained for environments where requests are blocked.              ║
 ║                                                                              ║
-║  [SRC-3]  Added Source D = IPO Watch (ipowatch.in) — JSON API,             ║
-║           no Playwright needed, current + upcoming IPOs.                    ║
+║  [BUG-FIX-1]  Removed self-import in Chittorgarh Playwright handler        ║
+║           (`from ipo_sniper_v6 import _parse_ajax_rows`) which would crash  ║
+║           on any machine where the file wasn't named exactly that.           ║
 ║                                                                              ║
-║  [SRC-4]  Added Source E = Chittorgarh LIVE subscription status URL         ║
-║           (retained, it works). Upcoming URL changed to a safer endpoint.   ║
+║  [BUG-FIX-2]  IndiaTrade date parsing handles "DD Mon YYYY - DD Mon YYYY"  ║
+║           compound date strings correctly; open and close extracted          ║
+║           separately with regex split on " - ".                              ║
 ║                                                                              ║
-║  [SCORE-1] GMP score cap: raw GMP% →  min(100, gmp_pct * 1.5)              ║
-║           Old: min(100, gmp*200) meant 50% GMP = 100 score (ceiling too low)║
-║           New: 67% GMP → 100.  Better spread for mid-range IPOs.            ║
+║  [BUG-FIX-3]  NSE Source C: removed Playwright API-intercept fallback       ║
+║           entirely — it always triggers ERR_HTTP2_PROTOCOL_ERROR on          ║
+║           NSE's Akamai CDN.  HTTP-only with cookie warmup is retained.       ║
 ║                                                                              ║
-║  [SCORE-2] Size score INVERTED logic fixed.                                 ║
-║           Old: s_size=100 if size<=20 (microcap bias). Microcaps are        ║
-║           HIGH RISK, not high score. New scale rewards mid-large cap.        ║
-║           <=20Cr=20, 20-50Cr=40, 50-500Cr=70, 500-2000Cr=90, >2000Cr=50   ║
-║                                                                              ║
-║  [SCORE-3] Sentiment sub-score: removed hardcoded 40 base, now dynamic.    ║
-║           Anchoring to 40 gave closed IPOs a free 40 sentiment pts.         ║
-║                                                                              ║
-║  [SCORE-4] Trend sub-score: was hardcoded 50 (useless). Now compares        ║
-║           SubscriptionTimes against sector rolling average from DB.          ║
-║                                                                              ║
-║  [SCORE-5] Upcoming IPO score cap: was 59, now 64. Prevents all upcoming    ║
-║           IPOs from being clustered at 59 (indistinguishable).              ║
-║                                                                              ║
-║  [VAL-1]  Price=0 for live IPO → DROP (was previously keeping it).          ║
-║           Price=0 for upcoming → allowed (TBD), shown as "Price TBD".       ║
-║                                                                              ║
-║  [VAL-2]  Lot size guard: SME lot < 500 → suspicious, warn but keep.        ║
-║           Old guard was only lot<=0 or lot>200000.                           ║
-║                                                                              ║
-║  RETAINED: All A–Q fixes from v5.4–v5.8 (BUG-1 through BUG-6).            ║
+║  RETAINED: All SCORE-1 through SCORE-5 and VAL-1/VAL-2 fixes from v6.0.   ║
+║  RETAINED: Sources A (Screener.in) and B (InvestorGain GMP) unchanged.     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -69,10 +59,10 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════
-IPO_DB_PATH  = Path("data/ipo_sniper_v6.db")
-FALLBACK_CSV = Path("data/ipo_fallback_v6.csv")
+IPO_DB_PATH  = Path("data/ipo_sniper_v7.db")
+FALLBACK_CSV = Path("data/ipo_fallback_v7.csv")
 JSON_EXPORT  = Path("data/ipo_latest_run.json")
-VERSION      = "IPO-SNIPER-v6.0"
+VERSION      = "IPO-SNIPER-v7.0"
 MC_RUNS      = 50_000
 KELLY_FRACTION = 0.25
 MAX_SYNDICATE  = 10
@@ -98,19 +88,10 @@ NSE_BASE          = "https://www.nseindia.com"
 NSE_API_URL       = "https://www.nseindia.com/api/getAllIpo"
 NSE_UPCOMING_API  = "https://www.nseindia.com/api/ipo-detail"   # fallback
 
-# Source D: IPOWatch — JSON API, no JS rendering needed
-IPOWATCH_API      = "https://ipowatch.in/wp-json/wp/v2/posts?categories=10&per_page=20&_fields=title,content,date"
-IPOWATCH_JSON_API = "https://ipowatch.in/api/ipo-list"          # may exist
-
-# Source E: Chittorgarh subscription status (live IPOs — original working URL)
-CHITT_LIVE_URLS = {
-    "Mainboard": "https://www.chittorgarh.com/report/ipo-subscription-status/10/",
-    "SME":       "https://www.chittorgarh.com/report/sme-ipo-subscription-status/10/",
-}
-# Chittorgarh upcoming — use the correct upcoming endpoint (not most-subscribed)
-CHITT_UPCOMING_URLS = {
-    "Mainboard": "https://www.chittorgarh.com/report/upcoming-ipo/6/",
-}
+# Source D: IndiaTrade IPO Portal — clean HTML tables, no JS rendering needed
+# Replaces Chittorgarh which served stale historical data.
+# Page structure: "Open IPOs" (live) | "Upcoming IPOs" | "Closed IPOs" (skipped)
+INDIRATRADE_IPO_URL = "https://ipo.indiratrade.com/Home"
 
 BASE_WEIGHTS: Dict[str, float] = {
     "gmp":       0.22,
@@ -898,220 +879,239 @@ def fetch_source_c_nse() -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════
-# SOURCE D — CHITTORGARH  [SRC-4 retained, correct URLs]
+# SOURCE D — INDIRATRADE IPO PORTAL  [SRC-D-NEW v7.0]
 # ═══════════════════════════════════════════════════════════
-def _fetch_chitt_playwright(url: str, ipo_type: str, source_tag: str,
-                             is_upcoming: bool = False) -> pd.DataFrame:
-    if not PLAYWRIGHT_OK:
-        return pd.DataFrame()
-    log.info(f"  PW [{ipo_type}] → {url}")
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"]
-            )
-            ctx  = browser.new_context(
-                user_agent=BROWSER_HEADERS["User-Agent"],
-                extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"},
-                viewport={"width": 1280, "height": 900},
-            )
-            page = ctx.new_page()
-            intercepted: List[dict] = []
-
-            def _on_resp(resp):
-                if resp.status == 200 and "chittorgarh" in resp.url:
-                    ct = resp.headers.get("content-type", "")
-                    if "json" in ct:
-                        try:
-                            body = resp.json()
-                            rows = body.get("data", body.get("aaData", []))
-                            if rows:
-                                intercepted.extend(rows)
-                                log.info(f"  PW AJAX: {len(rows)} rows")
-                        except Exception:
-                            pass
-
-            page.on("response", _on_resp)
-            page.goto(url, wait_until="networkidle", timeout=55_000)
-            try:
-                page.wait_for_selector("table tbody tr td:not(.dataTables_empty)",
-                                       timeout=15_000)
-            except PWTimeout:
-                pass
-
-            if intercepted:
-                browser.close()
-                from ipo_sniper_v6 import _parse_ajax_rows  # self-import for reuse
-                return _parse_ajax_rows(intercepted, ipo_type, source_tag, is_upcoming)
-
-            soup = BeautifulSoup(page.content(), "html.parser")
-            browser.close()
-            for tbl in soup.find_all("table"):
-                if len(tbl.find_all("tr")) > 3:
-                    df = _parse_html_table(tbl, ipo_type, source_tag + "_html", is_upcoming)
-                    if not df.empty:
-                        return df
-    except Exception as exc:
-        log.warning(f"  PW error [{ipo_type}]: {exc}")
-    return pd.DataFrame()
-
-
-def _fetch_chitt_http(url: str, ipo_type: str, source_tag: str,
-                      is_upcoming: bool = False) -> pd.DataFrame:
-    sess = _make_session("https://www.chittorgarh.com/")
-    try:
-        sess.get("https://www.chittorgarh.com/", timeout=12)
-        _jitter(1.5, 3.0)
-        resp = sess.get(url, timeout=25)
-        log.info(f"  HTTP [{ipo_type}] → {resp.status_code}")
-        if resp.status_code != 200:
-            return pd.DataFrame()
-        deny = resp.headers.get("x-deny-reason", "")
-        if deny:
-            log.warning(f"  Chittorgarh blocked: {deny}")
-            return pd.DataFrame()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for sel in ["table.table-striped", "table.table-bordered",
-                    ".table-responsive table", "table"]:
-            for tbl in soup.select(sel):
-                if len(tbl.find_all("tr")) > 3:
-                    df = _parse_html_table(tbl, ipo_type, source_tag + "_http", is_upcoming)
-                    if not df.empty:
-                        return df
-    except Exception as exc:
-        log.warning(f"  Chittorgarh HTTP error [{ipo_type}]: {exc}")
-    return pd.DataFrame()
-
-
-def fetch_source_d_chittorgarh() -> pd.DataFrame:
+def _parse_indiratrade_soup(soup: BeautifulSoup) -> pd.DataFrame:
     """
-    Chittorgarh live subscription status — these URLs are reliable.
-    NOTE: We do NOT use /report/most-subscribed-ipo-in-india-year-wise/110/
-    That URL lists historical most-subscribed IPOs (WRONG for current data).
-    Correct URLs: /report/ipo-subscription-status/10/ (live Mainboard)
-                  /report/sme-ipo-subscription-status/10/ (live SME)
-                  /report/upcoming-ipo/6/ (upcoming)
+    Parse ipo.indiratrade.com/Home which has three <table> sections:
+      - "Open IPOs"     → live bidding now
+      - "Upcoming IPOs" → not yet open
+      - "Closed IPOs"   → already listed — SKIP
+
+    Table columns: Company | Date (DD Mon YYYY - DD Mon YYYY) | Price range | Min. qty.
+
+    Sector detection: "(SME IPO)" in company name → SME else Mainboard.
     """
-    log.info("━━ SOURCE D: Chittorgarh ━━")
-    frames: List[pd.DataFrame] = []
+    records: List[dict] = []
+    seen: set = set()
 
-    for itype, url in CHITT_LIVE_URLS.items():
-        tag = f"chitt_live_{itype.lower()}"
-        df  = _fetch_chitt_playwright(url, itype, tag, is_upcoming=False)
-        if df.empty:
-            df = _fetch_chitt_http(url, itype, tag, is_upcoming=False)
-        if not df.empty:
-            log.info(f"  ✅ Chittorgarh live [{itype}]: {len(df)} rows")
-            frames.append(df)
-        _jitter(2.0, 4.0)
+    # Find all <h2> section headers and their adjacent tables
+    sections = []
+    for tag in soup.find_all(["h2", "h3"]):
+        heading = tag.get_text(strip=True).lower()
+        # Walk forward siblings to find the next table
+        for sib in tag.find_next_siblings():
+            if sib.name == "table":
+                sections.append((heading, sib))
+                break
+            if sib.name in ("h2", "h3"):  # hit next section header — stop
+                break
 
-    for itype, url in CHITT_UPCOMING_URLS.items():
-        tag = f"chitt_upcoming_{itype.lower()}"
-        df  = _fetch_chitt_playwright(url, itype, tag, is_upcoming=True)
-        if df.empty:
-            df = _fetch_chitt_http(url, itype, tag, is_upcoming=True)
-        if not df.empty:
-            log.info(f"  ✅ Chittorgarh upcoming [{itype}]: {len(df)} rows")
-            frames.append(df)
-        _jitter(1.5, 3.0)
+    # If no sections found via h2/h3, try the old fallback: just grab all tables
+    if not sections:
+        tables = soup.find_all("table")
+        if len(tables) >= 2:
+            # Heuristic: first table = open, second = upcoming
+            sections = [("open ipos", tables[0]), ("upcoming ipos", tables[1])]
+        elif len(tables) == 1:
+            sections = [("open ipos", tables[0])]
 
-    if frames:
-        combined = pd.concat(frames, ignore_index=True)
-        log.info(f"  ✅ SOURCE D raw: {len(combined)} rows")
-        return combined
-    log.warning("  ⚠️  SOURCE D (Chittorgarh): no data")
-    return pd.DataFrame()
+    for heading, table in sections:
+        # Skip closed IPOs section entirely
+        if any(kw in heading for kw in ("closed", "listed", "allotted", "past")):
+            log.debug(f"  IndiaTrade skip section: '{heading}'")
+            continue
 
+        is_upcoming = "upcoming" in heading
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
 
-# ═══════════════════════════════════════════════════════════
-# AJAX ROW PARSER  (used by Chittorgarh AJAX intercept)
-# ═══════════════════════════════════════════════════════════
-def _parse_ajax_rows(rows_raw: list, ipo_type: str,
-                     source_tag: str, is_upcoming: bool = False) -> pd.DataFrame:
-    if not rows_raw:
-        return pd.DataFrame()
-    sector  = "Mainboard" if "main" in ipo_type.lower() else "SME"
-    sample  = rows_raw[0]
-    is_dict = isinstance(sample, dict)
-    records = []
+        hdr_cells = rows[0].find_all(["th", "td"])
+        hdr = [c.get_text(strip=True).lower() for c in hdr_cells]
 
-    for raw in rows_raw[:80]:
-        try:
-            if is_dict:
-                cc = {k: _clean_symbol(str(v)) for k, v in raw.items()}
+        # Sniff column indices
+        col_company = col_date = col_price = col_qty = None
+        for i, h in enumerate(hdr):
+            if any(k in h for k in ("company", "name", "issuer", "ipo")):
+                col_company = col_company or i
+            elif any(k in h for k in ("date", "open", "period", "subscription")):
+                col_date = col_date or i
+            elif any(k in h for k in ("price", "band", "range", "issue price")):
+                col_price = col_price or i
+            elif any(k in h for k in ("qty", "lot", "min", "quantity", "shares")):
+                col_qty = col_qty or i
+        col_company = col_company or 0
+        col_date    = col_date    or (1 if len(hdr) > 1 else None)
+        col_price   = col_price   or (2 if len(hdr) > 2 else None)
+        col_qty     = col_qty     or (3 if len(hdr) > 3 else None)
 
-                def _kv(keys, default=""):
-                    k = next((x for x in cc if any(p in x.lower() for p in keys)), None)
-                    return cc.get(k, default) if k else default
-
-                symbol    = _kv(("company", "name", "issuer", "ipo")) or list(cc.values())[0]
-                size      = _flt(_kv(("size", "cr", "amt"), "50"), 50.0)
-                lo, hi    = _parse_price_band(_kv(("price", "band"), ""))
-                lot       = _int(_kv(("lot", "qty"), "")) or (1000 if sector == "SME" else 50)
-                close_raw = _kv(("close", "end date", "bid end"), "")
-                close_dt  = _parse_date(close_raw) if close_raw else None
-                date_fallback = (close_dt is None)
-                open_raw  = _kv(("open date", "opening", "bid open", "start"), "")
-                open_dt   = _parse_date(open_raw) if open_raw else None
-                sub       = _flt(_kv(("sub", "times", "subscri"), "0"), 0.0)
-                gmp_raw   = _kv(("gmp", "premium"), "")
-                gmp_v     = _flt(gmp_raw, 0.0)
-                gmp       = gmp_v / 100 if gmp_v > 1 else gmp_v
-                status_text = _kv(("status", "state"), "")
-            else:
-                clean = [_clean_symbol(str(c)) for c in raw]
-                if not clean or len(clean) < 2:
-                    continue
-                symbol = clean[0]
-                size, lo, hi, lot = 50.0, 0.0, 0.0, (1000 if sector == "SME" else 50)
-                sub, gmp = 0.0, 0.0
-                close_dt = open_dt = None
-                date_fallback = True
-                status_text = ""
-
-            if not symbol or symbol.lower() in SKIP_SYMBOLS or len(symbol) < 2:
+        for row in rows[1:]:
+            cells = row.find_all("td")
+            if len(cells) < 2:
                 continue
-            if size > 50_000:
-                size /= 1e7
 
+            def _cell(idx, default=""):
+                if idx is not None and idx < len(cells):
+                    return cells[idx].get_text(strip=True)
+                return default
+
+            # Company name + sector detection
+            raw_name = _cell(col_company)
+            symbol   = _clean_symbol(raw_name)
+            if not symbol or len(symbol) < 2 or symbol.lower() in SKIP_SYMBOLS:
+                continue
+            if symbol in seen:
+                continue
+
+            # Sector from "(SME IPO)" tag in the company name
+            sector = "SME" if re.search(r"\bSME\b", raw_name, re.I) else "Mainboard"
+
+            # Strip "(SME IPO)" and "(IPO)" suffixes from the display name
+            symbol = re.sub(r"\s*\(.*?IPO.*?\)", "", symbol, flags=re.I).strip()
+            if not symbol:
+                continue
+
+            # Date parsing: "DD Mon YYYY - DD Mon YYYY" or "To be announced"
+            date_raw = _cell(col_date)
+            open_dt = close_dt = None
+            date_fallback = True
+
+            if re.search(r"to\s*be\s*announced", date_raw, re.I) or not date_raw.strip():
+                pass  # TBD — leave None
+            else:
+                # Split on " - " or "–" or "to"
+                parts = re.split(r"\s*[-–]\s*|\s+to\s+", date_raw, maxsplit=1)
+                if len(parts) == 2:
+                    open_dt  = _parse_date(parts[0].strip())
+                    close_dt = _parse_date(parts[1].strip())
+                elif len(parts) == 1:
+                    close_dt = _parse_date(parts[0].strip())
+                date_fallback = (close_dt is None)
+
+            # Days to close
             if close_dt is None:
-                if is_upcoming:
-                    days = 20
-                else:
-                    close_dt = TODAY
-                    days = 0
+                days = 20 if is_upcoming else 0
             else:
                 days = (close_dt - TODAY).days
 
-            if not is_upcoming:
-                is_live, conf = _confirm_live_status(open_dt, close_dt, sub, date_fallback, status_text)
-                if not is_live:
-                    continue
+            # For live IPOs: skip if already closed
+            if not is_upcoming and close_dt and close_dt < TODAY:
+                log.debug(f"  IndiaTrade skip past-close [{symbol}]: {close_dt}")
+                continue
+            # For live IPOs: skip if not yet opened
+            if not is_upcoming and open_dt and open_dt > TODAY:
+                log.debug(f"  IndiaTrade skip future-open [{symbol}]: {open_dt}")
+                is_upcoming = True   # re-classify as upcoming
 
+            # Price band: "Rs 141 - 149" or "Rs 41" or "-"
+            price_raw = _cell(col_price)
+            lo, hi = _parse_price_band(price_raw)
+
+            # [VAL-1] Live IPO with no price → skip (will fail validation anyway)
+            if not is_upcoming and hi <= 0:
+                log.debug(f"  IndiaTrade skip price=0 live [{symbol}]")
+                continue
+
+            # Min qty / lot size
+            lot = _int(_cell(col_qty)) or (1000 if sector == "SME" else 50)
+
+            # Issue size: not directly on this page — estimate from lot × price × ~avg retail ratio
+            # Use 0 here; scoring engine defaults gracefully via IssueSizeCr default=50
+            size_cr = 50.0   # neutral placeholder; no size column on IndiaTrade home
+
+            seen.add(symbol)
             records.append({
-                "Symbol":            _clean_symbol(symbol),
+                "Symbol":            symbol,
                 "Sector":            sector,
-                "IssueSizeCr":       round(size, 2),
+                "IssueSizeCr":       size_cr,
                 "PriceBandLower":    lo,
                 "PriceBandUpper":    hi,
                 "LotSize":           lot,
-                "GMP":               round(gmp, 4),
-                "gmp_pct":           round(gmp * 100, 2),
-                "SubscriptionTimes": round(sub, 2),
+                "GMP":               0.0,
+                "gmp_pct":           0.0,
+                "SubscriptionTimes": 0.0,
                 "CloseDate":         close_dt.strftime("%Y-%m-%d") if close_dt else "TBD",
                 "OpenDate":          open_dt.strftime("%Y-%m-%d") if open_dt else "",
                 "DaysToClose":       days,
                 "IsUpcoming":        is_upcoming,
                 "_date_fallback":    date_fallback,
-                "Source":            source_tag + "_ajax",
+                "Source":            "indiratrade",
             })
-        except Exception as exc:
-            log.debug(f"  AJAX row parse error: {exc}")
-            continue
 
     return pd.DataFrame(records)
+
+
+def fetch_source_d_indiratrade() -> pd.DataFrame:
+    """
+    Fetch IndiaTrade IPO portal (ipo.indiratrade.com/Home).
+
+    Strategy:
+    1. HTTP GET with browser-like headers (no Playwright needed — page is SSR).
+    2. If that fails or returns empty, Playwright fallback (headless, domcontentloaded).
+
+    Returns DataFrame with Open + Upcoming IPOs.  Closed section is skipped.
+    """
+    log.info("━━ SOURCE D: IndiaTrade IPO Portal ━━")
+    url  = INDIRATRADE_IPO_URL
+    sess = _make_session("https://ipo.indiratrade.com/")
+
+    # ── HTTP attempt ──────────────────────────────────────────────────────
+    try:
+        resp = sess.get(url, timeout=25)
+        log.info(f"  IndiaTrade HTTP → {resp.status_code}")
+        deny = resp.headers.get("x-deny-reason", "")
+        if deny:
+            log.warning(f"  IndiaTrade blocked by proxy: {deny}")
+        elif resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            df   = _parse_indiratrade_soup(soup)
+            if not df.empty:
+                live_n = int((~df["IsUpcoming"]).sum())
+                upco_n = int(df["IsUpcoming"].sum())
+                log.info(f"  ✅ SOURCE D (IndiaTrade HTTP): {len(df)} rows "
+                         f"({live_n} live, {upco_n} upcoming)")
+                return df
+            else:
+                log.warning("  IndiaTrade HTTP: parsed 0 rows — page structure may have changed")
+    except Exception as exc:
+        log.warning(f"  IndiaTrade HTTP error: {exc}")
+
+    # ── Playwright fallback ───────────────────────────────────────────────
+    if PLAYWRIGHT_OK:
+        log.info("  IndiaTrade falling back to Playwright")
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled"]
+                )
+                ctx  = browser.new_context(
+                    user_agent=BROWSER_HEADERS["User-Agent"],
+                    locale="en-IN",
+                    viewport={"width": 1280, "height": 900},
+                )
+                page = ctx.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                try:
+                    page.wait_for_selector("table tr td", timeout=12_000)
+                except Exception:
+                    pass   # render what we have
+                soup = BeautifulSoup(page.content(), "html.parser")
+                browser.close()
+                df = _parse_indiratrade_soup(soup)
+                if not df.empty:
+                    live_n = int((~df["IsUpcoming"]).sum())
+                    upco_n = int(df["IsUpcoming"].sum())
+                    log.info(f"  ✅ SOURCE D (IndiaTrade PW): {len(df)} rows "
+                             f"({live_n} live, {upco_n} upcoming)")
+                    return df
+        except Exception as exc:
+            log.warning(f"  IndiaTrade PW error: {exc}")
+
+    log.warning("  ⚠️  SOURCE D (IndiaTrade): no data")
+    return pd.DataFrame()
 
 
 # ═══════════════════════════════════════════════════════════
