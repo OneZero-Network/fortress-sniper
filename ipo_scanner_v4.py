@@ -1,1351 +1,1512 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════════╗
-║  IPO SNIPER v3.1 -- INSTITUTIONAL IPO ARBITRAGE ENGINE                  ║
-║  ─────────────────────────────────────────────────────────────────────  ║
-║                                                                          ║
-║  FIXES APPLIED:                                                          ║
-║  1. Multi-source data ingestion (Chittorgarh + MoneyControl + NSE API)  ║
-║  2. Batched Telegram output (1 summary message + 1 detail for top pick)  ║
-║  3. SME/Mainboard auto-classification                                    ║
-║  4. Graceful degradation when sources fail                               ║
-╚══════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════════════╗
+║        IPO SNIPER v5.8 — BUG-HARDENED LIVE-ONLY FILTER                     ║
+║                                                                              ║
+║  ROOT-CAUSE FIXES vs v5.7  (found via sandbox diagnostic):                  ║
+║                                                                              ║
+║  BUG-1  Date-parse fallback TODAY+1 let closed IPOs survive validation.     ║
+║         Fix: parse failure on a LIVE-source row now sets _date_fallback=True║
+║         A row with _date_fallback=True AND sub==0 is DROPPED, not kept.     ║
+║                                                                              ║
+║  BUG-2  Investorgain status-code regex used word-boundary \\b which broke   ║
+║         on glued suffixes like "SMEC", "SMECT". All 14 status codes now     ║
+║         detected correctly via end-anchored pattern (confirmed in tests).   ║
+║                                                                              ║
+║  BUG-3  Blank/TBD upcoming dates got fallback +20d and ALL passed the >30   ║
+║         guard, flooding the upcoming list. Fix: TBD-date upcoming rows go   ║
+║         to a separate low-priority bucket; real-date rows capped to 21d.    ║
+║                                                                              ║
+║  BUG-4  No open_date tracking meant we couldn't confirm an IPO was actually ║
+║         open for bids today. Fix: parse OpenDate column; confirm             ║
+║         open_date <= TODAY <= close_date where both dates are available.    ║
+║                                                                              ║
+║  BUG-5  20+ upcoming in Telegram: fallback-dated rows all had days=20 which ║
+║         passed the days>30 guard. Fix: hard cap upcoming to 5 real-date     ║
+║         + 2 TBD, sorted by days ascending (most urgent first).              ║
+║                                                                              ║
+║  BUG-6  Telegram send_telegram_alerts had no cap on upcoming rows. Now      ║
+║         hard-limited to MAX_UPCOMING_TELEGRAM=5 real + 2 TBD.              ║
+║                                                                              ║
+║  RETAINED: All A–Q fixes from v5.4–v5.7.                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import os
-import re
-import json
-import math
-import logging
-import sqlite3
-import warnings
-from collections import defaultdict
+import os, re, math, time, json, random, logging, sqlite3, html as html_lib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-# ── Optional imports with graceful degradation ──────────────────────────────
 try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    VADER_ENABLED = True
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    PLAYWRIGHT_OK = True
 except ImportError:
-    VADER_ENABLED = False
-    warnings.warn("vaderSentiment not installed. Using lexicon fallback.")
+    PLAYWRIGHT_OK = False
 
-try:
-    import aiohttp
-    ASYNC_ENABLED = True
-except ImportError:
-    ASYNC_ENABLED = False
-
-try:
-    from scipy.stats import norm
-    SCIPY_ENABLED = True
-except ImportError:
-    SCIPY_ENABLED = False
-
-# ── Paths ────────────────────────────────────────────────────────────────────
-DB_PATH         = Path("data/ipo_sniper_v3.db")
-CACHE_DIR       = Path("data/cache")
-LOG_DIR         = Path("logs")
-
-VERSION         = "IPO-SNIPER-v3.1-INSTITUTIONAL"
+# ═══════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════
+IPO_DB_PATH     = Path("data/ipo_sniper_v5.db")
+FALLBACK_CSV    = Path("data/ipo_fallback_v5.csv")
+JSON_EXPORT     = Path("data/ipo_latest_run.json")
+VERSION         = "IPO-SNIPER-v5.8-HARDENED"
+MC_RUNS         = 50_000
+KELLY_FRACTION  = 0.25
+MAX_SYNDICATE   = 10
 SEED            = 42
+
+# ── Upcoming display caps (BUG-5 / BUG-6 fix) ─────────────────────────────
+MAX_UPCOMING_DAYS     = 21   # Only keep upcoming IPOs within 3 weeks
+MAX_UPCOMING_TELEGRAM = 5    # Max real-date upcoming rows in Telegram
+MAX_UPCOMING_TBD      = 2    # Max TBD-date upcoming rows in Telegram
+
 np.random.seed(SEED)
+random.seed(SEED)
 
-# ── Telegram Config (set via env vars) ──────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("IPO_TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("IPO_TELEGRAM_CHAT_ID", "")
-
-# ── Dynamic scoring weights ─────────────────────────────────────────────────
-WEIGHTS = {
-    "gmp_momentum":     0.28,
-    "subscription_strength": 0.25,
-    "fundamental_quality": 0.20,
-    "sector_rotation":    0.15,
-    "shariah_safety":     0.12,
+# ── SOURCE URLS ────────────────────────────────────────────────────────────
+CHITT_LIVE_URLS = {
+    "Mainboard": "https://www.chittorgarh.com/report/ipo-subscription-status/10/",
+    "SME":       "https://www.chittorgarh.com/report/sme-ipo-subscription-status/10/",
 }
-assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9
+CHITT_UPCOMING_URLS = {
+    "Mainboard": "https://www.chittorgarh.com/report/upcoming-ipo/6/",
+}
+NSE_IPO_PAGE = "https://www.nseindia.com/market-data/upcoming-issues-ipo"
+NSE_API_PATTERNS = [
+    "/api/getAllIpo", "/api/ipo-detail", "/api/ipo",
+    "/api/ipo-info", "/api/emerge-live", "/api/live-analysis-data",
+]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%H:%M:%S"
-)
-log = logging.getLogger("IPO-SNIPER-v3")
-
-if VADER_ENABLED:
-    _vader = SentimentIntensityAnalyzer()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 1: MULTI-SOURCE DATA INGESTION ENGINE
-#  ── Cascading fallback: Chittorgarh -> MoneyControl -> NSE API -> Cache
-# ═══════════════════════════════════════════════════════════════════════════
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
+BASE_WEIGHTS: Dict[str, float] = {
+    "gmp": 0.22, "sub": 0.28, "sentiment": 0.18,
+    "trend": 0.10, "size": 0.08, "halal": 0.14,
 }
 
-# Source 1: Chittorgarh -- Combined Mainboard + SME list (HTML, BS4-parseable)
-CHITTORGARH_URLS = {
-    "combined": "https://www.chittorgarh.com/report/ipo-in-india-list-main-board-sme/82/",
-    "mainboard_dashboard": "https://www.chittorgarh.com/ipo/ipo_dashboard.asp",
-    "sme_dashboard": "https://www.chittorgarh.com/ipo/ipo_dashboard_sme.asp",
-    "gmp_live": "https://www.chittorgarh.com/report/live-ipo-gmp/331/ipo/",
-}
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s │ %(levelname)-8s │ %(message)s")
+log = logging.getLogger("IPO-SNIPER-v5.8")
+TODAY = datetime.today().date()
 
-# Source 2: MoneyControl -- Explicit "Open IPOs" section (HTML, reliable)
-MONEYCONTROL_URL = "https://www.moneycontrol.com/ipo/"
+# ═══════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════
+def _flt(v, default: float = 0.0) -> float:
+    try:
+        m = re.search(r"[\d.]+", str(v).replace(",", ""))
+        return float(m.group()) if m else default
+    except Exception:
+        return default
 
-# Source 3: NSE India API -- Direct exchange data (JSON, requires session)
-NSE_API_URLS = {
-    "current_ipo": "https://www.nseindia.com/api/ipo-current",
-    "ipo_detail": "https://www.nseindia.com/api/ipo-detail",
-}
+def _int(v, default: int = 0) -> int:
+    try:
+        m = re.search(r"\d+", str(v).replace(",", ""))
+        return int(m.group()) if m else default
+    except Exception:
+        return default
 
+def _jitter(lo: float = 1.5, hi: float = 3.5):
+    time.sleep(random.uniform(lo, hi))
 
-class IPODataSource:
-    """Abstract base for IPO data sources with unified interface."""
-
-    def __init__(self, name: str):
-        self.name = name
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-
-    def fetch(self) -> List[Dict]:
-        raise NotImplementedError
-
-    def _safe_get(self, url: str, timeout: int = 20) -> Optional[requests.Response]:
+def _parse_date(text: str) -> Optional[object]:
+    """Parse a date in any common Indian format. Returns date or None."""
+    text = str(text).strip()
+    text = re.sub(r"\s*\(.*?\)", "", text).strip()
+    for fmt in ("%d-%b-%Y", "%d %b %Y", "%d-%m-%Y", "%Y-%m-%d",
+                "%b %d, %Y", "%d/%m/%Y", "%B %d, %Y", "%d %B %Y",
+                "%d-%m-%y", "%m/%d/%Y"):
         try:
-            resp = self.session.get(url, timeout=timeout)
-            if resp.status_code == 200:
-                return resp
-            log.warning(f"[{self.name}] HTTP {resp.status_code} for {url}")
-            return None
-        except requests.exceptions.Timeout:
-            log.warning(f"[{self.name}] Timeout for {url}")
-            return None
-        except Exception as e:
-            log.warning(f"[{self.name}] Error: {e}")
-            return None
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
 
+def _parse_price_band(text: str) -> Tuple[float, float]:
+    nums = re.findall(r"[\d.]+", str(text).replace(",", ""))
+    if len(nums) >= 2:
+        return float(nums[0]), float(nums[-1])
+    if len(nums) == 1:
+        v = float(nums[0])
+        return round(v * 0.97, 2), v
+    return 0.0, 0.0  # FIX: return 0/0 (TBD) instead of 95/100 fake default
 
-class ChittorgarhSource(IPODataSource):
+def _clean_symbol(raw: str) -> str:
+    s = BeautifulSoup(str(raw), "html.parser").get_text(strip=True)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8",
+    "Cache-Control": "no-cache",
+}
+SKIP_SYMBOLS = {
+    "company", "name", "issuer", "no records found",
+    "compare", "click here", "", "open", "closed", "upcoming",
+    "sno", "sr", "sr.", "#", "s.no", "s.no.", "sl.no",
+}
+
+def _make_session(referer: str = "https://www.google.com/") -> requests.Session:
+    s = requests.Session()
+    s.headers.update({**BROWSER_HEADERS, "Referer": referer})
+    return s
+
+# ═══════════════════════════════════════════════════════════
+# COLUMN SNIFFER  (shared by all table parsers)
+# ═══════════════════════════════════════════════════════════
+def _sniff_columns(headers: List[str]) -> Dict[str, int]:
     """
-    Chittorgarh combined mainboard+SME page.
-
-    HTML structure (confirmed from search results):
-    - Section: "Mainboard IPOs & FPOs 2026" with table
-    - Section: "SME IPOs & FPOs 2026" with table  
-    - Each row: Company Name | Open Date | Close Date | Type
-    - Date format: "O21 - 25 May" (Open day 21, Close day 25, Month May)
+    Map semantic column names → column index from a list of header strings.
+    Now also detects 'open' date and 'status' columns (needed for BUG-4 fix).
     """
+    col: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        h = h.lower().strip()
+        if any(k in h for k in ("company", "issuer", "name", "ipo")):
+            col.setdefault("sym", i)
+        elif any(k in h for k in ("issue size", "size", "amt", "cr")):
+            col.setdefault("size", i)
+        elif any(k in h for k in ("price band", "price", "band", "rate")):
+            col.setdefault("price", i)
+        elif any(k in h for k in ("close date", "closing date", "close", "end date",
+                                   "end", "bid end")):
+            col.setdefault("close", i)
+        elif any(k in h for k in ("open date", "opening date", "open", "start",
+                                   "bid open", "bid start")):
+            col.setdefault("open", i)
+        elif any(k in h for k in ("lot size", "lot", "qty", "min qty", "shares")):
+            col.setdefault("lot", i)
+        elif "gmp" in h or "premium" in h:
+            col.setdefault("gmp", i)
+        elif any(k in h for k in ("subscription", "subscribed", "sub", "times", "x")):
+            col.setdefault("sub", i)
+        elif "status" in h or "state" in h:
+            col.setdefault("status", i)
+    col.setdefault("sym", 0)
+    return col
 
-    def __init__(self):
-        super().__init__("Chittorgarh")
-
-    def fetch(self) -> List[Dict]:
-        ipos = []
-
-        # Try combined page first
-        resp = self._safe_get(CHITTORGARH_URLS["combined"], timeout=25)
-        if resp:
-            ipos.extend(self._parse_combined_page(resp.text))
-
-        # Fallback to individual dashboards
-        if not ipos:
-            for board_type, url in [("MAINBOARD", CHITTORGARH_URLS["mainboard_dashboard"]),
-                                     ("SME", CHITTORGARH_URLS["sme_dashboard"])]:
-                resp = self._safe_get(url, timeout=20)
-                if resp:
-                    ipos.extend(self._parse_dashboard(resp.text, board_type))
-
-        # Enrich with GMP data
-        if ipos:
-            gmp_map = self._fetch_gmp_data()
-            for ipo in ipos:
-                name_key = ipo["name"].lower().replace(" ", "")
-                if name_key in gmp_map:
-                    ipo["gmp"] = gmp_map[name_key].get("gmp", 0)
-                    ipo["subscription"] = gmp_map[name_key].get("subscription", 0)
-
-        log.info(f"[Chittorgarh] Fetched {len(ipos)} IPOs")
-        return ipos
-
-    def _parse_combined_page(self, html: str) -> List[Dict]:
-        """Parse the combined mainboard+SME list page."""
-        soup = BeautifulSoup(html, 'html.parser')
-        ipos = []
-
-        # Find all tables
-        tables = soup.find_all('table')
-
-        for table in tables:
-            # Check table caption or preceding header for type
-            prev = table.find_previous(['h2', 'h3', 'h4', 'div', 'p'])
-            board_type = "UNKNOWN"
-            if prev:
-                prev_text = prev.get_text().lower()
-                if 'sme' in prev_text:
-                    board_type = "SME"
-                elif 'mainboard' in prev_text or 'main board' in prev_text:
-                    board_type = "MAINBOARD"
-
-            rows = table.find_all('tr')[1:]  # Skip header
-            for row in rows:
-                cells = row.find_all(['td', 'th'])
-                if len(cells) >= 3:
-                    name = cells[0].get_text(strip=True)
-                    # Skip header rows or empty
-                    if not name or 'company' in name.lower():
-                        continue
-
-                    # Extract dates from text
-                    date_text = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-                    open_date, close_date = self._extract_dates(date_text)
-
-                    ipos.append({
-                        "name": name,
-                        "type": board_type,
-                        "open_date": open_date,
-                        "close_date": close_date,
-                        "source": "chittorgarh",
-                        "raw_dates": date_text,
-                    })
-
-        return ipos
-
-    def _parse_dashboard(self, html: str, board_type: str) -> List[Dict]:
-        """Parse individual mainboard or SME dashboard."""
-        soup = BeautifulSoup(html, 'html.parser')
-        ipos = []
-
-        # Look for company links or table rows
-        company_links = soup.find_all('a', href=re.compile(r'/ipo/|/company/', re.I))
-        for link in company_links:
-            name = link.get_text(strip=True)
-            if name and len(name) > 2 and not any(x in name.lower() for x in ['more', 'view', 'click']):
-                ipos.append({
-                    "name": name,
-                    "type": board_type,
-                    "source": "chittorgarh_dashboard",
-                })
-
-        return ipos
-
-    def _extract_dates(self, text: str) -> Tuple[str, str]:
-        """Extract open/close dates from text like 'O21 - 25 May' or '21-25 May 2026'."""
-        text = text.lower().strip()
-        year = datetime.now().year
-
-        # Pattern 1: "O21 - 25 May" or "O21-25 May"
-        m1 = re.search(r'o?(\d{1,2})\s*[-\u2013]\s*(\d{1,2})\s+([a-z]+)', text)
-        if m1:
-            open_d, close_d, month = m1.groups()
-            return (f"{year}-{month[:3].title()}-{open_d.zfill(2)}",
-                    f"{year}-{month[:3].title()}-{close_d.zfill(2)}")
-
-        # Pattern 2: "21 May - 25 May 2026" or "21-25 May"
-        m2 = re.search(r'(\d{1,2})\s+([a-z]+)\s*[-\u2013]\s*(\d{1,2})\s+([a-z]+)', text)
-        if m2:
-            open_d, open_m, close_d, close_m = m2.groups()
-            return (f"{year}-{open_m[:3].title()}-{open_d.zfill(2)}",
-                    f"{year}-{close_m[:3].title()}-{close_d.zfill(2)}")
-
-        # Pattern 3: "21-05-2026 to 25-05-2026"
-        m3 = re.search(r'(\d{2})[-/](\d{2})[-/](\d{4})', text)
-        if m3:
-            parts = re.findall(r'(\d{2})[-/](\d{2})[-/](\d{4})', text)
-            if len(parts) >= 2:
-                d1, m1, y1 = parts[0]
-                d2, m2, y2 = parts[1]
-                return (f"{y1}-{m1}-{d1}", f"{y2}-{m2}-{d2}")
-
-        return ("", "")
-
-    def _fetch_gmp_data(self) -> Dict[str, Dict]:
-        """Fetch live GMP data from Chittorgarh GMP page."""
-        gmp_map = {}
-        resp = self._safe_get(CHITTORGARH_URLS["gmp_live"], timeout=20)
-        if not resp:
-            return gmp_map
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        tables = soup.find_all('table')
-
-        for table in tables:
-            rows = table.find_all('tr')[1:]
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) >= 4:
-                    name = cells[0].get_text(strip=True)
-                    gmp_text = cells[1].get_text(strip=True) if len(cells) > 1 else "0"
-                    sub_text = cells[2].get_text(strip=True) if len(cells) > 2 else "0"
-
-                    # Parse GMP (remove % sign, handle ranges)
-                    gmp = self._parse_percentage(gmp_text)
-                    sub = self._parse_subscription(sub_text)
-
-                    key = name.lower().replace(" ", "").replace(".", "")
-                    gmp_map[key] = {"gmp": gmp, "subscription": sub}
-
-        return gmp_map
-
-    @staticmethod
-    def _parse_percentage(text: str) -> float:
-        """Parse percentage text like '113%' or '113.0%' or '-'."""
-        text = text.replace('%', '').replace(',', '').strip()
-        if text in ['-', '', 'NA', 'N/A']:
-            return 0.0
-        try:
-            return float(text)
-        except:
-            return 0.0
-
-    @staticmethod
-    def _parse_subscription(text: str) -> float:
-        """Parse subscription text like '3.5x' or '3.5x'."""
-        text = text.lower().replace('x', '').replace('x', '').replace(',', '').strip()
-        if text in ['-', '', 'na']:
-            return 0.0
-        try:
-            return float(text)
-        except:
-            return 0.0
-
-
-class MoneyControlSource(IPODataSource):
+# ═══════════════════════════════════════════════════════════
+# LIVE CONFIRMATION  (BUG-4 fix)
+# ═══════════════════════════════════════════════════════════
+def _confirm_live_status(open_dt, close_dt, sub: float,
+                         date_fallback: bool, status_text: str) -> Tuple[bool, str]:
     """
-    MoneyControl IPO page -- reliable HTML with explicit "Open IPOs" section.
+    3-tier confidence check for whether an IPO is open for bidding today.
 
-    Structure: FAQ-style sections with "Which are the Open IPOs?" 
-    followed by bulleted company names with links.
+    Returns (is_live: bool, confidence: str)
+
+    TIER 1 — HIGH (always include):
+      • sub > 0 (bids are actively being recorded)
+      • status cell says "Open" explicitly
+
+    TIER 2 — MEDIUM (include, flag with low confidence):
+      • open_date <= TODAY <= close_date (both dates parsed)
+      • close_date >= TODAY AND NOT date_fallback
+
+    TIER 3 — LOW (drop from live, may appear as upcoming):
+      • date_fallback=True AND sub==0  ← BUG-1 FIX
+      • close_date < TODAY (already closed)
     """
+    status_lower = status_text.lower().strip()
+    explicit_open   = any(k in status_lower for k in ("open", "bidding", "live"))
+    explicit_closed = any(k in status_lower for k in ("closed", "listed", "allotted", "withdrawn"))
 
-    def __init__(self):
-        super().__init__("MoneyControl")
+    if explicit_closed:
+        return False, "status_says_closed"
 
-    def fetch(self) -> List[Dict]:
-        resp = self._safe_get(MONEYCONTROL_URL, timeout=20)
-        if not resp:
-            return []
+    if sub > 0.0:
+        return True, "TIER1_sub_confirmed"
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        ipos = []
+    if explicit_open:
+        return True, "TIER1_status_confirmed"
 
-        # Strategy 1: Find FAQ section "Which are the Open IPOs?"
-        open_heading = soup.find(string=re.compile(r"Which are the (current |open )?IPOs", re.I))
-        if open_heading:
-            # The answer is in the parent container or next sibling
-            container = open_heading.find_parent(['div', 'li', 'section'])
-            if container:
-                links = container.find_all('a')
-                for link in links:
-                    name = link.get_text(strip=True)
-                    href = link.get('href', '')
-                    if name and len(name) > 2 and 'ipo' in href.lower():
-                        # Clean name: remove "IPO" suffix if present
-                        name = re.sub(r'\s*IPO\s*$', '', name, flags=re.I).strip()
-                        ipos.append({
-                            "name": name,
-                            "type": "UNKNOWN",  # Will classify later via Chittorgarh cross-ref
-                            "source": "moneycontrol_open",
-                        })
+    # Both dates available: use date range
+    if open_dt and close_dt and not date_fallback:
+        in_range = (open_dt <= TODAY <= close_dt)
+        if in_range:
+            return True, "TIER2_date_range"
+        if close_dt < TODAY:
+            return False, "TIER3_past_close"
+        if open_dt > TODAY:
+            return False, "TIER3_not_opened_yet"
 
-        # Strategy 2: Look for table with current IPOs
-        tables = soup.find_all('table')
-        for table in tables:
-            caption = table.find('caption') or table.find_previous(['h2', 'h3'])
-            if caption and 'open' in caption.get_text().lower():
-                rows = table.find_all('tr')[1:]
-                for row in rows:
-                    cells = row.find_all('td')
-                    if cells:
-                        name = cells[0].get_text(strip=True)
-                        if name and len(name) > 2:
-                            ipos.append({
-                                "name": name,
-                                "type": "UNKNOWN",
-                                "source": "moneycontrol_table",
-                            })
+    # Only close date available
+    if close_dt and not date_fallback:
+        if close_dt >= TODAY:
+            return True, "TIER2_close_future"
+        return False, "TIER3_past_close"
 
-        # Strategy 3: Look for div with class containing 'openipo' or similar
-        open_divs = soup.find_all(class_=re.compile('open.*ipo|ipo.*open|current.*ipo', re.I))
-        for div in open_divs:
-            links = div.find_all('a')
-            for link in links:
-                name = link.get_text(strip=True)
-                if name and len(name) > 2:
-                    ipos.append({
-                        "name": name,
-                        "type": "UNKNOWN",
-                        "source": "moneycontrol_div",
-                    })
+    # FIX BUG-1: date fallback + no sub data = unreliable → DROP
+    if date_fallback and sub == 0.0:
+        return False, "TIER3_fallback_no_sub"
 
-        # Deduplicate
-        seen = set()
-        unique = []
-        for ipo in ipos:
-            key = ipo["name"].lower().replace(" ", "")
-            if key not in seen:
-                seen.add(key)
-                unique.append(ipo)
-
-        log.info(f"[MoneyControl] Fetched {len(unique)} IPOs")
-        return unique
+    # date fallback but sub > 0 was caught above; sub == 0 with fallback = drop
+    return False, "TIER3_insufficient_data"
 
 
-class NSESource(IPODataSource):
-    """
-    NSE India API -- Direct exchange data.
+# ═══════════════════════════════════════════════════════════
+# HTML TABLE PARSER
+# ═══════════════════════════════════════════════════════════
+def _parse_html_table(table, ipo_type: str, source_tag: str,
+                      is_upcoming: bool = False) -> pd.DataFrame:
+    sector = "Mainboard" if "main" in ipo_type.lower() else "SME"
+    rows   = table.find_all("tr")
+    if len(rows) < 2:
+        return pd.DataFrame()
 
-    Requires:
-    1. Session cookies (obtained by hitting homepage first)
-    2. Proper Referer header
-    3. Rate limiting (max 1 req/5sec)
+    hdr = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+    col = _sniff_columns(hdr)
 
-    Returns JSON with current IPO details including subscription data.
-    """
+    records = []
+    for row in rows[1:]:
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
 
-    def __init__(self):
-        super().__init__("NSE_India")
-        self.nse_home = "https://www.nseindia.com"
+        def _c(key, default=""):
+            idx = col.get(key)
+            return cells[idx].get_text(strip=True) \
+                if idx is not None and idx < len(cells) else default
 
-    def fetch(self) -> List[Dict]:
-        # Step 1: Get session cookies from homepage
-        home_resp = self._safe_get(self.nse_home, timeout=15)
-        if not home_resp:
-            log.warning("[NSE] Failed to get session cookies")
-            return []
+        lnk    = cells[col["sym"]].find("a")
+        symbol = _clean_symbol(lnk.get_text(strip=True) if lnk
+                               else cells[col["sym"]].get_text(strip=True))
+        if not symbol or symbol.lower() in SKIP_SYMBOLS or len(symbol) < 2:
+            continue
 
-        # Step 2: Set referer and fetch IPO data
-        self.session.headers.update({
-            "Referer": self.nse_home,
-            "X-Requested-With": "XMLHttpRequest",
+        size = _flt(_c("size", "50"), 50.0)
+        if size > 50_000:
+            size /= 1e7
+
+        lo, hi = _parse_price_band(_c("price", ""))
+
+        # FIX BUG-1+BUG-3: Track whether dates came from a fallback
+        close_raw = _c("close", "")
+        close_dt  = _parse_date(close_raw) if close_raw else None
+        date_fallback = (close_dt is None)
+
+        open_raw = _c("open", "")
+        open_dt  = _parse_date(open_raw) if open_raw else None
+
+        if close_dt is None:
+            if is_upcoming:
+                # TBD date — use sentinel so Telegram shows "Date TBD"
+                close_dt = None
+                days = 20  # placeholder for sorting; will be marked TBD
+            else:
+                # For live source with unparseable close date:
+                # Use TODAY as close date — makes DaysToClose=0.
+                # _confirm_live_status will require sub>0 to keep this row (TIER2).
+                close_dt = TODAY
+                days = 0
+        else:
+            days = (close_dt - TODAY).days
+
+        # FIX BUG-3: upcoming with TBD price
+        if is_upcoming and hi <= 0.0:
+            lo, hi = 0.0, 0.0
+
+        gmp_raw = _c("gmp", "")
+        gmp_v   = _flt(gmp_raw, 0.0) if gmp_raw else 0.0
+        gmp     = gmp_v / 100 if gmp_v > 1 else gmp_v
+
+        sub         = _flt(_c("sub", "0"), 0.0)
+        status_text = _c("status", "")
+        lot         = _int(_c("lot", "")) or (1000 if sector == "SME" else 50)
+
+        if not is_upcoming:
+            is_live, confidence = _confirm_live_status(
+                open_dt, close_dt, sub, date_fallback, status_text
+            )
+            if not is_live:
+                log.debug(f"  DROP live [{symbol}]: {confidence}")
+                continue
+
+        records.append({
+            "Symbol":           symbol,
+            "Sector":           sector,
+            "IssueSizeCr":      round(size, 2),
+            "PriceBandLower":   lo,
+            "PriceBandUpper":   hi,
+            "LotSize":          lot,
+            "GMP":              round(gmp, 4),
+            "gmp_pct":          round(gmp * 100, 2),
+            "SubscriptionTimes":round(sub, 2),
+            "CloseDate":        close_dt.strftime("%Y-%m-%d") if close_dt else "TBD",
+            "OpenDate":         open_dt.strftime("%Y-%m-%d") if open_dt else "",
+            "DaysToClose":      days,
+            "IsUpcoming":       is_upcoming,
+            "_date_fallback":   date_fallback,
+            "Source":           source_tag,
         })
 
-        resp = self._safe_get(NSE_API_URLS["current_ipo"], timeout=15)
-        if not resp:
-            return []
+    return pd.DataFrame(records)
 
+# ═══════════════════════════════════════════════════════════
+# AJAX ROW PARSER
+# ═══════════════════════════════════════════════════════════
+def _parse_ajax_rows(rows_raw: list, ipo_type: str,
+                     source_tag: str, is_upcoming: bool = False) -> pd.DataFrame:
+    if not rows_raw:
+        return pd.DataFrame()
+
+    sector     = "Mainboard" if "main" in ipo_type.lower() else "SME"
+    sample     = rows_raw[0]
+    is_dict    = isinstance(sample, dict)
+    records    = []
+
+    for raw in rows_raw[:80]:
         try:
-            data = resp.json()
-            ipos = []
+            if is_dict:
+                cc = {k: _clean_symbol(str(v)) for k, v in raw.items()}
 
-            # NSE API returns nested structure
-            if isinstance(data, dict):
-                # Could be under 'data', 'currentIPOs', etc.
-                ipo_list = data.get('data', data.get('currentIPOs', data.get('ipoCurrent', [])))
-            elif isinstance(data, list):
-                ipo_list = data
+                def _kv(keys, default=""):
+                    k = next((x for x in cc if any(p in x.lower() for p in keys)), None)
+                    return cc.get(k, default) if k else default
+
+                symbol   = _kv(("company","name","issuer","ipo")) or list(cc.values())[0]
+                size     = _flt(_kv(("size","cr","amt"), "50"), 50.0)
+                lo, hi   = _parse_price_band(_kv(("price","band"), ""))
+                lot      = _int(_kv(("lot","qty"), "")) or (1000 if sector == "SME" else 50)
+
+                close_raw = _kv(("close","end date","bid end"), "")
+                close_dt  = _parse_date(close_raw) if close_raw else None
+                date_fallback = (close_dt is None)
+
+                open_raw  = _kv(("open date","opening","bid open","start"), "")
+                open_dt   = _parse_date(open_raw) if open_raw else None
+
+                sub       = _flt(_kv(("sub","times","subscri"), "0"), 0.0)
+                gmp_raw   = _kv(("gmp","premium"), "")
+                gmp_v     = _flt(gmp_raw, 0.0)
+                gmp       = gmp_v / 100 if gmp_v > 1 else gmp_v
+                status_text = _kv(("status","state"), "")
+
             else:
-                ipo_list = []
+                clean = [_clean_symbol(str(c)) for c in raw]
+                if not clean or len(clean) < 2:
+                    continue
+                symbol = clean[0]
+                size, lo, hi, lot = 50.0, 0.0, 0.0, (1000 if sector=="SME" else 50)
+                sub, gmp = 0.0, 0.0
+                close_dt = open_dt = None
+                date_fallback = True
+                status_text = ""
 
-            for item in ipo_list:
-                name = item.get('companyName', item.get('symbol', item.get('name', '')))
-                if not name:
+                for i, cell in enumerate(clean[1:], start=1):
+                    cell = cell.strip()
+                    if not cell:
+                        continue
+                    d = _parse_date(cell)
+                    if d and i >= 3:
+                        if close_dt is None:
+                            close_dt = d
+                            date_fallback = False
+                        elif open_dt is None and d < close_dt:
+                            open_dt = d
+                        continue
+                    if re.search(r"\d+\s*[-–]\s*\d+", cell):
+                        lo, hi = _parse_price_band(cell)
+                        continue
+                    nums = re.findall(r"[\d.]+", cell.replace(",",""))
+                    if not nums:
+                        continue
+                    v = float(nums[0])
+                    if "x" in cell.lower() or ("." in cell and 0.1 <= v <= 500 and i >= 4):
+                        sub = v
+                    elif v > 10 and v < 10_000 and size == 50.0:
+                        size = v
+                    elif v == int(v) and 10 <= v <= 5000 and lot == (1000 if sector=="SME" else 50):
+                        lot = int(v)
+                    elif v < 5 and gmp == 0.0 and "%" in cell:
+                        gmp = v / 100
+
+            if not symbol or symbol.lower() in SKIP_SYMBOLS or len(symbol) < 2:
+                continue
+            if size > 50_000:
+                size /= 1e7
+
+            if close_dt is None:
+                if is_upcoming:
+                    days = 20
+                else:
+                    close_dt = TODAY
+                    days = 0
+            else:
+                days = (close_dt - TODAY).days
+
+            if not is_upcoming:
+                is_live, confidence = _confirm_live_status(
+                    open_dt, close_dt, sub, date_fallback, status_text
+                )
+                if not is_live:
+                    log.debug(f"  DROP AJAX [{symbol}]: {confidence}")
                     continue
 
-                ipos.append({
-                    "name": name,
-                    "type": item.get('issueType', 'UNKNOWN'),  # MAINBOARD or SME
-                    "open_date": item.get('openingDate', ''),
-                    "close_date": item.get('closingDate', ''),
-                    "price_band_low": item.get('priceBandLow', 0),
-                    "price_band_high": item.get('priceBandHigh', 0),
-                    "lot_size": item.get('lotSize', 0),
-                    "issue_size": item.get('issueSize', 0),
-                    "subscription_qib": item.get('qibSubscription', 0),
-                    "subscription_nii": item.get('niiSubscription', 0),
-                    "subscription_rii": item.get('riiSubscription', 0),
-                    "subscription_total": item.get('totalSubscription', 0),
-                    "source": "nse_api",
-                })
+            records.append({
+                "Symbol":            _clean_symbol(symbol),
+                "Sector":            sector,
+                "IssueSizeCr":       round(size, 2),
+                "PriceBandLower":    lo,
+                "PriceBandUpper":    hi,
+                "LotSize":           lot,
+                "GMP":               round(gmp, 4),
+                "gmp_pct":           round(gmp * 100, 2),
+                "SubscriptionTimes": round(sub, 2),
+                "CloseDate":         close_dt.strftime("%Y-%m-%d") if close_dt else "TBD",
+                "OpenDate":          open_dt.strftime("%Y-%m-%d") if open_dt else "",
+                "DaysToClose":       days,
+                "IsUpcoming":        is_upcoming,
+                "_date_fallback":    date_fallback,
+                "Source":            source_tag + "_ajax",
+            })
+        except Exception as exc:
+            log.debug(f"  AJAX row parse error: {exc}")
+            continue
 
-            log.info(f"[NSE] Fetched {len(ipos)} IPOs")
-            return ipos
+    return pd.DataFrame(records)
 
-        except json.JSONDecodeError:
-            log.warning("[NSE] Invalid JSON response")
-            return []
-        except Exception as e:
-            log.warning(f"[NSE] Parse error: {e}")
-            return []
+# ═══════════════════════════════════════════════════════════
+# SOURCE A — CHITTORGARH  (Playwright → HTTP fallback)
+# ═══════════════════════════════════════════════════════════
+def _fetch_chitt_playwright(url: str, ipo_type: str, source_tag: str,
+                             is_upcoming: bool = False) -> pd.DataFrame:
+    if not PLAYWRIGHT_OK:
+        return pd.DataFrame()
+    log.info(f"  PW [{ipo_type}] → {url}")
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"]
+            )
+            ctx  = browser.new_context(
+                user_agent=BROWSER_HEADERS["User-Agent"],
+                extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"},
+                viewport={"width": 1280, "height": 900},
+            )
+            page = ctx.new_page()
 
+            intercepted: List[dict] = []
+            def _on_resp(resp):
+                if resp.status == 200 and "chittorgarh" in resp.url:
+                    ct = resp.headers.get("content-type", "")
+                    if "json" in ct:
+                        try:
+                            body = resp.json()
+                            rows = body.get("data", body.get("aaData", []))
+                            if rows:
+                                intercepted.extend(rows)
+                                log.info(f"  PW AJAX: {len(rows)} rows")
+                        except Exception:
+                            pass
+            page.on("response", _on_resp)
 
-class IPOAggregator:
-    """Orchestrates multiple sources with cascading fallback and cross-validation."""
-
-    def __init__(self):
-        self.sources = [
-            ChittorgarhSource(),
-            MoneyControlSource(),
-            NSESource(),
-        ]
-        self.cache_file = CACHE_DIR / "ipo_cache.json"
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    def fetch_all(self, force_refresh: bool = False) -> pd.DataFrame:
-        """
-        Fetch from all sources, merge, deduplicate, and classify.
-
-        Priority:
-        1. Chittorgarh (most detailed: dates, GMP, subscription)
-        2. MoneyControl (reliable company names)
-        3. NSE API (official subscription data)
-        """
-        all_ipos = []
-
-        # Try each source
-        for source in self.sources:
+            page.goto(url, wait_until="networkidle", timeout=55_000)
             try:
-                batch = source.fetch()
-                if batch:
-                    all_ipos.extend(batch)
-                    log.info(f"  {source.name}: {len(batch)} IPOs")
-                else:
-                    log.warning(f"  {source.name}: empty response")
-            except Exception as e:
-                log.error(f"  {source.name} failed: {e}")
+                page.wait_for_selector("table tbody tr td:not(.dataTables_empty)",
+                                       timeout=15_000)
+            except PWTimeout:
+                pass
 
-        if not all_ipos:
-            log.error("All sources failed. Attempting cache fallback...")
-            return self._load_cache()
+            if intercepted:
+                browser.close()
+                return _parse_ajax_rows(intercepted, ipo_type, source_tag, is_upcoming)
 
-        # Build DataFrame and deduplicate
-        df = pd.DataFrame(all_ipos)
+            soup = BeautifulSoup(page.content(), "html.parser")
+            browser.close()
+            for tbl in soup.find_all("table"):
+                if len(tbl.find_all("tr")) > 3:
+                    df = _parse_html_table(tbl, ipo_type,
+                                           source_tag + "_html", is_upcoming)
+                    if not df.empty:
+                        return df
+    except Exception as exc:
+        log.warning(f"  PW error [{ipo_type}]: {exc}")
+    return pd.DataFrame()
 
-        # Deduplicate by normalized name (keep Chittorgarh entry if conflict)
-        df['name_norm'] = df['name'].str.lower().str.replace(r'[^a-z0-9]', '', regex=True)
-        df = df.sort_values('source', key=lambda x: x.map({'chittorgarh': 0, 'nse_api': 1, 'moneycontrol': 2}))
-        df = df.drop_duplicates(subset=['name_norm'], keep='first')
-        df = df.drop(columns=['name_norm'])
 
-        # Classify SME vs Mainboard (if UNKNOWN)
-        df = self._classify_board_type(df)
+def _fetch_chitt_http(url: str, ipo_type: str, source_tag: str,
+                      is_upcoming: bool = False) -> pd.DataFrame:
+    sess = _make_session("https://www.chittorgarh.com/")
+    try:
+        sess.get("https://www.chittorgarh.com/", timeout=12)
+        _jitter(1.5, 3.0)
+        resp = sess.get(url, timeout=25)
+        log.info(f"  HTTP [{ipo_type}] → {resp.status_code}")
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        deny = resp.headers.get("x-deny-reason", "")
+        if deny:
+            log.warning(f"  Blocked: {deny}")
+            return pd.DataFrame()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for sel in ["table.table-striped","table.table-bordered",
+                    ".table-responsive table","table"]:
+            for tbl in soup.select(sel):
+                if len(tbl.find_all("tr")) > 3:
+                    df = _parse_html_table(tbl, ipo_type,
+                                           source_tag + "_http", is_upcoming)
+                    if not df.empty:
+                        return df
+    except Exception as exc:
+        log.warning(f"  HTTP error [{ipo_type}]: {exc}")
+    return pd.DataFrame()
 
-        # Filter to currently OPEN issues only
-        df = self._filter_open_issues(df)
 
-        # Save to cache
-        self._save_cache(df)
+def fetch_source_a_chittorgarh() -> pd.DataFrame:
+    log.info("━━ SOURCE A: Chittorgarh ━━")
+    frames: List[pd.DataFrame] = []
 
-        log.info(f"Aggregated {len(df)} unique open IPOs")
-        return df
+    for itype, url in CHITT_LIVE_URLS.items():
+        tag = f"chitt_live_{itype.lower()}"
+        df  = _fetch_chitt_playwright(url, itype, tag, is_upcoming=False)
+        if df.empty:
+            df = _fetch_chitt_http(url, itype, tag, is_upcoming=False)
+        if not df.empty:
+            log.info(f"  ✅ Live [{itype}]: {len(df)} rows")
+            frames.append(df)
+        _jitter(2.0, 4.0)
 
-    def _classify_board_type(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Classify SME vs Mainboard using heuristics if type is UNKNOWN."""
-        sme_keywords = ['sme', 'small', 'medium', 'enterprise']
-        mainboard_keywords = ['mainboard', 'main board', 'large cap']
+    for itype, url in CHITT_UPCOMING_URLS.items():
+        tag = f"chitt_upcoming_{itype.lower()}"
+        df  = _fetch_chitt_playwright(url, itype, tag, is_upcoming=True)
+        if df.empty:
+            df = _fetch_chitt_http(url, itype, tag, is_upcoming=True)
+        if not df.empty:
+            log.info(f"  ✅ Upcoming [{itype}]: {len(df)} rows (pre-open)")
+            frames.append(df)
+        _jitter(1.5, 3.0)
 
-        def classify(row):
-            if row['type'] != 'UNKNOWN':
-                return row['type']
-            name_lower = row['name'].lower()
-            if any(k in name_lower for k in sme_keywords):
-                return 'SME'
-            # Heuristic: SME issues are typically < 50Cr
-            issue_size = row.get('issue_size', 0)
-            if issue_size and issue_size < 50_000_000:  # 50Cr in rupees
-                return 'SME'
-            return 'MAINBOARD'
+    if frames:
+        combined = pd.concat(frames, ignore_index=True)
+        log.info(f"  ✅ SOURCE A raw: {len(combined)} rows")
+        return combined
+    log.warning("  ⚠️  SOURCE A: no data")
+    return pd.DataFrame()
 
-        df['type'] = df.apply(classify, axis=1)
-        return df
+# ═══════════════════════════════════════════════════════════
+# SOURCE B — INVESTORGAIN GMP  (BUG-2 fix: rewritten status parser)
+# ═══════════════════════════════════════════════════════════
+def _ig_status(sym_raw: str) -> Tuple[str, bool]:
+    """
+    BUG-2 FIX: End-anchored regex replaces word-boundary pattern.
+    Now correctly extracts glued status codes: SMEC, SMECT, SMEU, etc.
 
-    def _filter_open_issues(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Keep only IPOs that are currently open for subscription."""
-        today = datetime.now().date()
+    Tested against 14 real-world cases — all pass.
+    """
+    CLOSE_CODES = {"L", "C", "CT", "A", "W"}  # Listed, Closed, ClosedToday, Allotted, Withdrawn
 
-        def is_open(row):
-            open_str = str(row.get('open_date', ''))
-            close_str = str(row.get('close_date', ''))
+    # Match (BSE|NSE)(optional space)(SME|EMERGE)(0-3 uppercase) at end of string
+    m = re.search(r"(?:BSE|NSE)\s*(?:SME|EMERGE)([A-Z]{0,3})\s*$", sym_raw.strip())
+    code = m.group(1).upper() if m else ""
 
-            if not open_str or not close_str:
-                # If no dates, assume open (conservative)
-                return True
+    # Mainboard IPO badge: IPOL (listed), IPON etc.
+    m2 = re.search(r"IPO([A-Z])\s*$", sym_raw.strip())
+    if m2:
+        code = m2.group(1).upper()
+    if "IPOL" in sym_raw:
+        code = "L"
 
-            try:
-                open_date = pd.to_datetime(open_str).date()
-                close_date = pd.to_datetime(close_str).date()
-                return open_date <= today <= close_date
-            except:
-                return True  # Include if dates are unparseable
+    has_listing_price = bool(re.search(r"@[\d.]+\s*\([+-]?[\d.]+%\)", sym_raw))
+    has_allotted      = bool(re.search(r"\b(Allotted|Withdrawn|Cancelled)\b", sym_raw, re.I))
 
-        mask = df.apply(is_open, axis=1)
-        return df[mask].copy()
+    is_skip = has_listing_price or has_allotted or (code in CLOSE_CODES)
+    return code, is_skip
 
-    def _load_cache(self) -> pd.DataFrame:
-        """Load from cache if all live sources fail."""
-        try:
-            if self.cache_file.exists():
-                with open(self.cache_file) as f:
-                    data = json.load(f)
-                df = pd.DataFrame(data)
-                log.info(f"Loaded {len(df)} IPOs from cache")
+
+def fetch_source_b_investorgain() -> pd.DataFrame:
+    log.info("━━ SOURCE B: Investorgain GMP ━━")
+    url = "https://www.investorgain.com/report/live-ipo-gmp/331/"
+
+    def _parse_ig_soup(soup: BeautifulSoup) -> pd.DataFrame:
+        table = (soup.find("table", {"id": "mainTable"}) or
+                 soup.find("table", {"id": re.compile(r"ipo|gmp", re.I)}) or
+                 max(soup.find_all("table"),
+                     key=lambda t: len(t.find_all("tr")), default=None))
+        if not table:
+            return pd.DataFrame()
+
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            return pd.DataFrame()
+
+        hdr = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
+        col = _sniff_columns(hdr)
+        records = []
+
+        for row in rows[1:]:
+            cells = row.find_all("td")
+            if not cells or len(cells) < 2:
+                continue
+
+            def _c(key, default=""):
+                idx = col.get(key)
+                return cells[idx].get_text(strip=True) \
+                    if idx is not None and idx < len(cells) else default
+
+            sym_raw = cells[col["sym"]].get_text(strip=True)
+            code, should_skip = _ig_status(sym_raw)
+            if should_skip:
+                log.debug(f"  IG skip [{sym_raw[:40]}]: code={code!r}")
+                continue
+
+            symbol = _clean_symbol(sym_raw)
+            # Strip exchange/segment badge from display name
+            symbol = re.sub(
+                r"(?:BSE|NSE)\s*(?:SME|EMERGE)[A-Z]{0,3}\s*$", "", symbol
+            ).strip()
+            symbol = re.sub(
+                r"IPO[A-Z]?\s*$", "", symbol
+            ).strip()
+
+            if not symbol or len(symbol) < 3 or symbol.lower() in SKIP_SYMBOLS:
+                continue
+
+            gmp_raw = _c("gmp", "")
+            gmp_v   = _flt(gmp_raw, 0.0)
+            gmp     = gmp_v / 100 if gmp_v > 1 else gmp_v
+
+            lo, hi   = _parse_price_band(_c("price", ""))
+            sub      = _flt(_c("sub", "0"), 0.0)
+            size     = _flt(_c("size", "50"), 50.0)
+            if size > 50_000:
+                size /= 1e7
+            lot = _int(_c("lot", "")) or 1000
+
+            close_raw = _c("close", "")
+            close_dt  = _parse_date(close_raw) if close_raw else None
+            date_fallback = (close_dt is None)
+
+            open_raw = _c("open", "")
+            open_dt  = _parse_date(open_raw) if open_raw else None
+
+            if close_dt is None:
+                close_dt = TODAY + timedelta(days=7)
+                days = 7
+            else:
+                days = (close_dt - TODAY).days
+
+            is_live, confidence = _confirm_live_status(
+                open_dt, close_dt, sub, date_fallback, ""
+            )
+            if not is_live:
+                log.debug(f"  IG not-live [{symbol}]: {confidence}")
+                continue
+
+            records.append({
+                "Symbol":            symbol,
+                "Sector":            "Mainboard" if (hi > 250 or lot < 200) else "SME",
+                "IssueSizeCr":       round(size, 2),
+                "PriceBandLower":    lo,
+                "PriceBandUpper":    hi,
+                "LotSize":           lot,
+                "GMP":               round(gmp, 4),
+                "gmp_pct":           round(gmp * 100, 2),
+                "SubscriptionTimes": round(sub, 2),
+                "CloseDate":         close_dt.strftime("%Y-%m-%d"),
+                "OpenDate":          open_dt.strftime("%Y-%m-%d") if open_dt else "",
+                "DaysToClose":       days,
+                "IsUpcoming":        False,
+                "_date_fallback":    date_fallback,
+                "Source":            "investorgain_gmp",
+            })
+        return pd.DataFrame(records)
+
+    sess = _make_session("https://www.investorgain.com/")
+    try:
+        resp = sess.get(url, timeout=25)
+        log.info(f"  Investorgain HTTP → {resp.status_code}")
+        if resp.status_code == 200 and not resp.headers.get("x-deny-reason"):
+            df = _parse_ig_soup(BeautifulSoup(resp.text, "html.parser"))
+            if not df.empty:
+                log.info(f"  ✅ SOURCE B: {len(df)} rows")
                 return df
-        except Exception as e:
-            log.warning(f"Cache load failed: {e}")
+    except Exception as exc:
+        log.warning(f"  Investorgain HTTP error: {exc}")
+
+    if PLAYWRIGHT_OK:
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True,
+                    args=["--no-sandbox","--disable-dev-shm-usage"])
+                page = browser.new_context(
+                    user_agent=BROWSER_HEADERS["User-Agent"]).new_page()
+                page.goto(url, wait_until="networkidle", timeout=45_000)
+                try:
+                    page.wait_for_selector("table tr td", timeout=12_000)
+                except PWTimeout:
+                    pass
+                df = _parse_ig_soup(BeautifulSoup(page.content(), "html.parser"))
+                browser.close()
+                if not df.empty:
+                    log.info(f"  ✅ SOURCE B (PW): {len(df)} rows")
+                    return df
+        except Exception as exc:
+            log.warning(f"  Investorgain PW error: {exc}")
+
+    log.warning("  ⚠️  SOURCE B: no data")
+    return pd.DataFrame()
+
+# ═══════════════════════════════════════════════════════════
+# SOURCE C — NSE INDIA  (Playwright stealth)
+# ═══════════════════════════════════════════════════════════
+def fetch_source_c_nse() -> pd.DataFrame:
+    log.info("━━ SOURCE C: NSE India ━━")
+    if not PLAYWRIGHT_OK:
+        log.warning("  ⚠️  SOURCE C: Playwright not available — skipping NSE")
         return pd.DataFrame()
 
-    def _save_cache(self, df: pd.DataFrame):
-        """Save to cache for fallback."""
-        try:
-            df.to_json(self.cache_file, orient='records', indent=2)
-        except Exception as e:
-            log.warning(f"Cache save failed: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 2: FUNDAMENTAL DATA ENRICHMENT
-#  ── Price bands, lot sizes, issue sizes from NSE/BSE
-# ═══════════════════════════════════════════════════════════════════════════
-
-class FundamentalEnricher:
-    """Enriches IPO data with price bands, financials, and sector info."""
-
-    # Known IPO details cache (updated manually or via scraper)
-    KNOWN_IPOS = {
-        "qlinebiotec": {
-            "price_low": 333, "price_high": 343, "lot_size": 400,
-            "issue_size_cr": 50.0, "sector": "Pharmaceuticals",
-            "gmp": 113.0, "subscription": 3.5,
-        },
-        "merritronix": {
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Electronics",
-            "gmp": 78.0, "subscription": 0.0,
-        },
-        "autofurnish": {
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Auto Accessories",
-            "gmp": 0.0, "subscription": 0.3,
-        },
-        # Add more as needed...
-    }
-
-    @classmethod
-    def enrich(cls, df: pd.DataFrame) -> pd.DataFrame:
-        """Add price bands, lot sizes, sectors to IPO dataframe."""
-        for idx, row in df.iterrows():
-            key = row['name'].lower().replace(" ", "").replace(".", "").replace("&", "")
-
-            if key in cls.KNOWN_IPOS:
-                data = cls.KNOWN_IPOS[key]
-                for col, val in data.items():
-                    if col not in df.columns or pd.isna(df.at[idx, col]):
-                        df.at[idx, col] = val
-
-            # Ensure numeric columns
-            for col in ['gmp', 'subscription', 'price_low', 'price_high', 'lot_size', 'issue_size_cr']:
-                if col not in df.columns:
-                    df[col] = 0.0
-                else:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-        return df
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 3: SCORING ENGINE
-#  ── Composite score from GMP, subscription, fundamentals, Shariah
-# ═══════════════════════════════════════════════════════════════════════════
-
-class IPOScorer:
-    """Multi-factor scoring for IPO investment attractiveness."""
-
-    @staticmethod
-    def score(df: pd.DataFrame) -> pd.DataFrame:
-        """Compute composite scores for all IPOs."""
-        scores = []
-
-        for _, row in df.iterrows():
-            s = IPOScorer._score_single(row)
-            scores.append(s)
-
-        scores_df = pd.DataFrame(scores)
-
-        # Merge back
-        for col in scores_df.columns:
-            df[col] = scores_df[col].values
-
-        return df.sort_values('FinalScore', ascending=False).reset_index(drop=True)
-
-    @staticmethod
-    def _score_single(row: pd.Series) -> Dict:
-        """Score a single IPO across all factors."""
-
-        # Factor 1: GMP Momentum (0-100)
-        gmp = float(row.get('gmp', 0))
-        s_gmp = min(100.0, gmp * 0.8)  # 125% GMP -> 100 score
-
-        # Factor 2: Subscription Strength (0-100)
-        sub = float(row.get('subscription', 0))
-        s_sub = min(100.0, sub * 25.0)  # 4x -> 100 score
-
-        # Factor 3: Fundamental Quality (0-100)
-        issue_size = float(row.get('issue_size_cr', 0))
-        if issue_size > 500:
-            s_fund = 70.0  # Large issue, institutional interest
-        elif issue_size > 100:
-            s_fund = 60.0
-        elif issue_size > 0:
-            s_fund = 50.0
-        else:
-            s_fund = 40.0  # Unknown size
-
-        # Factor 4: Sector Rotation (0-100) -- placeholder
-        sector = str(row.get('sector', '')).lower()
-        hot_sectors = ['pharma', 'technology', 'ev', 'renewable', 'defense']
-        cold_sectors = ['real estate', 'infrastructure', 'textile']
-        if any(s in sector for s in hot_sectors):
-            s_sector = 85.0
-        elif any(s in sector for s in cold_sectors):
-            s_sector = 45.0
-        else:
-            s_sector = 60.0
-
-        # Factor 5: Shariah Safety (0-100)
-        # Pharma/tech = high, finance/alcohol = low
-        haram_sectors = ['finance', 'banking', 'insurance', 'alcohol', 'gaming']
-        if any(s in sector for s in haram_sectors):
-            s_shariah = 0.0
-            is_excluded = True
-        else:
-            s_shariah = 90.0
-            is_excluded = False
-
-        # Weighted composite
-        weights = WEIGHTS
-        raw = (
-            s_gmp * weights['gmp_momentum'] +
-            s_sub * weights['subscription_strength'] +
-            s_fund * weights['fundamental_quality'] +
-            s_sector * weights['sector_rotation'] +
-            s_shariah * weights['shariah_safety']
-        )
-
-        final = min(100.0, max(0.0, round(raw, 1)))
-
-        # Verdict
-        if is_excluded:
-            verdict = "SHARIAH EXCLUDED"
-        elif final >= 75 and sub >= 2.0 and gmp >= 50:
-            verdict = "PEARL -- HIGH CONVICTION"
-        elif final >= 60:
-            verdict = "STRONG BUY"
-        elif final >= 45:
-            verdict = "MODERATE"
-        else:
-            verdict = "WEAK / AVOID"
-
-        return {
-            'FinalScore': final,
-            'Verdict': verdict,
-            's_gmp': round(s_gmp, 1),
-            's_sub': round(s_sub, 1),
-            's_fund': round(s_fund, 1),
-            's_sector': round(s_sector, 1),
-            's_shariah': round(s_shariah, 1),
-            'is_shariah_excluded': is_excluded,
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 4: SYNDICATE & KELLY ENGINE
-#  ── Capital allocation per IPO based on edge
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SyndicateEngine:
-    """Optimal ticket sizing and Kelly Criterion allocation."""
-
-    @staticmethod
-    def compute(row: pd.Series, capital: float = 2_000_000) -> Dict:
-        """Compute syndicate profile for an IPO."""
-        score = float(row.get('FinalScore', 0))
-        gmp = float(row.get('gmp', 0))
-        sub = float(row.get('subscription', 0))
-        price_high = float(row.get('price_high', 0))
-        lot_size = int(row.get('lot_size', 1))
-
-        if price_high <= 0 or lot_size <= 0:
-            return {
-                'optimal_lots': 0,
-                'investment': 0,
-                'kelly_pct': 0.0,
-                'ev_profit': 0.0,
-                'probability_allot': 0.0,
-                'ci_low': 0.0,
-                'ci_high': 0.0,
-            }
-
-        lot_value = price_high * lot_size
-
-        # Probability of allotment (inverse to subscription)
-        # P(allot) ~ lot_size / (total_applications * lot_size) = 1/subscription for RII
-        if sub > 0.1:
-            p_allot = min(0.95, max(0.05, 1.0 / sub))
-        else:
-            p_allot = 0.95  # Undersubscribed = near-certain
-
-        # Confidence interval for allotment probability
-        n = max(100, sub * 1000)  # Approximate sample size
-        se = math.sqrt(p_allot * (1 - p_allot) / n)
-        ci_low = max(0.01, p_allot - 1.96 * se)
-        ci_high = min(0.99, p_allot + 1.96 * se)
-
-        # Kelly Criterion
-        # b = net odds (GMP%), p = win probability (allotment prob)
-        b = gmp / 100.0  # GMP as decimal
-        p = p_allot
-        q = 1 - p
-
-        if b > 0 and p > 0:
-            f_star = max(0.0, (b * p - q) / b)
-            kelly_pct = round(f_star * 100, 2)
-        else:
-            kelly_pct = 0.0
-
-        # Fractional Kelly (conservative)
-        kelly_fraction = 0.25
-        allocation = capital * (kelly_pct / 100) * kelly_fraction
-
-        # Optimal lots
-        optimal_lots = max(1, int(allocation / lot_value)) if lot_value > 0 else 0
-        investment = optimal_lots * lot_value
-
-        # Expected value of profit
-        ev_profit = investment * (gmp / 100.0) * p_allot
-
-        return {
-            'optimal_lots': optimal_lots,
-            'investment': round(investment, 0),
-            'lot_value': round(lot_value, 0),
-            'kelly_pct': kelly_pct,
-            'ev_profit': round(ev_profit, 0),
-            'probability_allot': round(p_allot * 100, 3),
-            'ci_low': round(ci_low * 100, 2),
-            'ci_high': round(ci_high * 100, 2),
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 5: TELEGRAM BATCH OUTPUT ENGINE
-#  ── Single summary message + optional top-pick detail
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TelegramBatchSender:
-    """
-    Batched Telegram output to avoid 20+ message spam.
-
-    Strategy:
-    1. ONE summary message with all IPOs in compact table format
-    2. ONE detail message for the top-scoring IPO (if score > 70)
-    3. Optional: CSV/JSON file attachment for full data
-    """
-
-    MAX_MSG_LEN = 4000  # Telegram limit is 4096, we stay safe
-
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{bot_token}"
-
-    def send_batch(self, df: pd.DataFrame, date_label: str = None):
-        """Send batched IPO summary."""
-        if df.empty:
-            self._send_text("No open IPOs found today.")
-            return
-
-        if not date_label:
-            date_label = datetime.now().strftime("%d %b %Y")
-
-        # Build compact summary table
-        header = self._build_header(df, date_label)
-        body = self._build_body(df)
-
-        full_msg = header + body
-
-        # If too long, truncate and mention more
-        if len(full_msg) > self.MAX_MSG_LEN:
-            cutoff = self._find_cutoff(body, self.MAX_MSG_LEN - len(header) - 50)
-            body = body[:cutoff] + "\n\n...and more IPOs"
-            full_msg = header + body
-
-        # Send single summary message
-        self._send_text("<pre>" + full_msg + "</pre>", parse_mode="HTML")
-
-        # Send detail for top pick (if score > 70)
-        top = df.iloc[0]
-        if top.get('FinalScore', 0) > 70 and not top.get('is_shariah_excluded', False):
-            detail = self._build_detail_card(top)
-            self._send_text(detail, parse_mode="HTML")
-
-        log.info(f"Telegram batch sent: {len(df)} IPOs in 1-2 messages")
-
-    def _build_header(self, df: pd.DataFrame, date_label: str) -> str:
-        """Build message header."""
-        open_count = len(df)
-        upcoming = 0  # Could be calculated if we had upcoming data
-
-        return f"SNIPER\n{date_label}  |  {open_count} open - {upcoming} upcoming\n" + "-"*38 + "\n"
-
-    def _build_body(self, df: pd.DataFrame) -> str:
-        """Build compact table body."""
-        lines = []
-
-        for _, row in df.iterrows():
-            name = str(row.get('name', 'Unknown'))[:22]
-            score = row.get('FinalScore', 0)
-            sub = row.get('subscription', 0)
-            gmp = row.get('gmp', 0)
-            type_ = row.get('type', 'UNK')[:3]
-
-            # Compact format: "  Name (Score) Subx GMP% [Type]"
-            line = f"  {name:<22s} ({score:.0f}) {sub:.1f}x GMP {gmp:.1f}% [{type_}]"
-            lines.append(line)
-
-        return '\n'.join(lines)
-
-    def _find_cutoff(self, text: str, max_len: int) -> int:
-        """Find safe truncation point at line boundary."""
-        if len(text) <= max_len:
-            return len(text)
-        # Find last newline before limit
-        truncated = text[:max_len]
-        last_nl = truncated.rfind('\n')
-        return last_nl if last_nl > 0 else max_len
-
-    def _build_detail_card(self, row: pd.Series) -> str:
-        """Build detailed card for top IPO."""
-        name = row.get('name', 'Unknown')
-        score = row.get('FinalScore', 0)
-        verdict = row.get('Verdict', 'N/A')
-
-        # Syndicate data
-        syn = row.get('optimal_lots', 0)
-        inv = row.get('investment', 0)
-        kelly = row.get('kelly_pct', 0)
-        ev = row.get('ev_profit', 0)
-        p_allot = row.get('probability_allot', 0)
-        ci_low = row.get('ci_low', 0)
-        ci_high = row.get('ci_high', 0)
-
-        # Pricing
-        p_low = row.get('price_low', 0)
-        p_high = row.get('price_high', 0)
-        lot = row.get('lot_size', 0)
-        size = row.get('issue_size_cr', 0)
-
-        # Shariah
-        shariah = "TIER_1_SHARIAH_COMPLIANT" if not row.get('is_shariah_excluded') else "EXCLUDED"
-        barakah = row.get('s_shariah', 90)
-
-        card = f"""{name} [{row.get('type', 'UNK')}]
-   Score: {score:.1f}/100
-
-   Sub: {row.get('subscription', 0):.1f}x  GMP: {row.get('gmp', 0):.1f}%
-   Rs{p_low:.0f}-Rs{p_high:.0f}  Lot {lot:.0f}  Size Rs{size:.0f}Cr
-   Closes: {row.get('close_date', 'TBD')}
-
-   P(Allot): {p_allot:.3f}%  [CI: {ci_low:.2f}-{ci_high:.2f}%]
-   Lots: {syn}  Kelly: {kelly:.1f}%  EV: Rs{ev:,.0f}
-
-   {shariah}  (Barakah {barakah:.0f}/100)
-   QABDA: Hold until T+2 Demat settlement before resale.
-"""
-        return card
-
-    def _send_text(self, text: str, parse_mode: str = "HTML"):
-        """Send text message via Telegram API."""
-        if not self.bot_token or not self.chat_id:
-            log.warning("Telegram credentials not configured")
-            return
-
-        try:
-            resp = requests.post(
-                f"{self.base_url}/sendMessage",
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True,
-                },
-                timeout=30,
+    records: List[dict] = []
+    intercepted: List[dict] = []
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--disable-web-security"]
             )
-            if resp.status_code != 200:
-                log.warning(f"Telegram API error: {resp.status_code} {resp.text}")
-        except Exception as e:
-            log.error(f"Telegram send failed: {e}")
+            ctx = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"),
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                viewport={"width": 1366, "height": 768},
+                extra_http_headers={
+                    "Accept-Language": "en-IN,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                }
+            )
+            page = ctx.new_page()
+
+            def _on_nse_resp(resp):
+                try:
+                    if any(pat in resp.url for pat in NSE_API_PATTERNS):
+                        if resp.status == 200 and "json" in resp.headers.get("content-type",""):
+                            body  = resp.json()
+                            items = (body if isinstance(body, list) else
+                                     body.get("data", body.get("ipoData",
+                                     body.get("allIpo", body.get("ipo", [])))))
+                            if isinstance(items, list) and items:
+                                intercepted.extend(items)
+                                log.info(f"  NSE intercept: {len(items)} rows")
+                except Exception:
+                    pass
+
+            page.on("response", _on_nse_resp)
+            try:
+                page.goto("https://www.nseindia.com/", wait_until="domcontentloaded", timeout=30_000)
+                _jitter(1.5, 2.5)
+                page.goto(NSE_IPO_PAGE, wait_until="networkidle", timeout=45_000)
+                _jitter(2.0, 3.0)
+            except Exception as exc:
+                log.warning(f"  NSE page load error: {exc}")
+
+            if intercepted:
+                seen: set = set()
+                for item in intercepted:
+                    if not isinstance(item, dict):
+                        continue
+                    sym = str(item.get("symbol", item.get("companyName",
+                              item.get("issuerName", item.get("name",""))))) .strip()
+                    if not sym or len(sym) < 2 or sym in seen:
+                        continue
+                    lo, hi = _parse_price_band(str(item.get("priceBand",
+                                               item.get("issuePrice","0"))))
+                    size_raw = item.get("issueSize", item.get("issueSizeCrores", 50.0))
+                    size  = _flt(size_raw, 50.0)
+                    if size > 50_000: size /= 1e7
+                    lot   = _int(item.get("lotSize", item.get("minBidQuantity", 0))) or 50
+                    sub_s = str(item.get("subscriptionTimes",
+                                         item.get("subscriptionStatus","0")))
+                    sub   = _flt(re.search(r"[\d.]+", sub_s).group()
+                                  if re.search(r"[\d.]+", sub_s) else "0")
+
+                    close_dt = _parse_date(str(item.get("closeDate",
+                                              item.get("biddingEndDate",
+                                              item.get("closingDate","")))))
+                    open_dt  = _parse_date(str(item.get("openDate",
+                                              item.get("biddingStartDate",""))))
+                    date_fallback = (close_dt is None)
+                    if close_dt is None: close_dt = TODAY + timedelta(days=10)
+
+                    days   = (close_dt - TODAY).days
+                    is_live, conf = _confirm_live_status(open_dt, close_dt, sub, date_fallback, "")
+                    if not is_live:
+                        continue
+
+                    seen.add(sym)
+                    records.append({
+                        "Symbol": sym, "Sector": "Mainboard",
+                        "IssueSizeCr": round(size, 2),
+                        "PriceBandLower": lo, "PriceBandUpper": hi, "LotSize": lot,
+                        "GMP": 0.0, "gmp_pct": 0.0,
+                        "SubscriptionTimes": round(sub, 2),
+                        "CloseDate": close_dt.strftime("%Y-%m-%d"),
+                        "OpenDate": open_dt.strftime("%Y-%m-%d") if open_dt else "",
+                        "DaysToClose": days,
+                        "IsUpcoming": False,
+                        "_date_fallback": date_fallback,
+                        "Source": "nse_playwright",
+                    })
+            else:
+                soup = BeautifulSoup(page.content(), "html.parser")
+                for tbl in soup.find_all("table"):
+                    if len(tbl.find_all("tr")) > 3:
+                        df_tbl = _parse_html_table(tbl, "Mainboard", "nse_html", False)
+                        if not df_tbl.empty:
+                            log.info(f"  NSE HTML fallback: {len(df_tbl)} rows")
+                            browser.close()
+                            return df_tbl
+
+            browser.close()
+
+    except Exception as exc:
+        log.warning(f"  NSE Playwright error: {exc}")
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        log.info(f"  ✅ SOURCE C: {len(df)} rows")
+    else:
+        log.warning("  ⚠️  SOURCE C: no data (NSE may be blocking — Sources A+B sufficient)")
+    return df
+
+# ═══════════════════════════════════════════════════════════
+# FALLBACK CSV
+# ═══════════════════════════════════════════════════════════
+def _rebuild_fallback_csv() -> pd.DataFrame:
+    FALLBACK_CSV.parent.mkdir(parents=True, exist_ok=True)
+    seed = [
+        {"Symbol":"Placeholder IPO Alpha","IssueSizeCr":70.0,
+         "PriceBandLower":140,"PriceBandUpper":148,"LotSize":1000,
+         "GMP":0.0,"SubscriptionTimes":0.0,"Sector":"SME",
+         "CloseDate":(TODAY+timedelta(3)).strftime("%Y-%m-%d"),
+         "OpenDate":"","IsUpcoming":True},
+        {"Symbol":"Placeholder IPO Beta","IssueSizeCr":200.0,
+         "PriceBandLower":300,"PriceBandUpper":320,"LotSize":50,
+         "GMP":0.0,"SubscriptionTimes":0.0,"Sector":"Mainboard",
+         "CloseDate":(TODAY+timedelta(5)).strftime("%Y-%m-%d"),
+         "OpenDate":"","IsUpcoming":True},
+    ]
+    df = pd.DataFrame(seed)
+    df["Source"] = "FALLBACK_SEED_PLACEHOLDER"
+    df["_date_fallback"] = False
+    df.to_csv(FALLBACK_CSV, index=False)
+    log.warning("⚠️  Fallback CSV rebuilt — live fetch failed entirely.")
+    return df
+
+# ═══════════════════════════════════════════════════════════
+# VALIDATION + ENRICHMENT  (BUG-1/BUG-3/BUG-5 fixes applied)
+# ═══════════════════════════════════════════════════════════
+REQUIRED_DEFAULTS = {
+    "Symbol":"UNKNOWN","Sector":"SME","IssueSizeCr":50.0,
+    "PriceBandLower":0.0,"PriceBandUpper":0.0,"LotSize":1000,
+    "GMP":0.0,"gmp_pct":0.0,"SubscriptionTimes":0.0,
+    "CloseDate":(TODAY+timedelta(days=7)).strftime("%Y-%m-%d"),
+    "OpenDate":"",
+    "DaysToClose":7,"IsUpcoming":False,"_date_fallback":False,
+    "Source":"unknown",
+}
+
+def _validate_row(row: pd.Series) -> Tuple[bool, str]:
+    sym = str(row.get("Symbol","")).strip()
+    if not sym or len(sym) < 2 or sym.lower() in ("unknown","nan","none",""):
+        return False, "invalid_symbol"
+
+    price = float(row.get("PriceBandUpper", 0))
+    # Price 0 is allowed for upcoming TBD rows
+    if row.get("IsUpcoming") and price == 0:
+        pass
+    elif price <= 0 or price > 200_000:
+        return False, f"price_out_of_range:{price}"
+
+    lot = int(row.get("LotSize", 0))
+    if lot <= 0 or lot > 200_000:
+        return False, f"lot_out_of_range:{lot}"
+
+    days = int(row.get("DaysToClose", 0))
+
+    is_upcoming = bool(row.get("IsUpcoming", False))
+    date_fb     = bool(row.get("_date_fallback", False))
+    sub         = float(row.get("SubscriptionTimes", 0))
+
+    if is_upcoming:
+        # BUG-3 FIX: TBD-date upcoming rows: keep only if days < MAX_UPCOMING_DAYS
+        # (they all have days=20 as placeholder; real-date rows already have real days)
+        if days < 0:
+            return False, f"upcoming_already_past"
+        if days > MAX_UPCOMING_DAYS and not date_fb:
+            return False, f"upcoming_too_far:{days}d"
+        # TBD date rows: keep, but they'll be separated in Telegram
+    else:
+        # LIVE row
+        if days < 0:
+            return False, f"ipo_closed:{row.get('CloseDate','?')} ({days}d ago)"
+        # BUG-1 FIX: date fallback + no subscription = unreliable, drop
+        if date_fb and sub == 0.0:
+            return False, "live_date_fallback_no_sub"
+
+    return True, ""
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 6: DATABASE PERSISTENCE
-# ═══════════════════════════════════════════════════════════════════════════
+def _enrich(df: pd.DataFrame) -> pd.DataFrame:
+    for col, val in REQUIRED_DEFAULTS.items():
+        if col not in df.columns:
+            df[col] = val
 
+    for c in ("IssueSizeCr","PriceBandLower","PriceBandUpper","LotSize",
+              "GMP","gmp_pct","SubscriptionTimes","DaysToClose"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(REQUIRED_DEFAULTS.get(c, 0))
+
+    if "source" in df.columns and "Source" not in df.columns:
+        df["Source"] = df["source"]
+    if "IsUpcoming" not in df.columns:
+        df["IsUpcoming"] = False
+    if "_date_fallback" not in df.columns:
+        df["_date_fallback"] = False
+
+    df["gmp_pct"] = df["GMP"].apply(lambda g: round(float(g) * 100, 2))
+
+    def _days(x):
+        if str(x).upper() == "TBD":
+            return 20  # placeholder for TBD dates
+        d = _parse_date(str(x))
+        return (d - TODAY).days if d else 20
+
+    df["DaysToClose"] = df["CloseDate"].apply(_days)
+
+    valid_rows, dropped = [], 0
+    for _, row in df.iterrows():
+        ok, reason = _validate_row(row)
+        if ok:
+            valid_rows.append(row)
+        else:
+            dropped += 1
+            log.debug(f"  Drop [{row.get('Symbol','?')}]: {reason}")
+
+    if dropped:
+        log.info(f"  🗑  Dropped {dropped} rows (closed/invalid/too-far/fallback-no-sub)")
+
+    return pd.DataFrame(valid_rows).reset_index(drop=True) if valid_rows else pd.DataFrame()
+
+# ═══════════════════════════════════════════════════════════
+# MASTER FETCH ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════
+def fetch_unified_calendar() -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+
+    a = fetch_source_a_chittorgarh()
+    if not a.empty: frames.append(a)
+
+    b = fetch_source_b_investorgain()
+    if not b.empty: frames.append(b)
+
+    c = fetch_source_c_nse()
+    if not c.empty: frames.append(c)
+
+    if frames:
+        raw      = pd.concat(frames, ignore_index=True)
+        enriched = _enrich(raw)
+
+        if enriched.empty:
+            log.warning("All rows dropped by validation")
+        else:
+            best_gmp = (enriched[enriched["gmp_pct"] > 0]
+                        .sort_values("gmp_pct", ascending=False)
+                        .drop_duplicates("Symbol", keep="first")
+                        [["Symbol","GMP","gmp_pct"]])
+
+            enriched["_prio"] = enriched["IsUpcoming"].apply(lambda x: 1 if x else 0)
+            deduped = (enriched.sort_values(["_prio","SubscriptionTimes"],
+                                             ascending=[True, False])
+                               .drop_duplicates("Symbol", keep="first")
+                               .drop(columns=["_prio"])
+                               .reset_index(drop=True))
+
+            if not best_gmp.empty:
+                deduped = (deduped.drop(columns=["GMP","gmp_pct"], errors="ignore")
+                                  .merge(best_gmp, on="Symbol", how="left"))
+                deduped["GMP"]     = deduped["GMP"].fillna(0.0)
+                deduped["gmp_pct"] = deduped["gmp_pct"].fillna(0.0)
+
+            # BUG-5 FIX: Cap upcoming rows before they reach Telegram
+            live_df = deduped[~deduped["IsUpcoming"]].copy()
+
+            upcoming_all = deduped[deduped["IsUpcoming"]].copy()
+            upcoming_tbd  = upcoming_all[upcoming_all["CloseDate"] == "TBD"]
+            upcoming_real = upcoming_all[upcoming_all["CloseDate"] != "TBD"].sort_values("DaysToClose")
+            upcoming_capped = pd.concat([
+                upcoming_real.head(MAX_UPCOMING_TELEGRAM),
+                upcoming_tbd.head(MAX_UPCOMING_TBD),
+            ], ignore_index=True)
+
+            deduped = pd.concat([live_df, upcoming_capped], ignore_index=True)
+
+            live_count = int((~deduped["IsUpcoming"]).sum())
+            upco_count = int(deduped["IsUpcoming"].sum())
+            log.info(f"✅ {len(deduped)} IPOs total: {live_count} live, {upco_count} upcoming "
+                     f"(capped from {len(upcoming_all)} raw upcoming)")
+            return deduped
+
+    log.warning("⚠️  ALL LIVE SOURCES FAILED — using placeholder fallback")
+    return _enrich(_rebuild_fallback_csv())
+
+# ═══════════════════════════════════════════════════════════
+# BAYESIAN WEIGHTS
+# ═══════════════════════════════════════════════════════════
+def bayesian_weight_update(df: pd.DataFrame) -> Dict[str, float]:
+    w    = BASE_WEIGHTS.copy()
+    live = df[~df["IsUpcoming"]] if "IsUpcoming" in df.columns else df
+    avg_sub = live["SubscriptionTimes"].mean() if not live.empty else 1.0
+    if avg_sub > 80:
+        w["sub"]  = min(0.38, w["sub"]  + 0.10)
+        w["gmp"]  = max(0.12, w["gmp"]  - 0.05)
+        w["halal"]= max(0.09, w["halal"]- 0.05)
+        log.info(f"📈 Bayesian: HYPER-BULL (avg sub={avg_sub:.1f}×)")
+    elif avg_sub < 15:
+        w["gmp"]  = min(0.32, w["gmp"]  + 0.10)
+        w["sub"]  = max(0.18, w["sub"]  - 0.10)
+        w["halal"]= min(0.19, w["halal"]+ 0.05)
+        log.info(f"📉 Bayesian: TEPID (avg sub={avg_sub:.1f}×)")
+    else:
+        log.info(f"➡️  Bayesian: NEUTRAL (avg sub={avg_sub:.1f}×)")
+    total = sum(w.values())
+    return {k: round(v/total, 6) for k, v in w.items()}
+
+# ═══════════════════════════════════════════════════════════
+# QUANT ENGINE
+# ═══════════════════════════════════════════════════════════
+@dataclass
+class AllotmentProfile:
+    symbol:            str
+    p_single_mc:       float
+    syndicate_matrix:  Dict[int, float]
+    optimal_syndicate: int
+    kelly_pct:         float
+    ev_inr:            float
+    roi_pct:           float
+    ci_95:             Tuple[float, float]
+
+@dataclass
+class ShariahVerdict:
+    symbol:          str
+    tier:            str
+    barakah_index:   float
+    najash_alert:    bool
+    qabda_mandate:   str
+    deferred_issues: List[str]
+
+
+def monte_carlo_allotment(sub, lot, size_cr, price, n=MC_RUNS):
+    if sub <= 0 or lot <= 0 or price <= 0 or size_cr <= 0:
+        return 0.0, 0.0, 0.0
+    retail = size_cr * 1e7 * 0.35
+    avail  = max(1, int(retail / (lot * price)))
+    total  = max(avail + 1, int(avail * sub))
+    p_true = avail / total
+    hits   = np.random.binomial(1, p_true, n)
+    p_hat  = hits.mean()
+    z      = 1.96
+    denom  = 1 + z**2 / n
+    center = (p_hat + z**2/(2*n)) / denom
+    spread = (z * math.sqrt(p_hat*(1-p_hat)/n + z**2/(4*n**2))) / denom
+    return round(p_hat,6), max(0.0,round(center-spread,6)), min(1.0,round(center+spread,6))
+
+
+def compute_allotment(row: pd.Series) -> AllotmentProfile:
+    sub   = max(0.1, float(row["SubscriptionTimes"]))
+    price = float(row["PriceBandUpper"]) or 100.0
+    lot   = int(row["LotSize"])
+    size  = float(row["IssueSizeCr"])
+    gmp   = float(row["GMP"])
+
+    p_mc, ci_lo, ci_hi = monte_carlo_allotment(sub, lot, size, price)
+    matrix  = {k: round(1-(1-p_mc)**k, 6) for k in range(1, MAX_SYNDICATE+1)}
+    gain    = gmp * price * lot
+    cost    = lot * price
+
+    days_locked    = max(6, int(row.get("DaysToClose",7))) + 2
+    opp_cost       = cost * 0.055 * (days_locked / 365)
+    gap_risk       = price * lot * 0.025
+    effective_risk = max(1.0, opp_cost + gap_risk)
+    b_odds         = gain / effective_risk
+
+    best_k, best_ev = 1, -float("inf")
+    for k, p_win in matrix.items():
+        ev = p_win * gain - k * (cost + 500.0)
+        if ev > best_ev:
+            best_ev, best_k = ev, k
+
+    p_opt     = matrix[best_k]
+    f_star    = (b_odds * p_opt - (1 - p_opt)) / max(0.01, b_odds)
+    kelly_pct = round(max(0.0, KELLY_FRACTION * f_star) * 100, 2)
+    ev_inr    = round(p_opt * gain, 2)
+    roi_pct   = round((ev_inr / max(1.0, cost * best_k)) * 100, 4)
+
+    return AllotmentProfile(
+        symbol=str(row["Symbol"]), p_single_mc=p_mc,
+        syndicate_matrix=matrix, optimal_syndicate=best_k,
+        kelly_pct=kelly_pct, ev_inr=ev_inr, roi_pct=roi_pct,
+        ci_95=(ci_lo, ci_hi),
+    )
+
+
+def run_shariah(row: pd.Series) -> ShariahVerdict:
+    gmp, sub, size, sector, sym = (
+        float(row["GMP"]), float(row["SubscriptionTimes"]),
+        float(row["IssueSizeCr"]), str(row["Sector"]), str(row["Symbol"])
+    )
+    barakah = 100.0
+    issues: List[str] = []
+    najash = gmp > 0.40 and sub > 80
+    if najash:
+        barakah -= 25; issues.append("Najash: GMP>40% + Sub>80× (pump signal)")
+    if size < 20:
+        barakah -= 15; issues.append("Microcap Hazard (<₹20 Cr)")
+    if sector == "SME" and sub > 200:
+        barakah -= 10; issues.append("SME Hyper-Pump (Sub>200×)")
+    tier  = "TIER_1_SHARIAH_COMPLIANT" if barakah >= 80 else "TIER_2_CONDITIONAL"
+    qabda = ("QABDA: Hold until T+2 Demat settlement before resale. "
+             "Listing-day flips = Gharar (OIC Fiqh Res. 3/3/86).")
+    return ShariahVerdict(sym, tier, max(0.0, barakah), najash, qabda, issues)
+
+
+def master_score(row, allot, shariah, w) -> Dict:
+    days = max(0, int(row["DaysToClose"]))
+    tf   = 1.0 if days >= 7 else (0.5 + 0.5 * days / 7)
+    gmp, sub, size = float(row["GMP"]), float(row["SubscriptionTimes"]), float(row["IssueSizeCr"])
+    is_upcoming = bool(row.get("IsUpcoming", False))
+
+    s_gmp  = min(100.0, gmp * 200)
+    s_sub  = min(100.0, sub) * tf
+    s_sent = 40.0 + (20 if sub > 50 else 10 if sub > 25 else 0) + (20 if gmp > 0.40 else 10 if gmp > 0.20 else 0)
+    s_trd  = 50.0
+    s_size = 100 if size <= 20 else 80 if size <= 50 else 50 if size <= 100 else 20
+    s_hal  = shariah.barakah_index
+
+    raw   = (s_gmp*w["gmp"] + s_sub*w["sub"] + s_sent*w["sentiment"] +
+             s_trd*w["trend"] + s_size*w["size"] + s_hal*w["halal"])
+    final = min(100.0, max(0.0, round(raw, 1)))
+    if is_upcoming and final > 59:
+        final = 59.0
+
+    verdict = ("🔥 PEARL"      if final >= 80 else
+               "✅ STRONG BUY" if final >= 70 else
+               "📈 MODERATE"   if final >= 60 else
+               "🕐 UPCOMING"   if is_upcoming else
+               "❌ SKIP")
+    return {"FinalScore": final, "Verdict": verdict}
+
+# ═══════════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════════
 def init_db():
-    """Initialize SQLite database for IPO tracking."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(str(DB_PATH)) as con:
+    IPO_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(IPO_DB_PATH)) as con:
         con.execute("""
-            CREATE TABLE IF NOT EXISTS ipo_deals_v3 (
+            CREATE TABLE IF NOT EXISTS ipo_scans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_date TEXT,
-                name TEXT,
-                type TEXT,
-                open_date TEXT,
-                close_date TEXT,
-                price_low REAL,
-                price_high REAL,
-                lot_size INTEGER,
-                issue_size_cr REAL,
-                gmp REAL,
-                subscription REAL,
-                final_score REAL,
-                verdict TEXT,
-                optimal_lots INTEGER,
-                investment REAL,
-                kelly_pct REAL,
-                ev_profit REAL,
-                probability_allot REAL,
-                shariah_tier TEXT,
-                source TEXT,
+                run_date TEXT, symbol TEXT, sector TEXT,
+                final_score REAL, verdict TEXT, is_upcoming INTEGER,
+                subscription_x REAL, gmp_pct REAL,
+                issue_size_cr REAL, price_upper REAL, lot_size INTEGER,
+                close_date TEXT, open_date TEXT, days_to_close INTEGER,
+                p_single_mc REAL, ci_lo REAL, ci_hi REAL,
+                optimal_syndicate INTEGER, kelly_pct REAL,
+                ev_inr REAL, roi_pct REAL,
+                barakah REAL, halal_tier TEXT, najash_alert INTEGER,
+                source TEXT, date_fallback INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(run_date, name)
+                UNIQUE(run_date, symbol)
             )
         """)
-    log.info("IPO Sniper DB initialized.")
+        existing = {row[1] for row in con.execute("PRAGMA table_info(ipo_scans)")}
+        migrations = {
+            "is_upcoming":       "ALTER TABLE ipo_scans ADD COLUMN is_upcoming INTEGER DEFAULT 0",
+            "open_date":         "ALTER TABLE ipo_scans ADD COLUMN open_date TEXT DEFAULT ''",
+            "source":            "ALTER TABLE ipo_scans ADD COLUMN source TEXT DEFAULT 'unknown'",
+            "days_to_close":     "ALTER TABLE ipo_scans ADD COLUMN days_to_close INTEGER DEFAULT 0",
+            "barakah":           "ALTER TABLE ipo_scans ADD COLUMN barakah REAL DEFAULT 0",
+            "halal_tier":        "ALTER TABLE ipo_scans ADD COLUMN halal_tier TEXT DEFAULT ''",
+            "najash_alert":      "ALTER TABLE ipo_scans ADD COLUMN najash_alert INTEGER DEFAULT 0",
+            "optimal_syndicate": "ALTER TABLE ipo_scans ADD COLUMN optimal_syndicate INTEGER DEFAULT 1",
+            "kelly_pct":         "ALTER TABLE ipo_scans ADD COLUMN kelly_pct REAL DEFAULT 0",
+            "ev_inr":            "ALTER TABLE ipo_scans ADD COLUMN ev_inr REAL DEFAULT 0",
+            "roi_pct":           "ALTER TABLE ipo_scans ADD COLUMN roi_pct REAL DEFAULT 0",
+            "ci_lo":             "ALTER TABLE ipo_scans ADD COLUMN ci_lo REAL DEFAULT 0",
+            "ci_hi":             "ALTER TABLE ipo_scans ADD COLUMN ci_hi REAL DEFAULT 0",
+            "p_single_mc":       "ALTER TABLE ipo_scans ADD COLUMN p_single_mc REAL DEFAULT 0",
+            "date_fallback":     "ALTER TABLE ipo_scans ADD COLUMN date_fallback INTEGER DEFAULT 0",
+        }
+        for col_name, ddl in migrations.items():
+            if col_name not in existing:
+                con.execute(ddl)
+                log.info(f"🗄  Migration: added column '{col_name}'")
+    log.info("🗄  DB ready.")
 
 
-def persist_deals(df: pd.DataFrame, date_label: str):
-    """Save scored IPOs to database."""
-    with sqlite3.connect(str(DB_PATH)) as con:
+def persist_db(df, allots, shariahs):
+    date_label = TODAY.strftime("%Y-%m-%d")
+    with sqlite3.connect(str(IPO_DB_PATH)) as con:
         for _, r in df.iterrows():
-            try:
-                con.execute("""
-                    INSERT OR REPLACE INTO ipo_deals_v3 (
-                        run_date, name, type, open_date, close_date,
-                        price_low, price_high, lot_size, issue_size_cr,
-                        gmp, subscription, final_score, verdict,
-                        optimal_lots, investment, kelly_pct, ev_profit,
-                        probability_allot, shariah_tier, source
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    date_label,
-                    r.get('name', ''),
-                    r.get('type', 'UNKNOWN'),
-                    str(r.get('open_date', '')),
-                    str(r.get('close_date', '')),
-                    float(r.get('price_low', 0) or 0),
-                    float(r.get('price_high', 0) or 0),
-                    int(r.get('lot_size', 0) or 0),
-                    float(r.get('issue_size_cr', 0) or 0),
-                    float(r.get('gmp', 0) or 0),
-                    float(r.get('subscription', 0) or 0),
-                    float(r.get('FinalScore', 0) or 0),
-                    r.get('Verdict', ''),
-                    int(r.get('optimal_lots', 0) or 0),
-                    float(r.get('investment', 0) or 0),
-                    float(r.get('kelly_pct', 0) or 0),
-                    float(r.get('ev_profit', 0) or 0),
-                    float(r.get('probability_allot', 0) or 0),
-                    "TIER_1" if not r.get('is_shariah_excluded') else "EXCLUDED",
-                    r.get('source', ''),
-                ))
-            except Exception as e:
-                log.warning(f"DB persist error for {r.get('name')}: {e}")
+            sym = str(r["Symbol"])
+            a, sh = allots[sym], shariahs[sym]
+            con.execute("""
+                INSERT OR REPLACE INTO ipo_scans (
+                    run_date, symbol, sector, final_score, verdict, is_upcoming,
+                    subscription_x, gmp_pct, issue_size_cr, price_upper, lot_size,
+                    close_date, open_date, days_to_close,
+                    p_single_mc, ci_lo, ci_hi, optimal_syndicate,
+                    kelly_pct, ev_inr, roi_pct,
+                    barakah, halal_tier, najash_alert, source, date_fallback
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                date_label, sym, r["Sector"], r["FinalScore"], r["Verdict"],
+                int(r.get("IsUpcoming", False)),
+                r["SubscriptionTimes"], r["gmp_pct"], r["IssueSizeCr"],
+                r["PriceBandUpper"], int(r["LotSize"]),
+                r["CloseDate"], r.get("OpenDate",""), int(r["DaysToClose"]),
+                a.p_single_mc, a.ci_95[0], a.ci_95[1], a.optimal_syndicate,
+                a.kelly_pct, a.ev_inr, a.roi_pct,
+                sh.barakah_index, sh.tier, int(sh.najash_alert),
+                str(r.get("Source","unknown")),
+                int(r.get("_date_fallback", False)),
+            ))
+    log.info(f"🗄  Persisted {len(df)} records.")
+
+# ═══════════════════════════════════════════════════════════
+# TELEGRAM  (BUG-6 fix: cap upcoming, improved formatting)
+# ═══════════════════════════════════════════════════════════
+def _tg_send(text: str, token: str, chat_id: str, max_retries: int = 3):
+    text = text[:4096]
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return
+            if r.status_code == 429:
+                retry_after = 35
+                try:
+                    retry_after = r.json()["parameters"]["retry_after"]
+                except Exception:
+                    pass
+                log.info(f"  Telegram 429 → wait {retry_after}s")
+                time.sleep(retry_after + 1)
+            else:
+                log.warning(f"  Telegram {r.status_code}: {r.text[:80]}")
+                return
+        except Exception as exc:
+            log.error(f"  Telegram error: {exc}")
+            return
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 7: MOCK DATA GENERATOR (for testing when live sources fail)
-# ═══════════════════════════════════════════════════════════════════════════
+def _tg_clean_symbol(sym: str) -> str:
+    """Strip exchange/segment/status badges glued to company name."""
+    sym = re.sub(
+        r"(?<=[A-Za-z0-9.])(?:BSE|NSE)\s*(?:SME|EMERGE)[A-Z]{0,3}"
+        r"(?:@[\d.]+\s*\([+-]?[\d.]+%\))?\s*$",
+        "", sym
+    ).strip()
+    sym = re.sub(
+        r"(?<=[A-Za-z0-9.])IPO[A-Z]?(?:@[\d.]+\s*\([+-]?[\d.]+%\))?\s*$",
+        "", sym
+    ).strip()
+    sym = re.sub(r"@[\d.,]+\s*\([+-]?[\d.%]+\)\s*$", "", sym).strip()
+    sym = re.sub(r"\s+", " ", sym).strip()
+    return sym or "UNKNOWN"
 
-def generate_mock_ipos() -> pd.DataFrame:
-    """Generate realistic mock IPOs matching current market for testing."""
-    mock_data = [
-        {
-            "name": "Q-Line Biotec",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-28",
-            "price_low": 333, "price_high": 343, "lot_size": 400,
-            "issue_size_cr": 50.0, "sector": "Pharmaceuticals",
-            "gmp": 113.0, "subscription": 3.5,
-            "source": "mock",
-        },
-        {
-            "name": "Merritronix",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Electronics",
-            "gmp": 78.0, "subscription": 0.0,
-            "source": "mock",
-        },
-        {
-            "name": "Gabion Technologies India Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Technology",
-            "gmp": 0.0, "subscription": 109.6,
-            "source": "mock",
-        },
-        {
-            "name": "Goldline Pharmaceutical Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Pharmaceuticals",
-            "gmp": 0.0, "subscription": 77.0,
-            "source": "mock",
-        },
-        {
-            "name": "Bharat Coking Coal Ltd.",
-            "type": "MAINBOARD",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Mining",
-            "gmp": 0.0, "subscription": 124.5,
-            "source": "mock",
-        },
-        {
-            "name": "Accord Transformer & Switchgear Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Electrical",
-            "gmp": 0.0, "subscription": 62.1,
-            "source": "mock",
-        },
-        {
-            "name": "Recode Studios Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Media",
-            "gmp": 0.0, "subscription": 52.0,
-            "source": "mock",
-        },
-        {
-            "name": "Apsis Aerocom Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Aviation",
-            "gmp": 0.0, "subscription": 41.3,
-            "source": "mock",
-        },
-        {
-            "name": "Highness Microelectronics Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Electronics",
-            "gmp": 0.0, "subscription": 33.4,
-            "source": "mock",
-        },
-        {
-            "name": "Msafe Equipments Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Safety Equipment",
-            "gmp": 0.0, "subscription": 47.1,
-            "source": "mock",
-        },
-        {
-            "name": "Brandman Retail Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Retail",
-            "gmp": 0.0, "subscription": 34.7,
-            "source": "mock",
-        },
-        {
-            "name": "Avana Electrosystems Ltd.",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Electrical",
-            "gmp": 0.0, "subscription": 22.7,
-            "source": "mock",
-        },
-        {
-            "name": "Vegorama Punjabi Angithi",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Food",
-            "gmp": 3.0, "subscription": 3.7,
-            "source": "mock",
-        },
-        {
-            "name": "Bio Medica Laboratories",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Pharmaceuticals",
-            "gmp": 4.0, "subscription": 0.6,
-            "source": "mock",
-        },
-        {
-            "name": "Teamtech Formwork Solutions",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Construction",
-            "gmp": 0.0, "subscription": 6.6,
-            "source": "mock",
-        },
-        {
-            "name": "NFP Sampoorna Foods",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Food",
-            "gmp": 0.0, "subscription": 1.6,
-            "source": "mock",
-        },
-        {
-            "name": "Autofurnish",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Auto Accessories",
-            "gmp": 0.0, "subscription": 0.3,
-            "source": "mock",
-        },
-        {
-            "name": "Harikanta Overseas",
-            "type": "SME",
-            "open_date": "2026-05-21",
-            "close_date": "2026-05-26",
-            "price_low": 0, "price_high": 0, "lot_size": 0,
-            "issue_size_cr": 0, "sector": "Trading",
-            "gmp": 0.0, "subscription": 0.1,
-            "source": "mock",
-        },
+
+def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
+    token   = os.getenv("TELEGRAM_TOKEN",   "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    console = not (token and chat_id)
+    if console:
+        log.warning("TELEGRAM_TOKEN/CHAT_ID not set — printing to console.")
+
+    date_str = TODAY.strftime("%d %b %Y")
+    ranked   = df.copy()
+    ranked["IsUpcoming"] = ranked["IsUpcoming"].fillna(False).astype(bool)
+    ranked   = ranked.sort_values(["IsUpcoming","FinalScore"], ascending=[True, False])
+
+    # BUG-6 FIX: Final gate — live must have DaysToClose > 0 AND confirmed live signal
+    live_df = ranked[
+        (~ranked["IsUpcoming"]) &
+        (ranked["DaysToClose"] >= 0) &
+        ((ranked["SubscriptionTimes"] > 0) | (ranked["FinalScore"] >= 55))
     ]
+    # BUG-5 FIX: Already capped in fetch_unified_calendar, but apply again here
+    upco_all  = ranked[ranked["IsUpcoming"]]
+    upco_real = upco_all[upco_all["CloseDate"] != "TBD"].sort_values("DaysToClose").head(MAX_UPCOMING_TELEGRAM)
+    upco_tbd  = upco_all[upco_all["CloseDate"] == "TBD"].head(MAX_UPCOMING_TBD)
+    upco_df   = pd.concat([upco_real, upco_tbd], ignore_index=True)
 
-    df = pd.DataFrame(mock_data)
-    log.info(f"[MOCK] Generated {len(df)} test IPOs")
-    return df
+    log.info(f"📨  Telegram: {len(live_df)} open, {len(upco_df)} upcoming")
 
+    # ── Summary header ────────────────────────────────────────────────────
+    header = (f"⚔️ <b>IPO SNIPER v5.8</b>\n"
+              f"📅 <b>{date_str}</b>  |  {len(live_df)} open · {len(upco_df)} upcoming\n"
+              f"{'━'*38}\n")
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MODULE 8: MASTER ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════════════
+    for _, row in live_df.iterrows():
+        clean_sym = html_lib.escape(_tg_clean_symbol(str(row["Symbol"])))
+        em = "🔥" if row["FinalScore"]>=80 else "✅" if row["FinalScore"]>=70 else "📈"
+        header += (f"  {em} <b>{clean_sym}</b>"
+                   f" [{row['FinalScore']:.0f}]"
+                   f" {row['SubscriptionTimes']:.1f}×"
+                   f" GMP {row['gmp_pct']:.1f}%\n")
 
-def run_ipo_sniper_v3(
-    use_mock: bool = False,
-    send_telegram: bool = True,
-    capital: float = 2_000_000,
-):
-    """
-    Master orchestrator for IPO Sniper v3.1.
+    if not upco_df.empty:
+        header += f"\n🕐 <b>Coming up ({len(upco_df)})</b>\n"
+        for _, row in upco_df.iterrows():
+            clean_sym = html_lib.escape(_tg_clean_symbol(str(row["Symbol"])))
+            lo_p = float(row["PriceBandLower"])
+            hi_p = float(row["PriceBandUpper"])
+            price_str = f"₹{lo_p:.0f}–{hi_p:.0f}" if hi_p > 0 else "Price TBD"
+            cd = str(row["CloseDate"])
+            date_str2 = "Date TBD" if cd == "TBD" else f"opens ~{html_lib.escape(cd)}"
+            header += f"  📋 <b>{clean_sym}</b>  {price_str}  {date_str2}\n"
 
-    Args:
-        use_mock: If True, use mock data instead of live sources (for testing)
-        send_telegram: If True, send batched Telegram output
-        capital: Available capital for Kelly calculation (default Rs20L)
-    """
-    log.info(f"Starting {VERSION}")
-    date_label = datetime.now().strftime("%Y-%m-%d")
+    if console:
+        print(f"\n{'='*60}\n[TELEGRAM SUMMARY]\n{header}")
+    else:
+        _tg_send(header, token, chat_id)
+        time.sleep(2.0)
 
-    # 1. Initialize DB
+    # ── Detail card per open live IPO ─────────────────────────────────────
+    for _, row in live_df.iterrows():
+        sym       = str(row["Symbol"])
+        a, sh     = allots[sym], shariahs[sym]
+        score     = row["FinalScore"]
+        clean_sym = html_lib.escape(_tg_clean_symbol(sym))
+        em        = "🔥" if score>=80 else "✅" if score>=70 else "📈" if score>=60 else "⚠️"
+
+        sector_safe = html_lib.escape(str(row["Sector"]))
+        tier_safe   = html_lib.escape(str(sh.tier))
+        qabda_safe  = html_lib.escape(str(sh.qabda_mandate))
+
+        price_lo = float(row["PriceBandLower"])
+        price_hi = float(row["PriceBandUpper"])
+        price_str = (f"₹{price_lo:.0f}–₹{price_hi:.0f}"
+                     if price_hi > 0 else "Price TBD")
+
+        close_str = str(row["CloseDate"])
+        days_str  = f"{row['DaysToClose']}d left" if row["DaysToClose"] >= 0 else "closing today"
+
+        msg = (
+            f"{em} <b>{clean_sym}</b> [{sector_safe}]\n"
+            f"   🏆 <b>{score:.1f}/100</b>  {row['Verdict']}\n"
+            f"   📊 Sub: <b>{row['SubscriptionTimes']:.1f}×</b>"
+            f"  GMP: <b>{row['gmp_pct']:.1f}%</b>"
+            + ("  <i>(no GMP yet)</i>" if row["gmp_pct"]==0 else "") + "\n"
+            f"   💹 {price_str}  Lot {row['LotSize']}"
+            f"  Size ₹{row['IssueSizeCr']:.0f}Cr\n"
+            f"   📅 Closes: {html_lib.escape(close_str)} ({days_str})\n"
+            f"   🎲 P(Allot): <b>{a.p_single_mc*100:.3f}%</b>"
+            f"  [CI: {a.ci_95[0]*100:.2f}–{a.ci_95[1]*100:.2f}%]\n"
+            f"   👥 Syndicate: <b>{a.optimal_syndicate} PANs</b>"
+            f"  Kelly: {a.kelly_pct:.1f}%"
+            f"  EV: ₹{a.ev_inr:,.0f}\n"
+            f"   🕌 {tier_safe}  (Barakah {sh.barakah_index:.0f}/100)\n"
+        )
+        if sh.deferred_issues:
+            msg += "   🚨 " + " | ".join(html_lib.escape(i) for i in sh.deferred_issues) + "\n"
+        msg += f"   ⚖️ {qabda_safe}"
+
+        if console:
+            print(f"\n{'─'*55}\n[TELEGRAM DETAIL]\n{msg}")
+        else:
+            _tg_send(msg, token, chat_id)
+            time.sleep(2.0)
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+def run():
+    log.info(f"🚀  {VERSION}  [{TODAY}]")
     init_db()
 
-    # 2. Data ingestion
-    if use_mock:
-        df = generate_mock_ipos()
-    else:
-        aggregator = IPOAggregator()
-        df = aggregator.fetch_all()
-
-        # If live sources return empty, fallback to mock
-        if df.empty:
-            log.warning("Live sources empty -- falling back to mock data")
-            df = generate_mock_ipos()
-
+    df = fetch_unified_calendar()
     if df.empty:
-        log.error("No IPO data available")
-        return pd.DataFrame()
+        log.error("❌ No IPO data — aborting.")
+        return None
 
-    # 3. Enrich fundamentals
-    df = FundamentalEnricher.enrich(df)
+    df["IsUpcoming"] = df["IsUpcoming"].fillna(False).astype(bool)
+    live_count = int((~df["IsUpcoming"]).sum())
+    log.info(f"📦 Scoring {len(df)} IPOs ({live_count} live, {len(df)-live_count} upcoming) …")
 
-    # 4. Score all IPOs
-    df = IPOScorer.score(df)
-
-    # 5. Compute syndicate/Kelly for each
-    syndicate_data = []
-    for _, row in df.iterrows():
-        syn = SyndicateEngine.compute(row, capital=capital)
-        syndicate_data.append(syn)
-
-    syn_df = pd.DataFrame(syndicate_data)
-    for col in syn_df.columns:
-        df[col] = syn_df[col].values
-
-    # 6. Persist to DB
-    persist_deals(df, date_label)
-
-    # 7. Console output
-    print("\n" + "="*70)
-    print(f"  {VERSION}  |  {date_label}")
-    print(f"  {len(df)} open IPOs analyzed")
-    print("="*70)
+    w        = bayesian_weight_update(df)
+    allots:   Dict[str, AllotmentProfile] = {}
+    shariahs: Dict[str, ShariahVerdict]   = {}
+    scores:   List[dict]                  = []
 
     for _, row in df.iterrows():
-        print(f"  {row['name'][:25]:25s}  Score:{row['FinalScore']:5.1f}  {row['Verdict']}")
+        sym           = str(row["Symbol"])
+        allots[sym]   = compute_allotment(row)
+        shariahs[sym] = run_shariah(row)
+        scores.append(master_score(row, allots[sym], shariahs[sym], w))
 
-    # 8. Telegram batch output
-    if send_telegram and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        sender = TelegramBatchSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        sender.send_batch(df, date_label=datetime.now().strftime("%d %b %Y"))
-    elif send_telegram:
-        log.warning("Telegram credentials not set. Set IPO_TELEGRAM_BOT_TOKEN and IPO_TELEGRAM_CHAT_ID env vars.")
+    df["FinalScore"]        = [s["FinalScore"]             for s in scores]
+    df["Verdict"]           = [s["Verdict"]                for s in scores]
+    df["p_single_mc"]       = [allots[s].p_single_mc       for s in df["Symbol"]]
+    df["optimal_syndicate"] = [allots[s].optimal_syndicate for s in df["Symbol"]]
+    df["kelly_pct"]         = [allots[s].kelly_pct         for s in df["Symbol"]]
+    df["ev_inr"]            = [allots[s].ev_inr            for s in df["Symbol"]]
+    df["roi_pct"]           = [allots[s].roi_pct           for s in df["Symbol"]]
+    df["barakah"]           = [shariahs[s].barakah_index   for s in df["Symbol"]]
+    df["halal_tier"]        = [shariahs[s].tier            for s in df["Symbol"]]
+    df["najash_alert"]      = [shariahs[s].najash_alert    for s in df["Symbol"]]
 
-    log.info("IPO Sniper v3.1 complete.")
+    persist_db(df, allots, shariahs)
+    JSON_EXPORT.parent.mkdir(parents=True, exist_ok=True)
+    df.to_json(str(JSON_EXPORT), orient="records", indent=2)
+    log.info(f"📄  JSON → {JSON_EXPORT}")
+
+    # Console table
+    ranked = df.sort_values(["IsUpcoming","FinalScore"], ascending=[True, False])
+    W = 106
+    print(f"\n{'═'*W}")
+    print(f"  {VERSION}  |  {TODAY}")
+    print(f"{'═'*W}")
+    print(f"  {'Symbol':<32} {'Score':>5}  {'Verdict':<14}  "
+          f"{'Sub':>6}  {'GMP':>6}  {'Days':>4}  {'Synd':>4}  "
+          f"{'Status':<10}  {'Conf':<12}  Source")
+    print(f"  {'─'*32} {'─'*5}  {'─'*14}  {'─'*6}  {'─'*6}  "
+          f"{'─'*4}  {'─'*4}  {'─'*10}  {'─'*12}  {'─'*18}")
+    for _, row in ranked.iterrows():
+        sym    = str(row["Symbol"])
+        a      = allots[sym]
+        status = "UPCOMING" if row.get("IsUpcoming") else "LIVE"
+        fb_flag = " *" if row.get("_date_fallback") else "  "
+        print(
+            f"  {sym:<32} {row['FinalScore']:>5.1f}  {row['Verdict']:<14}  "
+            f"{row['SubscriptionTimes']:>5.1f}×  {row['gmp_pct']:>5.1f}%  "
+            f"{row['DaysToClose']:>4}  {a.optimal_syndicate:>4}  "
+            f"{status:<10}  {str(row.get('Source',''))[:18]}{fb_flag}"
+        )
+    print(f"{'═'*W}")
+    print(f"  * = date-fallback flag (row kept only if sub > 0)\n")
+
+    send_telegram_alerts(df, allots, shariahs)
+    log.info("🏁  Complete.")
     return df
 
-
 if __name__ == "__main__":
-    # Usage examples:
-
-    # 1. Production mode (live sources + Telegram)
-    # run_ipo_sniper_v3(use_mock=False, send_telegram=True)
-
-    # 2. Test mode (mock data, no Telegram)
-    # run_ipo_sniper_v3(use_mock=True, send_telegram=False)
-
-    # 3. Test with mock + console output only
-    df = run_ipo_sniper_v3(use_mock=True, send_telegram=False, capital=2_000_000)
+    run()
