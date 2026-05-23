@@ -36,8 +36,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -1168,13 +1170,25 @@ def print_results(records: list[IPORecord]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="IPO Telegram Alert — Open IPOs + Buy/Avoid Signal")
-    parser.add_argument("--token",   required=True,  help="Telegram Bot Token")
-    parser.add_argument("--chat",    required=True,  help="Telegram Chat/Channel ID")
+    parser.add_argument("--token",   default=None, help="Telegram Bot Token (or set TELEGRAM_TOKEN env var)")
+    parser.add_argument("--chat",    default=None, help="Telegram Chat/Channel ID (or set TELEGRAM_CHAT_ID env var)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print message without sending to Telegram")
     parser.add_argument("--json",    default="open_ipos.json",
                         help="Path to save JSON output (default: open_ipos.json)")
     args = parser.parse_args()
+
+    # Resolve credentials: CLI args take priority, then environment variables
+    token   = args.token   or os.environ.get("TELEGRAM_TOKEN")   or os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = args.chat    or os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not args.dry_run and (not token or not chat_id):
+        log.error(
+            "❌ Telegram credentials missing.\n"
+            "   Provide via CLI:  --token TOKEN --chat CHAT_ID\n"
+            "   Or set env vars:  TELEGRAM_TOKEN  and  TELEGRAM_CHAT_ID"
+        )
+        sys.exit(1)
 
     log.info("🚀 Starting IPO pipeline…")
     open_ipos = run_pipeline()
@@ -1196,7 +1210,7 @@ def main():
         print("────────────────────────────────────────────────────────────────────\n")
     else:
         log.info("📤 Sending to Telegram…")
-        send_telegram(args.token, args.chat, msg)
+        send_telegram(token, chat_id, msg)
 
 
 if __name__ == "__main__":
