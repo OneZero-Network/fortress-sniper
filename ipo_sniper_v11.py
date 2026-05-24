@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║      IPO SNIPER v12.0 — CUSTOM PATCHES (per user request)                    ║
+║      IPO SNIPER v12.0 — FULL CODE                                           ║
 ║                                                                              ║
-║  CHANGES:                                                                    ║
+║  CHANGES (per user request):                                                ║
 ║  1. Shariah audit: OpenAI primary (gpt-4o-mini → gpt-4o)                    ║
 ║     Monthly advisor: Claude Sonnet 4                                        ║
 ║  2. Rule‑based fallback (debt/equity + revenue mix)                         ║
@@ -145,7 +145,7 @@ OBVIOUS_HARAM_SECTORS = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# (LEGACY HELPERS – unchanged)
+# LEGACY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _flt(v, default: float = 0.0) -> float:
@@ -227,7 +227,7 @@ def _confirm_live_status(open_dt, close_dt, sub: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCRAPER DATA LAYER — IPORecord + helpers (unchanged)
+# SCRAPER DATA LAYER — IPORecord + helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 class IPOStatus(str, Enum):
@@ -466,7 +466,7 @@ def _make_ipo_record(source: str, name: str, **kwargs) -> Optional[IPORecord]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GENERIC TABLE PARSERS (unchanged)
+# GENERIC TABLE PARSERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_tables_scraper(soup, source: str) -> list:
@@ -553,7 +553,7 @@ def _parse_td_header_tables(soup, source: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INVESTORGAIN TABLE PARSER (unchanged)
+# INVESTORGAIN TABLE PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
 _IG_EXCHANGE_RE = re.compile(
@@ -665,7 +665,7 @@ def _parse_investorgain_table(table) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLAYWRIGHT HELPERS (unchanged)
+# PLAYWRIGHT HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _USER_AGENTS = [
@@ -701,7 +701,7 @@ def _pw_get_html(url: str, wait_ms: int = 4000,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOURCE FETCHERS (unchanged)
+# SOURCE FETCHERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SCREENER_URLS = [
@@ -849,7 +849,7 @@ def _fetch_indiatrade() -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BRIDGE: IPORecord list → DataFrame (unchanged)
+# BRIDGE: IPORecord list → DataFrame
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ipo_records_to_df(records: list, source_label: str = "") -> pd.DataFrame:
@@ -916,7 +916,7 @@ def _ipo_records_to_df(records: list, source_label: str = "") -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SOURCE E — NSE JSON API (unchanged)
+# SOURCE E — NSE JSON API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_source_e_nse() -> pd.DataFrame:
@@ -1008,7 +1008,7 @@ def fetch_source_e_nse() -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VALIDATION + ENRICHMENT (unchanged)
+# VALIDATION + ENRICHMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 REQUIRED_DEFAULTS = {
@@ -1098,7 +1098,7 @@ def _enrich(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MASTER FETCH ORCHESTRATOR (unchanged)
+# MASTER FETCH ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_unified_calendar() -> pd.DataFrame:
@@ -1179,7 +1179,7 @@ def fetch_unified_calendar() -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BAYESIAN WEIGHTS (unchanged)
+# BAYESIAN WEIGHTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def bayesian_weight_update(df: pd.DataFrame) -> Dict[str, float]:
@@ -1199,7 +1199,7 @@ def bayesian_weight_update(df: pd.DataFrame) -> Dict[str, float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUANT ENGINE (unchanged)
+# QUANT ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -1273,7 +1273,7 @@ def compute_allotment(row: pd.Series) -> AllotmentProfile:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# v12 STRUCTURED OUTPUT SCHEMAS (unchanged)
+# v12 STRUCTURED OUTPUT SCHEMAS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SHARIAH_SO_SCHEMA: dict = {
@@ -1419,7 +1419,7 @@ def _rule_based_audit(symbol: str, sector: str, description: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SHARIAH ENGINE — audit cache + company description scraper (partly modified)
+# SHARIAH ENGINE — audit cache + company description scraper
 # ══════════════════════════════════════════════════════════════════════════════
 
 HARAM_SECTORS: set = {
@@ -2273,7 +2273,167 @@ Respond ONLY with a JSON object matching the schema."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE (unchanged)
+# T+2 OUTCOME CAPTURE (v11)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def capture_listing_outcome(
+    symbol:             str,
+    issue_price:        float,
+    lot_size:           int,
+    predicted_gmp_pct:  float,
+    predicted_ev_inr:   float,
+    day1_listing_price: float,
+    verdict_was:        str   = "",
+    final_score_was:    float = 0.0,
+    listed_date:        str   = "",
+) -> None:
+    """
+    Record the Day-1 listing price.
+    halal_gain_pct / halal_profit_inr / error_margin_pct stay NULL until
+    capture_t2_outcome() is called with the T+2 closing price.
+    """
+    day1_gain_pct = ((day1_listing_price - issue_price) / max(1.0, issue_price)) * 100
+    listed_date   = listed_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    try:
+        with sqlite3.connect(str(IPO_DB_PATH)) as con:
+            con.execute("""
+                INSERT OR REPLACE INTO ipo_outcomes (
+                    symbol, issue_price, lot_size,
+                    predicted_gmp_pct, predicted_ev_inr,
+                    day1_listing_price, day1_gain_pct,
+                    verdict_was, final_score_was, listed_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                symbol, issue_price, lot_size,
+                predicted_gmp_pct, predicted_ev_inr,
+                day1_listing_price, round(day1_gain_pct, 4),
+                verdict_was, final_score_was, listed_date,
+            ))
+        log.info(
+            f"📒 Muhasabah Day-1: {symbol}  @ ₹{day1_listing_price:.0f}  "
+            f"day1={day1_gain_pct:+.1f}%  (T+2 pending for halal P&L)"
+        )
+    except Exception as exc:
+        log.warning(f"  capture_listing_outcome failed for {symbol}: {exc}")
+
+def capture_t2_outcome(
+    symbol:           str,
+    t2_closing_price: float,
+    t2_date:          str = "",
+) -> None:
+    """
+    Record the T+2 (settlement day) closing price — the Shariah-compliant
+    realizable price per OIC Fiqh Resolution 3/3/86.
+    """
+    t2_date = t2_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    try:
+        with sqlite3.connect(str(IPO_DB_PATH)) as con:
+            row = con.execute(
+                "SELECT issue_price, lot_size, predicted_gmp_pct FROM ipo_outcomes WHERE symbol=?",
+                (symbol,)
+            ).fetchone()
+
+        if not row:
+            log.warning(
+                f"  capture_t2_outcome: {symbol} not in ipo_outcomes "
+                f"(call capture_listing_outcome first)"
+            )
+            return
+
+        issue_price, lot_size, pred_gmp = float(row[0]), int(row[1]), float(row[2] or 0)
+        halal_gain_pct = ((t2_closing_price - issue_price) / max(1.0, issue_price)) * 100
+        halal_profit   = (t2_closing_price - issue_price) * lot_size
+        error_margin   = abs(pred_gmp - halal_gain_pct)
+
+        with sqlite3.connect(str(IPO_DB_PATH)) as con:
+            con.execute("""
+                UPDATE ipo_outcomes
+                SET t2_closing_price = ?,
+                    halal_gain_pct   = ?,
+                    halal_profit_inr = ?,
+                    error_margin_pct = ?,
+                    t2_date          = ?
+                WHERE symbol = ?
+            """, (
+                t2_closing_price,
+                round(halal_gain_pct, 4),
+                round(halal_profit, 2),
+                round(error_margin, 4),
+                t2_date,
+                symbol,
+            ))
+
+        log.info(
+            f"📒 Muhasabah T+2: {symbol}  @ ₹{t2_closing_price:.0f}  "
+            f"halal_gain={halal_gain_pct:+.1f}%  profit=₹{halal_profit:,.0f}  "
+            f"pred_error={error_margin:.1f}pp"
+        )
+
+    except Exception as exc:
+        log.warning(f"  capture_t2_outcome failed for {symbol}: {exc}")
+
+def _detect_and_capture_outcomes(current_df: pd.DataFrame) -> None:
+    """
+    Auto status-transition detector.
+    Day-1 capture fires when ScrStatus = LISTED and a listing price is present.
+    """
+    if current_df.empty:
+        return
+
+    try:
+        with sqlite3.connect(str(IPO_DB_PATH)) as con:
+            prev = pd.read_sql("""
+                SELECT symbol, gmp_pct, ev_inr, verdict, final_score,
+                       price_upper, lot_size
+                FROM ipo_scans
+                WHERE is_upcoming = 0
+                  AND scr_status NOT IN ('Listed', 'LISTED')
+                ORDER BY run_date DESC
+            """, con)
+    except Exception as exc:
+        log.debug(f"  _detect_and_capture_outcomes: {exc}")
+        return
+
+    if prev.empty:
+        return
+
+    scr_col    = current_df.get("ScrStatus", pd.Series(dtype=str))
+    listed_now = current_df[scr_col.str.upper() == "LISTED"]
+
+    for _, row in listed_now.iterrows():
+        sym = str(row["Symbol"])
+        if prev[prev["symbol"] == sym].empty:
+            continue
+        prev_row = prev[prev["symbol"] == sym].iloc[0]
+
+        raw_price = row.get("ListingDate", "") or row.get("listing_price", "")
+        m = re.search(r"[\d.]+", str(raw_price).replace(",", ""))
+        if not m:
+            continue
+        day1_price = float(m.group())
+        if day1_price <= 0:
+            continue
+
+        issue_price = float(prev_row.get("price_upper", 0))
+        if issue_price <= 0:
+            continue
+
+        capture_listing_outcome(
+            symbol             = sym,
+            issue_price        = issue_price,
+            lot_size           = int(prev_row.get("lot_size", 1)),
+            predicted_gmp_pct  = float(prev_row.get("gmp_pct", 0)),
+            predicted_ev_inr   = float(prev_row.get("ev_inr", 0)),
+            day1_listing_price = day1_price,
+            verdict_was        = str(prev_row.get("verdict", "")),
+            final_score_was    = float(prev_row.get("final_score", 0)),
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extend_init_db_for_v11(con: sqlite3.Connection) -> None:
@@ -2380,7 +2540,7 @@ def persist_db(df, allots, shariahs):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM (unchanged)
+# TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SEP = "━" * 20
@@ -2580,7 +2740,6 @@ def build_ipo_card(row: pd.Series, allot: AllotmentProfile,
     )
     return msg
 
-
 def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
     token   = os.getenv("TELEGRAM_TOKEN",   "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -2626,7 +2785,7 @@ def send_telegram_alerts(df: pd.DataFrame, allots: dict, shariahs: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN (updated to optionally run backtest)
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run(backtest: bool = False):
