@@ -1673,7 +1673,7 @@ def _extract_desc_text(soup: BeautifulSoup, min_len: int = 40) -> str:
         bad.decompose()
 
     # 2. Chittorgarh-Specific Golden Target
-    # Chittorgarh usually starts their descriptions with "Incorporated in..."
+    # Chittorgarh usually starts their descriptions with "Incorporated in..." or "Founded in..."
     for p in soup.find_all("p"):
         text = p.get_text(" ", strip=True)
         if "incorporated in" in text.lower() or "founded in" in text.lower():
@@ -1699,7 +1699,7 @@ def _extract_desc_text(soup: BeautifulSoup, min_len: int = 40) -> str:
             return text
 
     return ""
-
+    
 def _name_based_stub(company_name: str) -> str:
     """
     Construct a minimal ~90-char description from the company name alone.
