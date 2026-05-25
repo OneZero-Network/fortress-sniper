@@ -42,7 +42,7 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH          = Path(os.getenv("CACHE_PATH", "outputs/sniper_cache.db"))
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
-SPREADSHEET_ID    = os.getenv("SPREADSHEET_ID", "")
+SPREADSHEET_ID    = os.getenv("GOOGLE_SHEET_ID", "")  # matches GOOGLE_SHEET_ID secret
 
 # Reply timeout — picks not confirmed within this window are auto-SKIPPED
 REPLY_TIMEOUT_MINUTES = int(os.getenv("REPLY_TIMEOUT_MINUTES", "30"))
@@ -217,7 +217,7 @@ def _restore_todays_picks_from_sheets() -> int:
         log.debug("FIX-RH-RESTORE: gspread not installed — skipping")
         return 0
     if not GOOGLE_CREDS_JSON or not SPREADSHEET_ID:
-        log.debug("FIX-RH-RESTORE: GOOGLE_CREDS_JSON or SPREADSHEET_ID not set — skipping")
+        log.debug("FIX-RH-RESTORE: GOOGLE_CREDS_JSON or GOOGLE_SHEET_ID not set — skipping")
         return 0
 
     today_str = datetime.today().strftime("%Y-%m-%d")
