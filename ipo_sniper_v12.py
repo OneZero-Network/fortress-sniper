@@ -213,19 +213,8 @@ _CAPITAL_INTENSIVE_SECTORS: frozenset = frozenset({
 class LLMTracker:
     """
     Per-run diagnostic tracker for every LLM pipeline stage.
-
-    Stages (in order):
-      DESC_FETCH   – web scraping for company description
-      CACHE_HIT    – Shariah SQLite cache lookup
-      PREFILTER    – sector keyword pre-filter
-      DE_RATIO     – debt/equity ratio fetch & gate (new)
-      RULE_AUDIT   – rule-based fallback
-      OPENAI_MINI  – gpt-4o-mini structured-output call
-      OPENAI_FULL  – gpt-4o escalated call
-      CLAUDE       – Claude monthly advisor call
-      FINAL        – resolved verdict
-
-    Status: START / OK / FAIL / SKIP / WARN
+    Thread-safe: all mutations are protected by an internal lock so the tracker
+    can be used safely from the parallel scoring ThreadPoolExecutor.
     """
 
     _ICONS = {"OK": "✅", "FAIL": "❌", "SKIP": "⏭", "START": "▶", "WARN": "⚠️"}
@@ -233,9 +222,11 @@ class LLMTracker:
     def __init__(self):
         self.events: List[dict] = []
         self._stage_start: Dict[str, float] = {}
+        self._lock = _threading.Lock()   # protects events and _stage_start
 
     def start(self, company: str, stage: str, detail: str = ""):
-        self._stage_start[f"{company}:{stage}"] = time.time()
+        with self._lock:
+            self._stage_start[f"{company}:{stage}"] = time.time()
         self._record(company, stage, "START", detail)
 
     def ok(self, company: str, stage: str, detail: str = ""):
@@ -297,7 +288,8 @@ class LLMTracker:
         self._stage_start.clear()
 
     def _elapsed(self, company: str, stage: str) -> float:
-        t0 = self._stage_start.pop(f"{company}:{stage}", None)
+        with self._lock:
+            t0 = self._stage_start.pop(f"{company}:{stage}", None)
         return round(time.time() - t0, 2) if t0 else 0.0
 
     def _record(self, company: str, stage: str, status: str,
@@ -311,7 +303,8 @@ class LLMTracker:
             "detail":    detail[:140],
             "elapsed_s": elapsed,
         }
-        self.events.append(entry)
+        with self._lock:
+            self.events.append(entry)
         elapsed_str = f"  ({elapsed:.2f}s)" if elapsed else ""
         log.info(
             f"  [LLM-TRACK] {icon} {company[:24]:<24} │ "
@@ -1776,10 +1769,27 @@ def _cache_get(symbol: str) -> Optional[dict]:
         cached_at = datetime.fromisoformat(row[5])
         if (datetime.utcnow() - cached_at).days > 7:
             return None
+        tier       = row[1]
+        confidence = int(row[4]) if row[4] is not None else 0
+        # ── Cache poison guard ────────────────────────────────────────────────
+        # A cached HARAM verdict with confidence below the minimum threshold
+        # was produced when description quality was poor (e.g. 300-char stubs).
+        # Serving it today would poison every run for 7 days.
+        # Force a fresh re-audit so the corrected description fetcher can try.
+        if tier == "HARAM_CORE_BUSINESS" and confidence < _HARAM_MIN_CONFIDENCE:
+            log.info(
+                f"  [cache] {symbol}: HARAM conf={confidence}% < "
+                f"{_HARAM_MIN_CONFIDENCE}% — invalidated (re-auditing)"
+            )
+            # Delete the poisoned row so next run stores the corrected verdict
+            with _AUDIT_CACHE_LOCK:
+                with sqlite3.connect(str(_AUDIT_CACHE_PATH)) as con:
+                    con.execute("DELETE FROM shariah_cache WHERE symbol=?", (symbol,))
+            return None
         return {
-            "is_compliant": bool(row[0]), "tier": row[1],
+            "is_compliant": bool(row[0]), "tier": tier,
             "haram_reason": row[2], "compliance_notes": row[3],
-            "confidence": row[4],
+            "confidence":   confidence,
         }
     except Exception:
         return None
@@ -1809,6 +1819,7 @@ def _cache_set(symbol: str, result: dict, description: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DESC_CACHE: Dict[str, str] = {}
+_DESC_CACHE_LOCK = _threading.Lock()   # guards concurrent writes to _DESC_CACHE
 
 
 def _slugify(name: str) -> str:
@@ -1881,6 +1892,7 @@ def _extract_desc_text(soup: BeautifulSoup, min_len: int = 40) -> str:
 
 # ── Proactive D/E ratio fetcher ───────────────────────────────────────────────
 _DE_CACHE: Dict[str, Optional[float]] = {}
+_DE_CACHE_LOCK = _threading.Lock()   # guards concurrent writes to _DE_CACHE
 
 def fetch_de_ratio(company_name: str) -> Optional[float]:
     """
@@ -1949,8 +1961,9 @@ def fetch_de_ratio(company_name: str) -> Optional[float]:
                     m = re.search(r"[\d]+\.?\d*", val_cell.replace(",", ""))
                     if m:
                         de = float(m.group())
-                        if 0 <= de <= 50:          # sanity range
-                            _DE_CACHE[company_name] = de
+                        if 0 <= de <= 50:
+                            with _DE_CACHE_LOCK:
+                                _DE_CACHE[company_name] = de
                             log.info(
                                 f"  [D/E] {company_name}: ratio={de:.2f}  "
                                 f"({'HARAM' if de>0.33 else 'OK'})"
@@ -1966,11 +1979,13 @@ def fetch_de_ratio(company_name: str) -> Optional[float]:
         if m:
             de = float(m.group(1))
             if 0 <= de <= 50:
-                _DE_CACHE[company_name] = de
+                with _DE_CACHE_LOCK:
+                    _DE_CACHE[company_name] = de
                 log.info(f"  [D/E] {company_name}: ratio={de:.2f} (regex scan)")
                 return de
 
-    _DE_CACHE[company_name] = None
+    with _DE_CACHE_LOCK:
+        _DE_CACHE[company_name] = None
     log.debug(f"  [D/E] {company_name}: not found in any source")
     return None
 
@@ -2116,7 +2131,8 @@ def fetch_company_description(company_name: str) -> str:
         text = _extract_desc_text(soup, min_len=40)
         if text:
             result = text[:3000]
-            _DESC_CACHE[company_name] = result
+            with _DESC_CACHE_LOCK:
+                _DESC_CACHE[company_name] = result
             llm_tracker.ok(
                 company_name, "DESC_FETCH",
                 f"source={label}  len={len(result)}"
@@ -2128,7 +2144,8 @@ def fetch_company_description(company_name: str) -> str:
 
     # ── Tier C: name-based stub (guaranteed non-empty, flags low confidence) ──
     stub = _name_based_stub(company_name)
-    _DESC_CACHE[company_name] = stub
+    with _DESC_CACHE_LOCK:
+        _DESC_CACHE[company_name] = stub
     llm_tracker.warn(
         company_name, "DESC_FETCH",
         f"all {len(sources)} sources failed — name stub ({len(stub)} chars). "
@@ -3527,15 +3544,63 @@ def run(backtest: bool = False):
         log.info("📅 1st of month — running AI Strategy Advisor...")
         w = run_monthly_strategy_advisor(w, days_lookback=30)
 
-    allots:   Dict[str, AllotmentProfile] = {}
-    shariahs: Dict[str, ShariahVerdict]   = {}
-    scores:   List[dict]                  = []
-
+    # ── Phase 1: Pre-fetch descriptions & D/E ratios SEQUENTIALLY ────────────
+    # Playwright/cloudscraper are heavy — running 5 browser instances in parallel
+    # would spike RAM by ~1GB and trigger the OOM killer on a standard VPS.
+    # Pre-fetching sequentially warms _DESC_CACHE and _DE_CACHE so the
+    # parallel Phase 2 only fires lightweight OpenAI API calls.
+    log.info("🌐 Pre-fetching descriptions & D/E ratios (sequential)...")
     for _, row in df.iterrows():
-        sym           = str(row["Symbol"])
-        allots[sym]   = compute_allotment(row)
-        shariahs[sym] = run_shariah(row)
-        scores.append(master_score(row, allots[sym], shariahs[sym], w, df_context=df))
+        sym = str(row["Symbol"])
+        if sym not in _DESC_CACHE:
+            fetch_company_description(sym)
+        if sym not in _DE_CACHE:
+            fetch_de_ratio(sym)
+
+    # ── Phase 2: Parallel scoring (Shariah LLM + allotment + master score) ───
+    # With caches warm, each worker only calls OpenAI (fast, no browser).
+    # max_workers=5: ~10 IPOs × 2 OpenAI calls each = 20 calls ≈ safe under
+    # OpenAI's 500 RPM rate limit. Raises ConnectionError on 429 → tenacity
+    # handles retries in _tg_send; OpenAI calls raise RateLimitError directly.
+    log.info("⚡ Parallel scoring (max 5 workers)...")
+
+    allots:      Dict[str, AllotmentProfile] = {}
+    shariahs:    Dict[str, ShariahVerdict]   = {}
+    scores_dict: Dict[int, dict]             = {}   # keyed by df index, not symbol
+
+    def _process_ipo(idx: int, row_data: pd.Series) -> Tuple[int, str, AllotmentProfile, ShariahVerdict, dict]:
+        sym    = str(row_data["Symbol"])
+        desc   = _DESC_CACHE.get(sym, "")          # already warm from Phase 1
+        a_prof = compute_allotment(row_data)
+        s_verd = run_shariah(row_data, company_description=desc)
+        m_scr  = master_score(row_data, a_prof, s_verd, w, df_context=df)
+        return idx, sym, a_prof, s_verd, m_scr
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_process_ipo, idx, row): idx
+            for idx, row in df.iterrows()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                idx, sym, a_prof, s_verd, m_scr = future.result()
+                allots[sym]      = a_prof
+                shariahs[sym]    = s_verd
+                scores_dict[idx] = m_scr
+            except Exception as exc:
+                idx = futures[future]
+                sym = str(df.at[idx, "Symbol"])
+                log.error(f"❌ Failed to process {sym} (idx={idx}): {exc}")
+                # Safe fallback — prevents DataFrame misalignment
+                allots[sym] = AllotmentProfile(
+                    sym, 0.0, {1: 0.0}, 1, 0.0, 0.0, 0.0, (0.0, 0.0))
+                shariahs[sym] = ShariahVerdict(
+                    sym, "TIER_2_CONDITIONAL", 50.0, False,
+                    "Error during audit.", [], 0, str(exc)[:100], "error")
+                scores_dict[idx] = {"FinalScore": 0.0, "Verdict": "❌ ERROR"}
+
+    # Reconstruct scores in original DataFrame row order
+    scores: List[dict] = [scores_dict[idx] for idx in df.index]
 
     df["FinalScore"]        = [s["FinalScore"] for s in scores]
     df["Verdict"]           = [s["Verdict"]    for s in scores]
