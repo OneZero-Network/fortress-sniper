@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH          = Path(os.getenv("CACHE_PATH", "outputs/sniper_cache.db"))
+DB_PATH          = Path(os.getenv("CACHE_PATH", "data/sniper_cache.db"))   # FIX-DB1: must match sniper DB_PATH (was outputs/)
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
 SPREADSHEET_ID    = os.getenv("GOOGLE_SHEET_ID", "")  # matches GOOGLE_SHEET_ID secret
 
