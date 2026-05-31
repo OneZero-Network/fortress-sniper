@@ -2199,4 +2199,8 @@ def _fetch_market_sentiment(symbol: str, fii_data: dict, insider_map: dict,
 # v5.0 — OUT-1: DAILY SHORTLIST PERSISTENCE (Step 9 §4e of architecture)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _save_daily_shortlist(run_date: str, symbol
+def _save_daily_shortlist(run_date: str, symbol: str, final_rank: int,
+                           fortress: float, apex: float, fused: float,
+                           meta_prob: float, halal: dict,
+                           llm_output: dict, sentiment: dict,
+                           llm_input: dict) -> None:
