@@ -742,6 +742,29 @@ SURVIVAL_MODEL_ENABLED  = os.getenv("SURVIVAL_MODEL_ENABLED", "true").lower() in
 SURVIVAL_MIN_SAMPLES    = int(os.getenv("SURVIVAL_MIN_SAMPLES", "100"))
 LANE_REQUIRE_HALAL_PURE = os.getenv("LANE_REQUIRE_HALAL_PURE","true").lower() in ("1","true","yes")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v5.6 CONVICTION RE-RANK (Bismillah) — flag-gated, A/B-testable.
+#   Addresses the three alpha gaps found by reverse-engineering v5.5:
+#     (1) cross-sectional RELATIVE STRENGTH — the missing #1 swing-trade edge,
+#     (2) a SUPER-LINEAR confluence multiplier that rewards independent edges
+#         stacking (pearls are confluence events, not single strong signals),
+#     (3) CATALYST-REQUIRED top grades + pearls-or-nothing lane gates so the
+#         engine returns a high-conviction pick or stays silent — instead of
+#         surfacing the best of a weak technical field.
+#   When CONVICTION_RERANK is false (default) v5.5 behaviour is unchanged.
+CONVICTION_RERANK     = os.getenv("CONVICTION_RERANK", "false").lower() in ("1","true","yes")
+CONV_RS_LOOKBACK_L    = int(os.getenv("CONV_RS_LOOKBACK_L", "126"))   # ~6 months of bars
+CONV_RS_LOOKBACK_S    = int(os.getenv("CONV_RS_LOOKBACK_S", "63"))    # ~3 months of bars
+CONV_RS_MIN_PCT       = float(os.getenv("CONV_RS_MIN_PCT", "70"))     # RS-leadership percentile
+CONV_EDGE_STEP        = float(os.getenv("CONV_EDGE_STEP", "0.15"))    # +15% conviction per extra edge
+CONV_EDGE_CAP         = float(os.getenv("CONV_EDGE_CAP", "1.60"))     # max confluence multiplier
+CONV_REQUIRE_CATALYST = os.getenv("CONV_REQUIRE_CATALYST","true").lower() in ("1","true","yes")
+# Grade-aligned lane gates used ONLY when CONVICTION_RERANK is on (pearls-or-nothing).
+# Fortress is scored out of 200 → 120 == the 60% GOOD line. APEX/FUSED are 0-100.
+CONV_LANE_FORTRESS_MIN = int(os.getenv("CONV_LANE_FORTRESS_MIN", "120"))
+CONV_LANE_APEX_MIN     = int(os.getenv("CONV_LANE_APEX_MIN", "60"))
+CONV_LANE_FUSED_MIN    = int(os.getenv("CONV_LANE_FUSED_MIN", "70"))
+
 
 MIN_PRICE          = 50
 MAX_PRICE          = int(os.getenv("MAX_PRICE", "800"))  # FIX-UNIVERSE: was 800, excluding TCS/RELIANCE/HDFC/etc.
@@ -8544,12 +8567,140 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
         if "story" not in r:
             r["story"] = f"{lane_name} lane selection"
 
+        # ── v5.6 CONVICTION: top grades require a real (non-technical) catalyst ──
+        if CONVICTION_RERANK:
+            if (CONV_REQUIRE_CATALYST and r.get("grade") in ("APEX", "PRISTINE")
+                    and not r.get("has_catalyst", False)):
+                r["grade"] = "GOOD"
+                r["story"] = (r.get("story", "") +
+                              " | ⚠️ grade capped GOOD — RS/technical only, no fundamental catalyst")
+            r["story"] = (r.get("story", "") +
+                          f" | 🎯 conv={r.get('conviction', 0):.0f} "
+                          f"edges={'+'.join(r.get('edges', [])) or '—'} "
+                          f"RS={r.get('rs_pct', 0):.0f}pct")
+
         log.info(f"LANE {lane_name} WINNER: {sym} | {min_score_key}={score:.0f} | halal={r['halal_tier']}")
         return r
 
     log.info(f"LANE {lane_name}: NO PICK (no symbol passed score+halal gate)")
     return None
                             
+def _compute_conviction(candidates: list, hist_cache: dict,
+                        insider_map: dict, filings: dict, macro: dict) -> list:
+    """
+    v5.6 — PEARL LOCATOR (Bismillah). Re-scores every surviving candidate by a
+    confluence-weighted CONVICTION value and tags it with independent edge flags,
+    so lane selection can pick the highest-conviction qualifier instead of the
+    highest raw technical score.
+
+    Conviction = base_0_100 * confluence_multiplier + RS tilt
+      - base_0_100        : the candidate's own lane score (fort_pct / apex / fused)
+      - confluence_mult   : 1 + CONV_EDGE_STEP*(num_edges-1), capped at CONV_EDGE_CAP
+      - RS tilt           : 0.08 * rs_pct  (breaks ties toward leadership names)
+
+    Independent edges (each counted once):
+      RS      : cross-sectional relative-strength leader (>= CONV_RS_MIN_PCT pct)
+      BASE    : own technical base score healthy (>= 55/100)
+      VOL     : whale/volume thrust  (whale>=40, or ADX>=25 & MFI>=55)
+      INSIDER : real insider net-buy on file        (non-technical CATALYST)
+      FILING  : bullish exchange filing (> neutral)  (non-technical CATALYST)
+      PEAD    : just reported, in post-earnings drift (non-technical CATALYST)
+
+    `has_catalyst` is True iff at least one of INSIDER/FILING/PEAD fires — that is
+    what `_select_lane_winner` requires for an APEX/PRISTINE grade.
+    Mutates each candidate dict in place AND returns the list.
+    """
+    if not candidates:
+        return candidates
+
+    def _hist_for(sym: str):
+        return (hist_cache.get(sym) if hist_cache.get(sym) is not None
+                else hist_cache.get(sym.upper()))
+
+    def _ret(df, n):
+        try:
+            if df is None or len(df) <= n:
+                return None
+            c = df["close"]
+            past = float(c.iloc[-(n + 1)]); now = float(c.iloc[-1])
+            return (now - past) / past * 100.0 if past > 0 else None
+        except Exception:
+            return None
+
+    # ── 1) cross-sectional relative-strength returns (blended 6m/3m) ───────────
+    blended = {}
+    for r in candidates:
+        sym = r.get("symbol", "")
+        df = _hist_for(sym)
+        rl = _ret(df, CONV_RS_LOOKBACK_L)
+        rs = _ret(df, CONV_RS_LOOKBACK_S)
+        if rl is None and rs is None:
+            blended[id(r)] = None
+        else:
+            blended[id(r)] = 0.6 * (rl if rl is not None else (rs or 0.0)) + \
+                             0.4 * (rs if rs is not None else (rl or 0.0))
+
+    scored = [v for v in blended.values() if v is not None]
+    scored_sorted = sorted(scored)
+    n_scored = len(scored_sorted)
+
+    def _pct_rank(v):
+        if v is None or n_scored == 0:
+            return 0.0
+        # fraction of candidates this name beats → 0..100
+        import bisect
+        return bisect.bisect_right(scored_sorted, v) / n_scored * 100.0
+
+    # ── 2) per-candidate edges + conviction ────────────────────────────────────
+    for r in candidates:
+        sym = r.get("symbol", "")
+        rs_pct = round(_pct_rank(blended.get(id(r))), 1)
+
+        fort_pct = (float(r.get("fort_pts", 0) or 0) / FORT_TOTAL_MAX) * 100.0
+        base = max(fort_pct,
+                   float(r.get("apex_comp", 0) or 0),
+                   float(r.get("fused", 0) or 0))
+
+        ins = insider_map.get(sym.upper(), {})
+        fil = filings.get(sym.upper(), {})
+        ins_score = float(ins.get("score", 0) or 0)
+        fil_score = float(fil.get("score", 15) or 15)
+        earn_days = r.get("earn_days")
+        whale = float(r.get("whale_score", 0) or 0)
+        adx = float(r.get("adx", 0) or 0)
+        mfi = float(r.get("mfi", 50) or 50)
+
+        edge_rs      = rs_pct >= CONV_RS_MIN_PCT
+        edge_base    = base >= 55.0
+        edge_vol     = (whale >= 40.0) or (adx >= 25.0 and mfi >= 55.0)
+        edge_insider = ins_score > 0.0
+        edge_filing  = fil_score > 15.0
+        edge_pead    = (earn_days is not None and -20 <= earn_days <= -1)
+
+        edge_names = []
+        if edge_rs:      edge_names.append(f"RS{int(rs_pct)}")
+        if edge_base:    edge_names.append("Base")
+        if edge_vol:     edge_names.append("Vol")
+        if edge_insider: edge_names.append("Insider")
+        if edge_filing:  edge_names.append("Filing")
+        if edge_pead:    edge_names.append("PEAD")
+
+        num_edges = sum([edge_rs, edge_base, edge_vol,
+                         edge_insider, edge_filing, edge_pead])
+        has_catalyst = edge_insider or edge_filing or edge_pead
+
+        mult = min(CONV_EDGE_CAP, 1.0 + CONV_EDGE_STEP * max(0, num_edges - 1))
+        conviction = round(base * mult + 0.08 * rs_pct, 1)
+
+        r["rs_pct"]       = rs_pct
+        r["num_edges"]    = num_edges
+        r["has_catalyst"] = has_catalyst
+        r["edges"]        = edge_names
+        r["conviction"]   = conviction
+
+    return candidates
+
+
 def _persist_lane_results(lane_name: str, winner: Optional[dict],
                            date_label: str) -> None:
     """Stage 5 -- DB persistence with lane tag."""
@@ -11791,6 +11942,15 @@ def run():
        run as separate CLI invocations.
     """
     _init_db()
+    # FIX-PERSIST (v5.5.2): restore pick_outcomes + trade_decisions from Sheets at the
+    # START of every daily run so a fresh GitHub Actions runner inherits full history
+    # (open picks to track + prior decisions for learning). Previously restore ran ONLY
+    # inside the weekly agent, so the daily and outcome runs always saw an empty DB on a
+    # fresh runner — open picks never reached the outcome engine and never closed.
+    try:
+        _restore_db_from_sheets()
+    except Exception as _re:
+        log.warning(f"FIX-PERSIST: daily _restore_db_from_sheets failed (non-fatal): {_re}")
     # FIX-1.4: Declare FORCE_YFINANCE as global so the auto-detect can modify it mid-run
     global FORCE_YFINANCE
     # FIX-2.6: Validate secrets at startup
@@ -12191,6 +12351,25 @@ def run():
                 date_label=date_label,
             )
 
+            # ── v5.6 CONVICTION RE-RANK (Bismillah) — flag-gated ───────────────
+            # Re-score every lane candidate by confluence-weighted conviction and
+            # sort each lane by it, so _select_lane_winner picks the highest-
+            # conviction qualifier (RS leader + stacked catalysts) rather than the
+            # highest raw technical score. No extra network calls — reuses hist_cache.
+            if CONVICTION_RERANK:
+                try:
+                    _conv_all = (_three_lane_results.get("fortress", []) +
+                                 _three_lane_results.get("apex", []) +
+                                 _three_lane_results.get("fused", []))
+                    _compute_conviction(_conv_all, hist_cache, insider_map, filings, macro)
+                    for _ln in ("fortress", "apex", "fused"):
+                        _three_lane_results[_ln] = sorted(
+                            _three_lane_results.get(_ln, []),
+                            key=lambda _r: _r.get("conviction", 0.0), reverse=True)
+                    log.info("CONVICTION RE-RANK ✅ — lanes sorted by confluence-weighted conviction")
+                except Exception as _ce:
+                    log.warning(f"CONVICTION re-rank failed (non-fatal, raw order kept): {_ce}")
+
             # Stage 3 -- DEDUPLICATED L4 LLM SCREEN
             _unique_syms = _deduplicate_lane_winners(_three_lane_results)
             log.info(f"Stage 3: {len(_unique_syms)} unique symbols for L4 screen: {_unique_syms}")
@@ -12209,20 +12388,25 @@ def run():
                         pass
 
             # Stage 4 -- LANE FINALIZATION
+            # v5.6: under CONVICTION_RERANK, gates rise to the GOOD line so the
+            # engine returns a pearl or stays silent (no "best of a weak field").
+            _g_fort  = CONV_LANE_FORTRESS_MIN if CONVICTION_RERANK else LANE_FORTRESS_MIN
+            _g_apex  = CONV_LANE_APEX_MIN     if CONVICTION_RERANK else LANE_APEX_MIN
+            _g_fused = CONV_LANE_FUSED_MIN    if CONVICTION_RERANK else LANE_FUSED_MIN
             _three_lane_winners["fortress"] = _select_lane_winner(
                 _three_lane_results.get("fortress", []),
                 _halal_dedup, _alpha_dedup,
-                "FORTRESS", "fort_pts", LANE_FORTRESS_MIN
+                "FORTRESS", "fort_pts", _g_fort
             )
             _three_lane_winners["apex"] = _select_lane_winner(
                 _three_lane_results.get("apex", []),
                 _halal_dedup, _alpha_dedup,
-                "APEX", "apex_comp", LANE_APEX_MIN
+                "APEX", "apex_comp", _g_apex
             )
             _three_lane_winners["fused"] = _select_lane_winner(
                 _three_lane_results.get("fused", []),
                 _halal_dedup, _alpha_dedup,
-                "FUSED", "fused", LANE_FUSED_MIN
+                "FUSED", "fused", _g_fused
             )
 
             # Stage 5 -- DB PERSISTENCE (per-lane)
@@ -12469,14 +12653,24 @@ def run():
             f"({[r['symbol'] for r in top_picks]}); legacy allocation ignored."
         )
     else:
-        top_picks = allocation
-        seen = set()
-        top_picks = [r for r in top_picks if r["symbol"] not in seen and not seen.add(r["symbol"])]
-        if THREE_LANE_ENABLED:
-            log.warning(
-                "FIX-ISSUE-3: THREE_LANE_ENABLED but no lane winners produced — "
-                "falling back to legacy allocation list."
+        # v5.6: under CONVICTION_RERANK we deliberately return NO picks rather than
+        # fall back to the loose legacy allocation — a day with no qualifying pearl
+        # is a valid, expected outcome (capital preservation > forcing a weak trade).
+        if THREE_LANE_ENABLED and CONVICTION_RERANK:
+            top_picks = []
+            log.info(
+                "CONVICTION_RERANK: no lane cleared the pearls-or-nothing gate today — "
+                "returning 0 picks (legacy fallback intentionally suppressed)."
             )
+        else:
+            top_picks = allocation
+            seen = set()
+            top_picks = [r for r in top_picks if r["symbol"] not in seen and not seen.add(r["symbol"])]
+            if THREE_LANE_ENABLED:
+                log.warning(
+                    "FIX-ISSUE-3: THREE_LANE_ENABLED but no lane winners produced — "
+                    "falling back to legacy allocation list."
+                )
 
     # ── v3.0-M: Attach meta_prob, regime-scaled confidence, setup profile ──
     meta_model_live = _load_meta_model()
@@ -12924,8 +13118,20 @@ def run():
         _save_meta_model(refreshed_model)
         log.info("Meta-model refreshed with today's resolved outcomes")
 
-    # v4.0-M: auto-log any unresponded picks as SKIPPED at EOD
-    _auto_log_skipped_picks(date_label)
+    # FIX-SKIP (v5.5.2): DO NOT auto-log SKIPPED here. run() executes at ~08:30 IST,
+    # BEFORE the Telegram reply window opens, so calling _auto_log_skipped_picks() here
+    # pre-stamps EVERY pick as SKIPPED/no_response before the user can reply TAKEN — which
+    # is exactly why DB_DECISIONS contained only SKIPPED/no_response rows. The EOD outcome
+    # job (15:30 IST, after the reply window closes) is the correct and only place for it.
+    # _auto_log_skipped_picks(date_label)   # <-- intentionally disabled; runs in outcome job
+
+    # FIX-PERSIST (v5.5.2): back up DB to Sheets at the END of every daily run so today's
+    # open picks + signals are durable immediately (not only on the Monday weekly run).
+    # This lets the EOD outcome job restore and resolve them, and survives cache eviction.
+    try:
+        _backup_db_to_sheets()
+    except Exception as _be:
+        log.warning(f"FIX-PERSIST: daily _backup_db_to_sheets failed (non-fatal): {_be}")
 
     log.info(f"\n✅ Done | {len(top_picks)} picks | Macro: {macro['macro_state']} | "
              f"VIX: {macro['vix_val']:.1f} | Source: {data_source} | "
