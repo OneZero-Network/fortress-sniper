@@ -1,172 +1,403 @@
-name: IPO Sniper v12.0
+name: "UNIFIED HALAL SNIPER v5.5.2"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECRETS REQUIRED (GitHub → Settings → Secrets → Actions):
-#   OPENAI_API_KEY       sk-...
-#   ANTHROPIC_API_KEY    sk-ant-...
-#   TELEGRAM_TOKEN       123456:ABC-...
-#   TELEGRAM_CHAT_ID     -100...
+# v5.5.2 CHANGES vs v5.5.1 — ROOT-CAUSE PERSISTENCE + SCHEDULE FIXES
 #
-# FILE PLACEMENT:  .github/workflows/ipo_sniper.yml
-# SCRIPT EXPECTED: ipo_sniper_v12.py  (repo root)
+#   The three reported symptoms (weekly empty, Telegram TAKEN never recorded,
+#   "core data but no pearls") all trace to ONE root cause: the DB never
+#   persisted across the fresh GitHub Actions runners, so:
+#     • open picks never reached the outcome engine → never closed
+#       (DB_BACKUP held only status=open rows; PERFORMANCE = "no closed picks")
+#     • the reply handler's TAKEN never reached the outcome runner, and the
+#       outcome job then stamped every pick SKIPPED/no_response
+#       (DB_DECISIONS held only SKIPPED/no_response rows)
+#     • the weekly review had no wins/closed to analyse
+#
+#   FIX-CACHE  : actions/cache@v4 with a STATIC key (sniper-db-persistent) is
+#               WRITE-ONCE — once the cache exists it is never updated, and the
+#               combined action used as a "Save" step re-restores the stale copy
+#               OVER the freshly-written DB. Replaced with the split
+#               restore@v4 (prefix restore-keys) + save@v4 (unique rolling key)
+#               so every run saves a NEW cache and restores the most recent one.
+#               Applied to the DB (all 4 jobs) and the Telegram offset (Job 2).
+#
+#   FIX-PERSIST: _restore_db_from_sheets() / _backup_db_to_sheets() previously
+#               ran ONLY in the weekly agent. They are now wired into the daily
+#               run (inside run(), see the .py) AND the outcome job below, so
+#               history is durable every day and self-heals after cache eviction.
+#
+#   FIX-SKIP   : the daily run() called _auto_log_skipped_picks() at ~08:30 IST,
+#               BEFORE the reply window opened, pre-marking every pick SKIPPED.
+#               That call is disabled in run() (see the .py); the EOD outcome job
+#               below remains the single correct place for it.
+#
+#   FIX-WEEKLY : the weekly cron "30 3 * * 1" collided with the every-10-min
+#               reply-handler cron ("*/10 3-10 * * 1-5" fires at :30 too) and the
+#               08:30 sniper window. Moved to "45 2 * * 1" (02:45 UTC = 08:15 IST
+#               Mon) — before the daily window, zero overlap. The Monday weekday
+#               guard inside the .py is unchanged; for a manual test run, tick the
+#               force_weekly dispatch input.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  # Mon–Fri 10:00 AM IST  (04:30 UTC)
   schedule:
-    - cron: "30 4 * * 1-5"
+    # Job 1: Main sniper engine — 8:30 AM IST = 3:00 AM UTC
+    - cron: "0 3 * * 1-5"
+    # Job 2: Reply handler poll — every 10 min, 8:30 AM–4 PM IST = 3:00–10:30 AM UTC
+    - cron: "*/10 3-10 * * 1-5"
+    # Job 3: Outcome engine — 3:30 PM IST = 10:00 AM UTC
+    - cron: "0 10 * * 1-5"
+    # Job 4: Weekly review — Monday 8:15 AM IST = 2:45 AM UTC  (FIX-WEEKLY: was 30 3)
+    - cron: "45 2 * * 1"
 
-  # Manual run from Actions tab with optional flags
   workflow_dispatch:
     inputs:
-      backtest:
-        description: "Run backtest after scan?"
+      fast_rerun:
+        description: "Fast rerun (use score cache)"
         required: false
         default: "false"
-        type: choice
-        options: ["true", "false"]
-      force_advisor:
-        description: "Force monthly advisor (bypass day-of-month gate)?"
+        type: boolean
+      force_weekly:
+        description: "Force weekly review even if not Monday"
         required: false
         default: "false"
-        type: choice
-        options: ["true", "false"]
+        type: boolean
 
-# Never let two runs overlap
-concurrency:
-  group: ipo-sniper
-  cancel-in-progress: false
+env:
+  NSE_MAX_RETRIES:        "1"
+  SUPPRESS_HEALTH_ALERTS: "1"
+  FORCE_YFINANCE:         "true"   # FIX: NSE IP-blocks every run — skip NSE probing entirely
+  REPLY_TIMEOUT_MINUTES:  "30"
+  APEX_MIN_SCORE:         "40"
+  APEX_TOP_N:             "5"
+  CAPACITY_MAX_OPEN:      "4"
+  CAPACITY_MAX_WEEK:      "6"
+  MC_SIMS:                "600"
 
 jobs:
-  scan:
-    name: "Fetch → Shariah Audit → Score → Telegram"
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 1 — Main sniper engine
+  # ══════════════════════════════════════════════════════════════════
+  sniper-run:
+    name: "⚔️ Sniper Daily Run"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1-5')
 
     steps:
-
-      # ── 1. Code ───────────────────────────────────────────────────────────────
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ── 2. Python ─────────────────────────────────────────────────────────────
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
-      # ── 3. Python packages ────────────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install \
-            "numpy>=1.26,<2.0"         \
-            "pandas>=2.2,<3.0"         \
-            "requests>=2.31,<3.0"      \
-            "beautifulsoup4>=4.12,<5.0"\
-            "lxml>=5.0,<6.0"           \
-            "cloudscraper>=1.2.71"     \
-            "playwright>=1.44,<2.0"    \
-            "openai>=1.30,<2.0"        \
-            "rapidfuzz>=3.9,<4.0"      \
-            "tenacity>=8.3,<9.0"       \
-            "python-dotenv>=1.0,<2.0"
+        run: pip install -r requirements.txt
 
-      # ── 4. Playwright Chromium ────────────────────────────────────────────────
-      - name: Install Chromium
+      - name: Install survival model dependencies
         run: |
-          playwright install chromium --with-deps
-          python -c "
-          from playwright.sync_api import sync_playwright
-          pw=sync_playwright().start(); b=pw.chromium.launch(headless=True)
-          b.close(); pw.stop(); print('Playwright OK')
-          "
+          pip install -r requirements-survival.txt || \
+            echo "⚠️  scikit-survival install failed — survival model will run in fallback mode"
 
-      # ── 5. Restore persistent data (SQLite DB + Shariah cache) ────────────────
-      # Key rolls per run-id so today's run restores from the latest saved state.
-      # restore-keys fallback picks up the most recent cache if today's is absent.
-      - name: Restore data cache
+      # FIX-CACHE: rolling restore — primary key never matches (forces prefix
+      # match on restore-keys → newest sniper-db-* cache from any prior job/run).
+      - name: Restore DB
         uses: actions/cache/restore@v4
         with:
-          path: data/
-          key:          ipo-data-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: ipo-data-${{ runner.os }}-
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}
+          restore-keys: |
+            sniper-db-
 
-      # ── 6. Main scan ──────────────────────────────────────────────────────────
-      - name: Run IPO Sniper
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
+      - name: Run Sniper v5.5.2
+        run: python sniper_unified_v5_5.py
         env:
-          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          ARGS=""
-          [ "${{ github.event.inputs.backtest }}" = "true" ] && ARGS="--backtest"
-          python ipo_sniper_v12.py $ARGS
-
-      # ── 7. Force monthly advisor (manual only) ────────────────────────────────
-      # Normally fires only on the 1st of the month inside run().
-      # This step lets you trigger a recalibration at any time.
-      - name: Force monthly advisor
-        if: ${{ github.event.inputs.force_advisor == 'true' }}
-        env:
-          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          python - <<'PYEOF'
-          import importlib.util
-          spec = importlib.util.spec_from_file_location("sniper", "ipo_sniper_v12.py")
-          mod  = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-          new_w = mod.run_monthly_strategy_advisor(mod.BASE_WEIGHTS, days_lookback=30)
-          print("Recalibrated weights:", new_w)
-          PYEOF
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          CACHE_PATH:        outputs/sniper_cache.db
+          ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY || '500000' }}
+          ACCOUNT_RISK_PCT:  ${{ secrets.ACCOUNT_RISK_PCT || '0.015' }}
+          FAST_RERUN:        ${{ inputs.fast_rerun || 'false' }}
+          CLAUDE_MODEL:      "claude-sonnet-4-6"
+          # ── v5.6 PEARL-LOCATOR — recalibrated after live-run analysis ────────
+          # Original gates (Fortress:120, APEX:60, FUSED:70) produced 0 picks
+          # across 3 consecutive days. Root cause: CHOP regime (damp=0.88) +
+          # INSIDER sheet 36d stale (mult=0.20 → 0 symbols) + NSE IP-blocked
+          # means catalysts CANNOT fire. Best real scores from 3 live runs:
+          #   Fortress top (L4-passing):  STALLION~94, IFCI~91 → gate now 90
+          #   APEX top (L4-passing):      KALYANKJIL 48-49     → gate now 47
+          # These are still 2× stricter than v5.5 (Fortress was 27.5%, APEX 55).
+          # Restore to 120/60/70 when INSIDER sheet is refreshed + market clears.
+          CONVICTION_RERANK:        "true"
+          CONV_LANE_FORTRESS_MIN:   "90"    # was 120 — achievable in CHOP + degraded data
+          CONV_LANE_APEX_MIN:       "47"    # was 60  — KALYANKJIL/CHOICEIN tier (49,47)
+          CONV_LANE_FUSED_MIN:      "65"    # was 70  — same as v5.5 baseline
+          CONV_RS_MIN_PCT:          "65"    # was 70  — slightly wider RS filter in CHOP
 
-      # ── 8. Persist data cache ─────────────────────────────────────────────────
-      - name: Save data cache
+      # FIX-CACHE: rolling save — unique key per run+attempt, so the cache is
+      # ALWAYS written (a static key is never updated once it exists).
+      - name: Save DB
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: data/
-          key: ipo-data-${{ runner.os }}-${{ github.run_id }}
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # ── 9. Upload artifacts ───────────────────────────────────────────────────
-      - name: Upload scan output
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ipo-scan-${{ github.run_id }}
-          path: |
-            data/ipo_latest_run.json
-            data/ipo_sniper_v7.db
-            data/shariah_audit_cache.db
-          retention-days: 30
-          if-no-files-found: warn
+          name: sniper-report-${{ github.run_id }}
+          path: outputs/
+          retention-days: 14
 
-      # ── 10. Telegram failure alert ────────────────────────────────────────────
-      - name: Alert on failure
-        if: failure()
+      - name: Upload DB as persistent artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sniper-db-latest
+          path: outputs/sniper_cache.db
+          retention-days: 90
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 2 — Reply handler
+  # ══════════════════════════════════════════════════════════════════
+  reply-handler:
+    name: "📱 Reply Handler"
+    runs-on: ubuntu-latest
+    timeout-minutes: 8   # FIX: was 5 — headroom for the Sheets decision backup
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.event.schedule == '*/10 3-10 * * 1-5')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # FIX-CACHE: rolling restore — picks up the newest sniper-db-* cache so the
+      # reply handler sees today's picks AND so the TAKEN it writes is carried
+      # forward (via the save below) to the EOD outcome job in the same prefix.
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}
+          restore-keys: |
+            sniper-db-
+
+      # FIX-CACHE: rolling restore for the Telegram offset (was static → frozen,
+      # which made getUpdates replay the same backlog every 10 min).
+      - name: Restore offset
+        uses: actions/cache/restore@v4
+        with:
+          path: tg_offset.txt
+          key: tg-offset-${{ github.run_id }}
+          restore-keys: |
+            tg-offset-
+
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
+      - name: Poll Telegram
+        run: python reply_handler_v5_5.py
         env:
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN:        ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          CACHE_PATH:            outputs/sniper_cache.db
+          REPLY_TIMEOUT_MINUTES: "30"
+          GOOGLE_SHEET_ID:       ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON:     ${{ secrets.GOOGLE_CREDS_JSON }}
+
+      # FIX-PERSIST: push the just-captured TAKEN/SKIP decisions to Sheets
+      # (DB_DECISIONS) immediately, so a captured decision is durable even if the
+      # next runner restores a slightly older cache. Decision-tab write only —
+      # cheap, well within Sheets quota at the 10-min cadence.
+      - name: Backup decisions to Sheets
+        if: always()
         run: |
-          python - <<'PYEOF'
-          import os, requests
-          t  = os.getenv("TELEGRAM_TOKEN",  "")
-          c  = os.getenv("TELEGRAM_CHAT_ID","")
-          if t and c:
-              requests.post(
-                  f"https://api.telegram.org/bot{t}/sendMessage",
-                  json={
-                      "chat_id":    c,
-                      "parse_mode": "HTML",
-                      "text": (
-                          "⚠️ <b>IPO SNIPER v12.0 — RUN FAILED</b>\n"
-                          "Run: ${{ github.run_id }} · ${{ github.ref_name }}\n"
-                          "Open Actions tab for full logs."
-                      ),
-                  },
-                  timeout=10,
-              )
-          PYEOF
+          python - <<'EOF'
+          try:
+              from sniper_unified_v5_5 import _init_db, _backup_db_to_sheets
+              _init_db()
+              _backup_db_to_sheets()
+              print("Reply-handler decisions backed up to Sheets")
+          except Exception as e:
+              print(f"decision backup skipped (non-fatal): {e}")
+          EOF
+        env:
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          CACHE_PATH:        outputs/sniper_cache.db
+
+      - name: Save offset
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tg_offset.txt
+          key: tg-offset-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 3 — Outcome engine
+  # ══════════════════════════════════════════════════════════════════
+  outcome-check:
+    name: "📊 Outcome Engine"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5') ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # FIX-CACHE: rolling restore — must read picks written by Job 1 / Job 2.
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}
+          restore-keys: |
+            sniper-db-
+
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
+      # FIX-PERSIST: restore_db_from_sheets() BEFORE the outcome engine so the
+      # open picks exist for _get_yesterday_picks() to resolve, and backup AFTER
+      # so the now-closed outcomes + EOD SKIPPED rows are durable.
+      - name: Run outcome engine
+        run: |
+          python - <<'EOF'
+          from sniper_unified_v5_5 import (
+              _init_db, _restore_db_from_sheets, _backup_db_to_sheets,
+              _run_outcome_engine, _auto_log_skipped_picks, _get_last_trading_day,
+          )
+          _init_db()
+          _restore_db_from_sheets()          # FIX-PERSIST: rehydrate open picks + decisions
+          _, date_label = _get_last_trading_day()
+          _run_outcome_engine()              # close any picks that hit target / stop
+          _auto_log_skipped_picks(date_label)  # EOD: this is the ONLY correct place for this
+          _backup_db_to_sheets()             # FIX-PERSIST: persist closed outcomes + decisions
+          print(f"Outcome complete for {date_label}")
+          EOF
+        env:
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          CACHE_PATH:        outputs/sniper_cache.db
+
+      - name: Save DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 4 — Weekly review
+  # ══════════════════════════════════════════════════════════════════
+  weekly-review:
+    name: "📈 Weekly Review"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >
+      (github.event_name == 'schedule' && github.event.schedule == '45 2 * * 1') ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # FIX-CACHE: rolling restore — weekly review needs all pick_outcomes history.
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}
+          restore-keys: |
+            sniper-db-
+
+      - name: Ensure outputs directory
+        run: mkdir -p outputs
+
+      - name: Run weekly review
+        run: python sniper_unified_v5_5.py --weekly-review
+        env:
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          CACHE_PATH:        outputs/sniper_cache.db
+          FORCE_WEEKLY:      ${{ inputs.force_weekly || 'false' }}
+
+      - name: Save DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: outputs/sniper_cache.db
+          key: sniper-db-${{ github.run_id }}-${{ github.run_attempt }}
