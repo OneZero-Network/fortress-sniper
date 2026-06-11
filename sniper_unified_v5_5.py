@@ -759,6 +759,9 @@ CONV_RS_MIN_PCT       = float(os.getenv("CONV_RS_MIN_PCT", "70"))     # RS-leade
 CONV_EDGE_STEP        = float(os.getenv("CONV_EDGE_STEP", "0.15"))    # +15% conviction per extra edge
 CONV_EDGE_CAP         = float(os.getenv("CONV_EDGE_CAP", "1.60"))     # max confluence multiplier
 CONV_REQUIRE_CATALYST = os.getenv("CONV_REQUIRE_CATALYST","true").lower() in ("1","true","yes")
+# Option-C RS catalyst fallback: rs_pct >= this floor substitutes for a missing news catalyst.
+# Top-grade setups with extreme momentum keep their grade even when has_catalyst is False.
+CONV_RS_CATALYST_FLOOR = float(os.getenv("CONV_RS_CATALYST_FLOOR", "85"))
 # Grade-aligned lane gates used ONLY when CONVICTION_RERANK is on (pearls-or-nothing).
 # Fortress is scored out of 200 → 120 == the 60% GOOD line. APEX/FUSED are 0-100.
 CONV_LANE_FORTRESS_MIN = int(os.getenv("CONV_LANE_FORTRESS_MIN", "120"))
@@ -8571,9 +8574,21 @@ def _select_lane_winner(lane_results, halal_map, alpha_mine_map, lane_name,
         if CONVICTION_RERANK:
             if (CONV_REQUIRE_CATALYST and r.get("grade") in ("APEX", "PRISTINE")
                     and not r.get("has_catalyst", False)):
-                r["grade"] = "GOOD"
-                r["story"] = (r.get("story", "") +
-                              " | ⚠️ grade capped GOOD — RS/technical only, no fundamental catalyst")
+                # Option-C: extreme relative strength (rs_pct >= CONV_RS_CATALYST_FLOOR)
+                # is a valid catalyst substitute — momentum IS the catalyst when
+                # the news feed is silent. Only downgrade if RS is also absent.
+                rs_pct_val = r.get("rs_pct", 0.0)
+                if rs_pct_val >= CONV_RS_CATALYST_FLOOR:
+                    r["story"] = (r.get("story", "") +
+                                  f" | ✅ RS{rs_pct_val:.0f}pct substitutes catalyst"
+                                  f" (threshold={CONV_RS_CATALYST_FLOOR:.0f})")
+                    log.info(f"  Option-C catalyst sub: {sym} rs_pct={rs_pct_val:.0f} >= "
+                             f"{CONV_RS_CATALYST_FLOOR:.0f} — grade {r['grade']} retained")
+                else:
+                    r["grade"] = "GOOD"
+                    r["story"] = (r.get("story", "") +
+                                  f" | ⚠️ grade capped GOOD — no catalyst, RS{rs_pct_val:.0f}pct"
+                                  f" < floor {CONV_RS_CATALYST_FLOOR:.0f}")
             r["story"] = (r.get("story", "") +
                           f" | 🎯 conv={r.get('conviction', 0):.0f} "
                           f"edges={'+'.join(r.get('edges', [])) or '—'} "
