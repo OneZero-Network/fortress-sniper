@@ -582,6 +582,72 @@ def _log_decision(con: sqlite3.Connection, symbol: str, decision: str,
         meta_prob, None
     ))
     log.info(f"✅ Decision logged: {symbol} → {decision} | ₹{entry_price or '—'} | shares={shares} | reason={skip_reason or '—'}")
+    # Bug-1 Race Condition Fix: write to Sheets immediately so the EOD outcome
+    # engine reads from Sheets (durable) rather than the volatile SQLite cache.
+    _write_decision_to_sheets(
+        run_date=today, symbol=symbol, decision=decision,
+        entry_price=entry_price, shares=shares or 0,
+        skip_reason=skip_reason, ai_confidence=meta_prob,
+    )
+
+
+# ── Direct-to-Sheets decision writer (Bug-1 Race Condition Fix) ───────────────
+# Race condition: concurrent GHA runners mean the reply-handler's SQLite TAKEN
+# write can be overwritten by the main sniper job's cache save before the EOD
+# outcome engine reads it. Fix: write the decision to DB_DECISIONS in Google
+# Sheets IMMEDIATELY at the moment TAKEN/SKIP is received — the outcome engine
+# reads Sheets as its source of truth, bypassing the volatile cache entirely.
+_DB_DECISIONS_HEADER = [
+    "run_date","symbol","decision","entry_price","shares_taken",
+    "skip_reason","ai_confidence","worth_flag","logged_at"
+]
+
+def _write_decision_to_sheets(run_date: str, symbol: str, decision: str,
+                               entry_price=None, shares: int = 0,
+                               skip_reason: str = None,
+                               ai_confidence=None) -> None:
+    """Append one decision row to DB_DECISIONS Sheets tab immediately.
+    Non-fatal: if Sheets unavailable the decision stays in SQLite; the
+    outcome engine will pick it up via _restore_db_from_sheets() at EOD.
+    """
+    if not _GSPREAD_OK:
+        log.debug("_write_decision_to_sheets: gspread unavailable — SQLite only")
+        return
+    if not GOOGLE_CREDS_JSON or not SPREADSHEET_ID:
+        log.debug("_write_decision_to_sheets: Sheets creds not set — SQLite only")
+        return
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        creds_dict = _json.loads(GOOGLE_CREDS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = _GCreds.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        wb = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            ws = wb.worksheet("DB_DECISIONS")
+        except Exception:
+            ws = wb.add_worksheet(title="DB_DECISIONS", rows=1000, cols=len(_DB_DECISIONS_HEADER))
+            ws.append_row(_DB_DECISIONS_HEADER)
+        row = [
+            run_date,
+            symbol.upper(),
+            decision,
+            str(entry_price) if entry_price is not None else "",
+            str(shares) if shares else "0",
+            skip_reason or "",
+            str(ai_confidence) if ai_confidence is not None else "",
+            "",   # worth_flag — set by outcome engine
+            _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        log.info(f"✅ DB_DECISIONS Sheets: {symbol} → {decision} @ {run_date}")
+    except Exception as e:
+        log.warning(f"_write_decision_to_sheets non-fatal: {e}")
+
 
 # ── Main polling loop ───────────────────────────────────────────────────────
 def process_updates() -> None:
