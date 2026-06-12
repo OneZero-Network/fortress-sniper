@@ -74,7 +74,7 @@ log = logging.getLogger("fortress_v7")
 # SECTION 1 — CONFIGURATION & SECRETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "FORTRESS v8.0 — APEX PREDATOR (SAST+SECTOR_VELOCITY+MATERIALITY+PLEDGE_GATE)"
+VERSION = "FORTRESS v8.1 — APEX PREDATOR (SESSION_ARMOR+TARGETED_INTEL+SOFT_GATE+SAST+SECTOR+PLEDGE)"
 
 # ── FIX-C: Secret preflight check ────────────────────────────────────────────
 # Called once at run() start. Warns (not crashes) on missing secrets so the
@@ -844,32 +844,42 @@ _UA_POOL = [
      "Gecko/20100101 Firefox/125.0"),
 ]
 
-def _get_nse_session() -> requests.Session:
+def _get_nse_session():
     """
-    FIX-D: Returns a CF-validated NSE session (thread-safe, cached).
-    3-step handshake:
-      1. GET nseindia.com (homepage → CF cookie)
-      2. GET /api/allIndices (JSON API → CF session validation)
-      3. Returns session ready for archive requests
+    v8.1 PATCH 1: Session Armor Repair.
+    Uses curl_cffi Chrome TLS fingerprint when available (bypasses Akamai/Cloudflare).
+    Falls back to requests.Session() with UA rotation only if curl_cffi missing.
+    3-step handshake preserved: homepage → allIndices → ready.
     """
     global _NSE_SESSION_CACHE, _NSE_SESSION_TS
     with _NSE_SESSION_LOCK:
         now = time.time()
         if _NSE_SESSION_CACHE and (now - _NSE_SESSION_TS) < _NSE_SESSION_TTL:
             return _NSE_SESSION_CACHE
-        ua   = random.choice(_UA_POOL)
-        hdrs = {**_NSE_HEADERS, "User-Agent": ua}
-        sess = requests.Session()
+
+        # ── PATCH 1: Aligned variable name → forces curl_cffi path ──────────
+        if _CURL_CFFI_OK:
+            log.info("NSE session: Activating Chrome TLS fingerprint (curl_cffi) ✅")
+            sess = curl_requests.Session(impersonate="chrome110")
+            sess.headers.update(_NSE_HEADERS)
+        else:
+            log.warning("NSE session: curl_cffi unavailable — bare requests (may hit CF)")
+            ua   = random.choice(_UA_POOL)
+            sess = requests.Session()
+            sess.headers.update({**_NSE_HEADERS, "User-Agent": ua})
+
         try:
-            # Step 1: homepage
-            r1 = sess.get("https://www.nseindia.com", headers=hdrs, timeout=12)
+            # Step 1: homepage (establish CF cookie)
+            r1 = sess.get("https://www.nseindia.com",
+                          headers={**_NSE_HEADERS, "Accept": "text/html"},
+                          timeout=12)
             log.info(f"NSE session step1 (homepage): HTTP {r1.status_code} "
                      f"cookies={list(sess.cookies.keys())}")
             time.sleep(1.2)
-            # Step 2: validate session via allIndices API
+            # Step 2: validate via allIndices (CF session confirmation)
             r2 = sess.get(
                 "https://www.nseindia.com/api/allIndices",
-                headers={**hdrs,
+                headers={**_NSE_HEADERS,
                          "Accept": "application/json, text/plain, */*",
                          "X-Requested-With": "XMLHttpRequest",
                          "Referer": "https://www.nseindia.com/"},
@@ -881,7 +891,7 @@ def _get_nse_session() -> requests.Session:
             _NSE_SESSION_CACHE = sess
             _NSE_SESSION_TS    = now
         except Exception as e:
-            log.warning(f"NSE session handshake failed: {e} — using bare session")
+            log.warning(f"NSE session handshake failed: {e} — using partially-warmed session")
             _NSE_SESSION_CACHE = sess
             _NSE_SESSION_TS    = now
         return _NSE_SESSION_CACHE
@@ -1454,6 +1464,100 @@ def fetch_filings(days_back: int = 14) -> dict:
         log.debug(f"fetch_filings: {e}")
     return result
 
+# ══════════════════════════════════════════════════════════════════════════════
+# v8.1 PATCH 2 — LATE-STAGE TARGETED INTEL HEIST
+# Per-symbol precision pull replacing run-start global bulk dump.
+# Only fires for symbols that already cleared Fortress math gate.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_target_intel(symbol: str) -> tuple:
+    """
+    v8.1 PATCH 2: Late-stage precision intel heist for a single survivor symbol.
+
+    Called AFTER a stock clears Fortress/APEX math gates — not at run start.
+    Replaces the global bulk dump (fetch_insider_trades/fetch_filings) which
+    was hammering NSE for 2000 symbols before any filtering had occurred.
+
+    Returns: (insider_data: dict, filing_data: dict)
+      insider_data = {"count": int, "total_cr": float, "person": str}
+      filing_data  = {"score": int, "subject": str}
+
+    Degrades gracefully on any failure (returns neutral defaults).
+    """
+    sess = _get_nse_session()
+    insider_data: dict = {"count": 0, "total_cr": 0.0, "person": ""}
+    filing_data:  dict = {"score": 15, "subject": "None"}
+
+    # ── Precision insider / SAST pull ────────────────────────────────────────
+    try:
+        url = (f"https://www.nseindia.com/api/corporates-pit"
+               f"?index=equities&symbol={symbol}")
+        r = sess.get(url, timeout=10,
+                     headers={**_NSE_HEADERS,
+                              "Accept": "application/json, text/plain, */*",
+                              "X-Requested-With": "XMLHttpRequest",
+                              "Referer": "https://www.nseindia.com/"})
+        if r.status_code == 200:
+            cutoff   = (datetime.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+            total_cr = 0.0
+            count    = 0
+            person   = ""
+            for d in r.json().get("data", []):
+                dt = str(d.get("tdpTransactionDate", ""))[:10]
+                if dt < cutoff:
+                    continue
+                txn = str(d.get("tdpTransactionType", "")).upper()
+                if "BUY" not in txn and "ACQUIRE" not in txn:
+                    continue
+                qty    = float(d.get("secAcq", 0) or 0)
+                price  = float(d.get("tdpAcqPrice", 0) or 0)
+                val_cr = qty * price / 1e7
+                total_cr += val_cr
+                count    += 1
+                if not person:
+                    person = str(d.get("acqName", "") or d.get("personName", ""))[:40]
+            if count > 0:
+                insider_data = {"count": count,
+                                "total_cr": round(total_cr, 2),
+                                "person": person}
+                log.debug(f"TargetIntel {symbol}: insider {count} txn ₹{total_cr:.1f}Cr")
+    except Exception as e:
+        log.debug(f"fetch_target_intel insider {symbol}: {e}")
+
+    # ── Precision announcement/filing pull ───────────────────────────────────
+    try:
+        url = (f"https://www.nseindia.com/api/corp-info"
+               f"?symbol={symbol}&corpType=announcements&market=capital")
+        r = sess.get(url, timeout=10,
+                     headers={**_NSE_HEADERS,
+                              "Accept": "application/json, text/plain, */*",
+                              "X-Requested-With": "XMLHttpRequest",
+                              "Referer": f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"})
+        if r.status_code == 200:
+            items = r.json()
+            items = items if isinstance(items, list) else items.get("data", [])
+            score = 15
+            subj  = "None"
+            for item in items[:5]:
+                subj_raw = str(item.get("subject", "") or item.get("desc", ""))
+                if not subj_raw:
+                    continue
+                sl = subj_raw.lower()
+                for w in ["profit", "order", "win", "contract", "growth",
+                          "capex", "expansion", "buyback", "dividend"]:
+                    if w in sl: score += 5
+                for w in ["loss", "downgrade", "fraud", "strike", "penalty", "default"]:
+                    if w in sl: score -= 8
+                if subj == "None":
+                    subj = subj_raw[:100]
+            filing_data = {"score": score, "subject": subj}
+            log.debug(f"TargetIntel {symbol}: filing score={score}")
+    except Exception as e:
+        log.debug(f"fetch_target_intel filing {symbol}: {e}")
+
+    return insider_data, filing_data
+
+
 # ── PATCH-4: Percentage-tick VPOC helper ─────────────────────────────────
 def _vpoc_pct_tick(tp: np.ndarray, vols: np.ndarray,
                    tick_pct: float = 0.005) -> float:
@@ -1844,36 +1948,53 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
 def _check_uptrend_gate(close: float, ind: dict) -> Tuple[bool, str]:
     """
-    Hard uptrend gate: Price > 50MA > 200MA.
+    v8.1 PATCH 3: Softened Accumulation Gate.
 
-    Rationale: A downtrending stock exhibits identical ATR contraction and
-    volume dry-up as a genuine VCP — it has simply been abandoned.  Without
-    this gate the scoring engine awards full VCP/VDU points to stocks whose
-    chart looks like a falling knife, labelling them 'GOOD' or 'PROBE'.
+    PROBLEM: The v7 hard gate (Price > 50MA > 200MA) was killing valid early-stage
+    compression bases that form BELOW a flat or slightly-declining 200MA.
+    A stock in week 3 of a VCP base naturally sits below the 200MA before the
+    breakout lift. The old gate gave these a score of 12/200 and rejected them.
 
-    Returns (passed: bool, reason: str).
-    200MA check uses a UPTREND_MA_SLACK tolerance (default 3%) when fewer
-    than 200 bars are available (ma200 == 0.0 from compute_indicators).
+    FIX: Decouple VCP/VDU scoring from the 200MA constraint.
+    Gate now has two tiers:
+
+      FULL_UPTREND  (Price > 50MA AND 50MA > 200MA):
+        → All VCP/VDU points awarded at full weight.
+        → story tag: "uptrend ✅"
+
+      BASE_FORMING  (Price > 50MA, but 50MA ≤ 200MA or 200MA unknown):
+        → VCP/VDU points awarded at HALF weight (base may still be valid).
+        → story tag: "base_forming ✅"
+        → Does NOT return False — passes through for scoring.
+
+      DOWNTREND     (Price ≤ 50MA):
+        → Hard reject. A stock below its 50MA has no business in a breakout scanner.
+
+    Returns:
+      (uptrend_ok: bool, reason: str)
+      uptrend_ok = True  for FULL_UPTREND and BASE_FORMING (both pass)
+      uptrend_ok = False only for DOWNTREND
+      reason carries the tier tag so fortress_score can adjust VCP weight.
     """
     ma50  = ind.get("ma50",  0.0)
     ma200 = ind.get("ma200", 0.0)
 
     if ma50 <= 0:
-        return False, f"ma50 unavailable (close={close:.0f})"
+        # Not enough bars to compute 50MA — allow through, mark as uncertain
+        return True, "base_forming ✅ (ma50 unavailable)"
 
     if close <= ma50:
-        return False, f"price ₹{close:.0f} ≤ 50MA ₹{ma50:.0f} — downtrend"
+        return False, f"price ₹{close:.0f} ≤ 50MA ₹{ma50:.0f} — downtrend ❌"
 
-    if ma200 > 0:
-        # Full gate: 50MA must be ≥ 200MA (allow tiny slack for transition)
-        if ma50 < ma200 * (1 - UPTREND_MA_SLACK):
-            return False, (f"50MA ₹{ma50:.0f} < 200MA ₹{ma200:.0f} — "
-                           f"ma50/ma200={ma50/ma200:.3f} (need ≥{1-UPTREND_MA_SLACK:.3f})")
+    # Price is above 50MA — check 200MA for tier classification
+    if ma200 > 0 and ma50 >= ma200 * (1.0 - UPTREND_MA_SLACK):
+        # Full uptrend: 50MA is at or above 200MA (within slack)
+        return True, "uptrend ✅"
     else:
-        # <200 bars: enforce price > 50MA only (already checked above)
-        pass
-
-    return True, "uptrend ✅"
+        # Base-forming: price > 50MA but 50MA still below 200MA (or no 200MA data)
+        # Valid for early-stage accumulation — VCP points will be halved in fortress_score
+        tier = f"50MA ₹{ma50:.0f} below 200MA ₹{ma200:.0f}" if ma200 > 0 else "< 200 bars"
+        return True, f"base_forming ✅ ({tier})"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 12 — v7.0: CONFIDENCE SCORE (Statistical Variance Layer)
@@ -1971,11 +2092,16 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
     fort_pts   = 0
     story_parts = []
 
-    # ── UPTREND GATE (v7.0) ──────────────────────────────────────────────────
+    # ── UPTREND GATE (v8.1 softened) ─────────────────────────────────────────
     uptrend_ok, uptrend_reason = _check_uptrend_gate(close, ind)
-    if uptrend_ok:
+    # Tier detection: base_forming gets half VCP/VDU weight
+    is_base_forming = uptrend_ok and "base_forming" in uptrend_reason
+    is_full_uptrend = uptrend_ok and not is_base_forming
+    if is_full_uptrend:
         story_parts.append("uptrend ✅")
-    # VCP and VDU only fire if uptrend is confirmed (logged below)
+    elif is_base_forming:
+        story_parts.append("base_forming ✅")
+    # Only hard downtrend (uptrend_ok=False) blocks VCP/VDU entirely
 
     # 1. 52-Week compression + proximity
     hi52 = ind["hi52"]; lo52 = ind["lo52"]
@@ -1991,7 +2117,7 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
         if w52 >= 12:
             story_parts.append(f"52W compression: {pct_from_h:.1f}% from high")
 
-    # 2. VCP coil — REQUIRES UPTREND GATE ────────────────────────────────────
+    # 2. VCP coil — fires for uptrend AND base_forming (half weight for base) ─
     # PATCH-1: ratio = natr14 / natr100  (% vol / % vol — momentum-proof)
     vcp_score = 0
     if uptrend_ok and natr14 > 0 and natr100 > 0:
@@ -1999,8 +2125,12 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
         if ratio < 0.60:   vcp_score = 20
         elif ratio < 0.70: vcp_score = 14
         elif ratio < 0.80: vcp_score = 8
+        # PATCH 3: base_forming gets 50% weight (accumulation not yet confirmed)
+        if is_base_forming:
+            vcp_score = vcp_score // 2
         if vcp_score:
-            story_parts.append(f"VCP coil NATR={ratio:.2f}")
+            tag = "base" if is_base_forming else "VCP"
+            story_parts.append(f"{tag} coil NATR={ratio:.2f}")
     elif not uptrend_ok:
         log.debug(f"VCP gate FAIL {sym}: {uptrend_reason}")
     fort_pts += vcp_score
@@ -2015,7 +2145,7 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
         elif ind["atr7"] < ind["atr50"]: atrv = 2
     fort_pts += atrv
 
-    # 4. Volume dry-up (VDU) — REQUIRES UPTREND GATE ─────────────────────────
+    # 4. Volume dry-up (VDU) — fires for uptrend AND base_forming ─────────────
     vdu_score = 0
     if uptrend_ok and not hist.empty and len(hist) >= 20:
         recent_vol = float(hist["volume"].tail(5).mean())
@@ -2025,6 +2155,9 @@ def fortress_score(symbol: str, today_row: dict, hist: pd.DataFrame,
             if vdu_r < 0.40:   vdu_score = 15
             elif vdu_r < 0.60: vdu_score = 10
             elif vdu_r < 0.80: vdu_score = 5
+            # PATCH 3: base_forming half-weight
+            if is_base_forming:
+                vdu_score = vdu_score // 2
     fort_pts += vdu_score
 
     # 5. FII/DII
@@ -2186,9 +2319,12 @@ def apex_composite(symbol: str, fortress: dict, hist: pd.DataFrame,
     natr14_a = fortress.get("natr14", (atr14 / close * 100) if close > 0 else 5)
     vcp_pct  = natr14_a * 100  # convert to %, e.g. 0.018 → 1.8%
     vcp_s = 15 if vcp_pct < 1.5 else (10 if vcp_pct < 2.5 else (5 if vcp_pct < 4 else 0))
-    # v7.0: VCP score only counts if uptrend gate passed
+    # v8.1: uptrend = full, base_forming = half, downtrend = 0
+    uptrend_reason = fortress.get("uptrend_reason", "")
     if not fortress.get("uptrend_ok", True):
-        vcp_s = 0
+        vcp_s = 0      # downtrend — no VCP credit
+    elif "base_forming" in uptrend_reason:
+        vcp_s = vcp_s // 2   # accumulation tier — half credit
     scores.append(("vcp", vcp_s, 15))
 
     # 6. VPOC support
@@ -2912,9 +3048,21 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         # Phase 3: EOD order flow
         order_flow = compute_eod_order_flow(sym, row, hist)
 
+        # ── v8.1 PATCH 2: Late-stage targeted intel (runs AFTER history/flow) ─
+        # Replaces run-start global dump. Only called for math-gate survivors.
+        # Use passed-in maps as base; override with fresh precision data.
+        target_insider, target_filing = fetch_target_intel(sym)
+        # Merge: fresh precision data wins over stale global dump
+        live_insider_map = dict(insider_map)
+        live_filings     = dict(filings)
+        if target_insider.get("count", 0) > 0:
+            live_insider_map[sym] = target_insider
+        if target_filing.get("subject", "None") != "None":
+            live_filings[sym] = target_filing
+
         # Fortress scoring
-        fort = fortress_score(sym, row, hist, fii_data, insider_map,
-                              filings, macro, order_flow)
+        fort = fortress_score(sym, row, hist, fii_data, live_insider_map,
+                              live_filings, macro, order_flow)
         fp = fort.get("fort_pts", 0) if fort else 0
         if not fort or fp < 45:  # v7.5: adjusted for lean scoring (60pts VPOC block removed in v7)
             ma50  = fort.get("ma50",  0) if fort else 0
@@ -3011,8 +3159,8 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         has_catalyst = False
         if ALT_DATA_ENABLED and _OPENAI_OK:
             try:
-                fil      = filings.get(sym, {})
-                ins      = insider_map.get(sym, {})
+                fil      = live_filings.get(sym, {})
+                ins      = live_insider_map.get(sym, {})
                 tenders  = _scrape_cpp_tenders(sym)
                 exports  = _scrape_zauba_exports(sym)
                 alt_text = _build_alt_data_text(sym, tenders, exports,
@@ -3039,7 +3187,7 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
 
         # LLM narrative
         llm = llm_enrich_pick(sym, fort, apex_d, bayes_p, macro,
-                              fii_data, insider_map, filings, alt_match)
+                              fii_data, live_insider_map, live_filings, alt_match)
 
         # Grade
         if fused >= 80:   grade = "APEX"
@@ -3510,15 +3658,14 @@ def run_weekly_review(force: bool = False):
 def run():
     log.info(f"{'='*70}")
     log.info(f"  {VERSION}")
-    log.info(f"  FIX-A NSE retry+curl | FIX-B sentinel | FIX-C preflight")
-    log.info(f"  PATCH-1 NATR | PATCH-2 DynNIFTY50 | PATCH-3 MFI-Catalyst | PATCH-4 PctVPOC")
     log.info(f"  v8.0: SAST Real-Whale | Sector-Velocity | Materiality-Filter | Pledge-Gate")
-    log.info(f"  curl_cffi: {'AVAILABLE' if _CURL_CFFI_OK else 'NOT INSTALLED (pip install curl_cffi)'}")
-    log.info(f"  Uptrend Gate: ON | Confidence Min: {CONFIDENCE_MIN} | "
-             f"Std Max: {CONFIDENCE_STD_MAX}")
+    log.info(f"  v8.1: Session-Armor-Fix | Targeted-Intel-Heist | Soft-Accumulation-Gate")
+    log.info(f"  curl_cffi: {'ACTIVE — Chrome TLS fingerprint ON' if _CURL_CFFI_OK else 'NOT INSTALLED (pip install curl_cffi) — CF bypass DISABLED'}")
+    log.info(f"  Uptrend Gate: SOFTENED (full=100% VCP, base_forming=50% VCP, downtrend=0%)")
+    log.info(f"  Confidence Min: {CONFIDENCE_MIN} | Std Max: {CONFIDENCE_STD_MAX}")
     log.info(f"  Pledge Gate: {'ON' if PLEDGE_GATE_ENABLED else 'OFF'} > {PLEDGE_GATE_MAX_PCT:.0f}% → SKIP")
     log.info(f"  Sector Velocity: {'ON' if SECTOR_VELOCITY_ENABLED else 'OFF'} "
-             f"penalty={SECTOR_VELOCITY_PENALTY:.0f}pts when sector bleeding")
+             f"penalty={SECTOR_VELOCITY_PENALTY:.0f}pts when bleeding")
     log.info(f"{'='*70}")
 
     _init_db()
