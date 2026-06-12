@@ -1,7 +1,7 @@
-name: "FORTRESS SNIPER v6.0 EOD QUANTUM"
+name: "FORTRESS SNIPER .0 EOD QUANTUM"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v6.0 SCHEDULE — ZERO INFRASTRUCTURE STACK
+# .0 SCHEDULE — ZERO INFRASTRUCTURE STACK
 #
 #   Job 1: EOD Screener    — 3:00 AM UTC (8:30 AM IST open)
 #   Job 2: Reply Handler   — every 10 min during market hours
@@ -108,7 +108,7 @@ jobs:
   # JOB 1 — EOD Screener (main scoring pipeline)
   # ══════════════════════════════════════════════════════════════════════════
   sniper-run:
-    name: "⚔️ Fortress v6.0 EOD Screener"
+    name: "⚔️ Fortress v7 Screener"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: >
@@ -125,8 +125,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-v6-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-v6-${{ runner.os }}-
+          key: pip--${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-v7-${{ runner.os }}-
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -140,19 +140,19 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}
+          key: sniper-db-v7-${{ github.run_id }}
           restore-keys: |
-            sniper-db-v6-
+            sniper-db-v7-
 
       - name: Ensure outputs directory
         run: mkdir -p outputs
 
-      - name: Run Fortress v6.0 EOD Screener
+      - name: Run Fortress v7.0 Screener
         run: |
           if [ "${{ inputs.outcome_only }}" = "true" ]; then
-            python sniper_v6_eod.py --outcome-only
+            python sniper_v7.py --outcome-only
           else
-            python sniper_v6_eod.py
+            python sniper_v7.py
           fi
         env:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
@@ -170,13 +170,13 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db-v7-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fortress-v6-${{ github.run_id }}
+          name: fortress-v7-${{ github.run_id }}
           path: outputs/
           retention-days: 14
 
@@ -201,8 +201,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-v6-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-v6-${{ runner.os }}-
+          key: pip-v7-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-v7-${{ runner.os }}-
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -211,9 +211,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}
+          key: sniper-db-v7-${{ github.run_id }}
           restore-keys: |
-            sniper-db-v6-
+            sniper-db-v7-
 
       # Telegram offset — rolling restore so getUpdates never replays stale backlog
       - name: Restore Telegram offset
@@ -249,7 +249,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db-v7-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ══════════════════════════════════════════════════════════════════════════
   # JOB 3 — Outcome Engine (EOD resolution, auto-SKIPPED, performance tab)
@@ -272,8 +272,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-v6-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-v6-${{ runner.os }}-
+          key: pip-v7-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-v7-${{ runner.os }}-
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -282,9 +282,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}
+          key: sniper-db-v7-${{ github.run_id }}
           restore-keys: |
-            sniper-db-v6-
+            sniper-db-v7-
 
       - name: Ensure outputs directory
         run: mkdir -p outputs
@@ -292,7 +292,7 @@ jobs:
       - name: Run outcome engine + auto-SKIPPED + performance tab
         run: |
           python - <<'EOF'
-          from sniper_v6_eod import (
+          from sniper_v7 import (
               _init_db, _get_last_trading_day,
               run_outcome_engine, auto_log_skipped_picks,
               push_performance_to_sheets
@@ -317,7 +317,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db--${{ github.run_id }}-${{ github.run_attempt }}
 
   # ══════════════════════════════════════════════════════════════════════════
   # JOB 4 — Weekly Review (OpenAI gpt-4o-mini narrative, Monday)
@@ -340,8 +340,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-v6-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: pip-v6-${{ runner.os }}-
+          key: pip--${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip--${{ runner.os }}-
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -350,15 +350,15 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}
+          key: sniper-db--${{ github.run_id }}
           restore-keys: |
-            sniper-db-v6-
+            sniper-db--
 
       - name: Ensure outputs directory
         run: mkdir -p outputs
 
       - name: Run weekly review
-        run: python sniper_v6_eod.py --weekly-review
+        run: python sniper_v7.py --weekly-review
         env:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
@@ -373,4 +373,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: outputs/sniper_cache.db
-          key: sniper-db-v6-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sniper-db--${{ github.run_id }}-${{ github.run_attempt }}
