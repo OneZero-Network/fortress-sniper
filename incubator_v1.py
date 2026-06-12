@@ -59,7 +59,7 @@ log = logging.getLogger("incubator_v1")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v3.0 STONE HUNTER (price-before-slice + yf-eps + 6pct-slope)"
+VERSION = "INCUBATOR v5.0 STONE HUNTER (2-stage: math-sweep → sharia-audit → concall)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -264,35 +264,112 @@ def _call_openai(prompt: str, max_tokens: int = 400) -> Optional[str]:
 # SECTION 5 — HALAL SCREEN (L1 keyword only — L2-L4 from sector map)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_HARAM_KW = {"bank","banking","finance","financial","insurance","nbfc","mortgage",
-             "alcohol","brewery","beer","liquor","tobacco","cigarette","casino",
-             "gambling","lottery","weapons","defence prod","arms","ammunition"}
+# PATCH 1: Strict halal check — live Google Sheets HALAL_LIST + ticker keyword guard
+# Replaces the hardcoded 40-stock sector map that let IIFL/GICRE/EDELWEISS through.
 
-_SECTOR_MAP: Dict[str, str] = {
-    "TCS":"IT","INFY":"IT","WIPRO":"IT","HCLTECH":"IT","TECHM":"IT",
-    "SUNPHARMA":"PHARMA","DRREDDY":"PHARMA","CIPLA":"PHARMA","DIVISLAB":"PHARMA",
-    "HINDUNILVR":"FMCG","ITC":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG",
-    "RELIANCE":"ENERGY","ONGC":"ENERGY","BPCL":"ENERGY","NTPC":"ENERGY",
-    "HDFCBANK":"BANK","ICICIBANK":"BANK","SBIN":"BANK","KOTAKBANK":"BANK",
-    "AXISBANK":"BANK","BAJFINANCE":"FINANCE","BAJAJFINSV":"FINANCE",
-    "JSWSTEEL":"METAL","TATASTEEL":"METAL","HINDZINC":"METAL","VEDL":"METAL",
-    "MARUTI":"AUTO","TATAMOTORS":"AUTO","M&M":"AUTO","MOTHERSON":"AUTO",
-    "LT":"INFRA","NBCC":"INFRA","NCC":"INFRA","CONCOR":"INFRA",
-    "DEEPAKNTR":"CHEMICALS","PIIND":"CHEMICALS","CHAMBLFERT":"CHEMICALS",
-    "COROMANDEL":"CHEMICALS","GNFC":"CHEMICALS","TATACHEM":"CHEMICALS",
-}
-_HARAM_SECTORS = {"BANK","FINANCE"}
+_HARAM_TICKER_KW = {"BANK", "FINANCE", "INSURE", "CAPITAL", "CREDIT",
+                    "NBFC", "ALCOHOL", "BREWERY", "TOBACCO", "CASINO", "GAMBLING"}
+
+_HARAM_TERMS = ["BANK", "FINANC", "INSURANCE", "ALCOHOL", "BREWERY",
+                "DEFENCE", "GAMBLING", "PORK", "CIGARETTE", "TOBACCO"]
+
+# Cache HALAL_LIST per run to avoid a Sheets call per stock
+_HALAL_LIST_CACHE: Optional[list] = None
+_HALAL_CACHE_TS: float = 0.0
+
+def _get_halal_list() -> list:
+    """Return HALAL_LIST rows, cached for the run (refreshes every 30 min)."""
+    global _HALAL_LIST_CACHE, _HALAL_CACHE_TS
+    now = time.time()
+    if _HALAL_LIST_CACHE is not None and (now - _HALAL_CACHE_TS) < 1800:
+        return _HALAL_LIST_CACHE
+    rows = _read_sheet("HALAL_LIST")
+    _HALAL_LIST_CACHE = rows or []
+    _HALAL_CACHE_TS   = now
+    log.info(f"HALAL_LIST loaded: {len(_HALAL_LIST_CACHE)} rows")
+    return _HALAL_LIST_CACHE
 
 def halal_ok(symbol: str) -> bool:
+    """
+    Strict Sharia screen inherited from sniper_v7 architecture.
+    Layer 1: Reject if ticker itself contains haram keywords (BANK, FINANCE, etc.)
+    Layer 2: Live check against HALAL_LIST Google Sheet.
+             If sheet is down → fail-safe: reject everything (buy nothing).
+    """
     sym = symbol.upper()
-    sl  = sym.lower()
-    for kw in _HARAM_KW:
-        if kw in sl:
+
+    # Layer 1: Ticker keyword hard-fail
+    for kw in _HARAM_TICKER_KW:
+        if kw in sym:
+            log.debug(f"Halal FAIL (ticker kw '{kw}'): {sym}")
             return False
-    sector = _SECTOR_MAP.get(sym, "DIVERSIFIED")
-    if sector in _HARAM_SECTORS:
-        return False
-    return True
+
+    # Layer 2: Live Google Sheets check
+    raw_halal = _get_halal_list()
+    if not raw_halal or len(raw_halal) < 2:
+        log.warning(f"HALAL_LIST unavailable — fail-safe reject: {sym}")
+        return False   # DB down → buy nothing
+
+    for row in raw_halal[1:]:
+        if not row:
+            continue
+        if str(row[0]).strip().upper() == sym:
+            sector   = str(row[2]).strip().upper() if len(row) > 2 else ""
+            industry = str(row[3]).strip().upper() if len(row) > 3 else ""
+            if any(h in sector for h in _HARAM_TERMS) or any(h in industry for h in _HARAM_TERMS):
+                log.debug(f"Halal FAIL (sector/industry): {sym} | {sector} | {industry}")
+                return False
+            return True   # Found in sheet, sector clean
+
+    log.debug(f"Halal FAIL (not in HALAL_LIST): {sym}")
+    return False   # Not in approved list → reject
+
+def dynamic_shariah_audit(symbol: str) -> Tuple[bool, str]:
+    """
+    Late-stage Sharia audit — runs only on top 25 math survivors.
+    Layer 1: Hard ticker keyword veto (instant, free).
+    Layer 2: Targeted OpenAI query audits actual business model dynamically.
+             If OpenAI disabled → pass on local gates alone.
+    """
+    sym = symbol.upper().strip()
+
+    # Layer 1: Ticker keyword hard veto
+    for kw in ["BANK", "FINANCE", "INSURE", "CAPITAL", "CREDIT",
+               "INVEST", "MUTUAL", "HOLDING", "NBFC", "LEASING"]:
+        if kw in sym:
+            return False, f"L1: Haram ticker keyword '{kw}'"
+
+    if not _OPENAI_OK:
+        return True, "Passed local gates (AI disabled)"
+
+    # Layer 2: LLM dynamic business model audit
+    prompt = f"""You are an Islamic finance compliance auditor verifying a stock for an investment fund.
+Company Ticker: {sym} (Listed on National Stock Exchange of India)
+
+Task: Determine if this company's primary business model violates Shariah compliance principles.
+Prohibited sectors: Conventional Banking, Insurance, NBFCs, Financial Lending, Alcohol, Tobacco, Gambling, Pork, Non-Halal Entertainment, Defense/Weapons manufacturing.
+
+Respond strictly in this JSON format (no markdown, no other text):
+{{
+  "is_compliant": true,
+  "primary_business": "brief description of what they sell",
+  "reason": "if non-compliant, state exactly why, otherwise write NONE"
+}}"""
+
+    raw = _call_openai(prompt, max_tokens=150)
+    if raw:
+        try:
+            parsed = json.loads(re.sub(r"```json|```", "", raw).strip())
+            compliant = bool(parsed.get("is_compliant", False))
+            reason    = str(parsed.get("reason", "NONE"))
+            biz       = str(parsed.get("primary_business", "unknown"))
+            if not compliant:
+                return False, f"L2 AI Audit: {reason} ({biz})"
+            return True, f"Passed AI audit: {biz}"
+        except Exception as e:
+            log.debug(f"Shariah audit parse {sym}: {e}")
+
+    return True, "Passed fallback (AI parse error)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — BHAVCOPY (weekly — reads from Sheets BHAVCOPY tab first)
@@ -721,6 +798,12 @@ def check_eps_acceleration(symbol: str) -> Tuple[bool, dict]:
         details["reason"] = f"{metric} prior={val_prior:.2f} ≤ 0 (loss-making)"
         return False, details
 
+    # PATCH 2: Base-effect floor — prevents penny-stock 1000%+ hallucinations
+    # e.g. ₹0.02 → ₹0.23 = +1050% but company is making pennies
+    if val_prior < 1.0:
+        details["reason"] = f"{metric} prior={val_prior:.2f} too close to zero (Base Effect Flaw)"
+        return False, details
+
     growth_pct = (val_latest - val_prior) / abs(val_prior)
     details["eps_latest"]    = round(val_latest, 2)
     details["eps_prior"]     = round(val_prior,  2)
@@ -925,7 +1008,11 @@ def analyze_concall(symbol: str) -> dict:
 
     text = _fetch_concall_text(symbol)
     if not text or len(text) < 300:
-        result["summary"] = "No concall transcript found"
+        # PATCH 3: Admit failure — don't silently output False and mislead the scorer
+        result["summary"] = "DATA_MISSING: No concall transcript could be extracted."
+        result["capex_signal"]  = False
+        result["margin_signal"] = False
+        log.info(f"Concall {symbol}: DATA_MISSING — no transcript extracted")
         return result
 
     prompt = f"""You are a quantitative analyst reading an Indian company earnings call transcript.
@@ -970,127 +1057,55 @@ Rules:
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — STONE SCORER (composite 120 pts max)
+# SECTION 12 — MATH SCORER (pure quant — no Sharia, no LLM)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-#  Stage1 base score  : 0-50  (box quality + MA flatness)
-#  EPS acceleration   : 0-30  (growth magnitude)
-#  Sponge volume      : 0-35  (dry-up + sponge weeks)  [note: 35 not 30]
-#  Concall LLM        : 0-40  (capex +20, margin +20)
-#  Total max          : 155   (pick threshold: STONE_SCORE_MIN default 60)
+# Sharia audit and concall are late-stage operations in run() Stage 2.
+# This function only runs the three quantitative gates and returns a score.
 
-def score_stone(symbol: str, bhav_row: dict) -> Optional[dict]:
+def score_stone_math(symbol: str, bhav_row: dict) -> Optional[dict]:
     """
-    Full Stone pipeline. Returns result dict or None if fails any hard gate.
+    Pure mathematical Stone scorer — Weinstein + EPS + Sponge only.
+    Returns result dict or None if fails any hard gate.
+    Halal check and LLM concall are intentionally excluded (handled in Stage 2).
     """
     sym   = symbol.upper()
     close = float(bhav_row.get("close", 0))
 
-    if close <= 0:
-        return None
-
-    # Price filter for Stones (cheap pre-discovery stocks)
-    if close < MIN_PRICE or close > MAX_PRICE:
-        return None
-
-    # Halal
-    if not halal_ok(sym):
-        log.debug(f"Stone {sym}: halal veto")
+    if close <= 0 or close < MIN_PRICE or close > MAX_PRICE:
         return None
 
     # Weekly history
     weekly = fetch_weekly_history(sym, weeks=52)
     if weekly.empty or len(weekly) < 13:
-        log.info(f"  STONE_REJECT {sym:14s} | NO_WEEKLY_DATA bars={len(weekly)}")
+        log.info(f"  MATH_REJECT {sym:14s} | NO_WEEKLY_DATA bars={len(weekly)}")
         return None
-
-    total_score = 0
 
     # GATE 1: Stage 1 base
     g1_ok, g1 = check_stage1_base(sym, weekly, close)
     if not g1_ok:
-        log.info(f"  STONE_REJECT {sym:14s} | STAGE1_FAIL | {g1['reason']}")
+        log.info(f"  MATH_REJECT {sym:14s} | STAGE1_FAIL | {g1['reason']}")
         return None
-    total_score += g1.get("score", 0)
 
     # GATE 2: EPS acceleration
     g2_ok, g2 = check_eps_acceleration(sym)
     if not g2_ok:
-        log.info(f"  STONE_REJECT {sym:14s} | EPS_FAIL | {g2['reason']}")
+        log.info(f"  MATH_REJECT {sym:14s} | EPS_FAIL | {g2['reason']}")
         return None
-    total_score += g2.get("score", 0)
 
     # GATE 3: Sponge volume
     g3_ok, g3 = check_sponge_volume(weekly)
     if not g3_ok:
-        log.info(f"  STONE_REJECT {sym:14s} | SPONGE_FAIL | {g3['reason']}")
-        return None
-    total_score += g3.get("score", 0)
-
-    # Minimum score check before expensive LLM call
-    if total_score < STONE_SCORE_MIN * 0.5:
-        log.info(f"  STONE_REJECT {sym:14s} | PRE_LLM_LOW score={total_score}")
+        log.info(f"  MATH_REJECT {sym:14s} | SPONGE_FAIL | {g3['reason']}")
         return None
 
-    # LLM Concall (bonus — expensive, runs only on survivors)
-    concall = {"capex_signal": False, "margin_signal": False,
-               "summary": "", "score": 0}
-    if _OPENAI_OK:
-        try:
-            concall = analyze_concall(sym)
-            total_score += concall.get("score", 0)
-        except Exception as e:
-            log.debug(f"concall {sym}: {e}")
-
-    if total_score < STONE_SCORE_MIN:
-        log.info(f"  STONE_REJECT {sym:14s} | TOTAL_LOW score={total_score} < {STONE_SCORE_MIN}")
-        return None
-
-    # Build target: Stage 1 → Stage 2 breakout = breakout above box high
-    box_high    = float(weekly["high"].tail(g1.get("box_weeks", 12)).max())
-    target_6m   = round(box_high * 1.25, 2)   # 25% above box breakout
-    target_12m  = round(box_high * 1.60, 2)   # 60% above
-    stop_loss   = round(weekly["low"].tail(4).min() * 0.97, 2)   # 3% below 4-week low
-
-    log.info(f"  ✅ STONE {sym:14s} | score={total_score} | "
-             f"stage1={g1['box_weeks']}w | eps={g2.get('eps_growth_pct',0):+.0f}% | "
-             f"sponge={g3['sponge_weeks']}w | "
-             f"capex={concall['capex_signal']} margin={concall['margin_signal']}")
+    math_score = g1.get("score", 0) + g2.get("score", 0) + g3.get("score", 0)
 
     return {
-        "symbol":          sym,
-        "close":           close,
-        "total_score":     total_score,
-        # Stage 1
-        "stage":           g1.get("stage","STAGE1"),
-        "box_weeks":       g1.get("box_weeks", 0),
-        "box_width_pct":   g1.get("box_width_pct", 0),
-        "ma200_slope_pct": g1.get("ma200_slope_pct", 0),
-        "ma200":           g1.get("ma200", 0),
-        "stage1_score":    g1.get("score", 0),
-        # EPS
-        "eps_growth_pct":  g2.get("eps_growth_pct", 0),
-        "eps_latest":      g2.get("eps_latest", 0),
-        "eps_prior":       g2.get("eps_prior", 0),
-        "eps_metric":      g2.get("metric","EPS"),
-        "eps_score":       g2.get("score", 0),
-        # Sponge
-        "dry_up_weeks":    g3.get("dry_up_weeks", 0),
-        "sponge_weeks":    g3.get("sponge_weeks", 0),
-        "sponge_score":    g3.get("score", 0),
-        # Concall
-        "capex_signal":    concall.get("capex_signal", False),
-        "margin_signal":   concall.get("margin_signal", False),
-        "concall_summary": concall.get("summary","")[:120],
-        "concall_score":   concall.get("score", 0),
-        # Targets
-        "box_high":        round(box_high, 2),
-        "stop_loss":       stop_loss,
-        "target_25pct":    target_6m,
-        "target_60pct":    target_12m,
-        "upside_6m_pct":   round((target_6m  / close - 1) * 100, 1),
-        "upside_12m_pct":  round((target_12m / close - 1) * 100, 1),
-        "run_date":        datetime.today().strftime("%Y-%m-%d"),
+        "symbol":    sym,
+        "close":     close,
+        "math_score": math_score,
+        "weekly_df": weekly,
+        "g1": g1, "g2": g2, "g3": g3,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1187,8 +1202,8 @@ def push_stones_to_sheets(stones: List[dict], date_label: str):
 def run():
     log.info("=" * 70)
     log.info(f"  {VERSION}")
-    log.info(f"  Weinstein Stage1 | EPS ≥+{EPS_ACCEL_PCT_MIN*100:.0f}% | Sponge Vol | LLM Concall")
-    log.info(f"  Score gate: {STONE_SCORE_MIN}/120 | Top N: {TOP_N_STONES}")
+    log.info(f"  Stage1: Math sweep (Weinstein+EPS+Sponge) → Stage2: Sharia+Concall")
+    log.info(f"  Score gate: {STONE_SCORE_MIN} | Top N: {TOP_N_STONES}")
     log.info("=" * 70)
 
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1201,71 +1216,137 @@ def run():
     bhav = load_universe()
     if bhav.empty:
         log.error("Universe empty — abort")
-        _send_tg(f"❌ <b>INCUBATOR v1.0 — {date_label}</b>\nUniverse unavailable.")
+        _send_tg(f"❌ <b>INCUBATOR v5.0 — {date_label}</b>\nUniverse unavailable.")
         return []
     _write_sentinel("UNIVERSE_LOADED", {"ROWS": len(bhav)})
 
-    # Filter to Stone price range
-    cands = bhav[
-        (bhav["close"] >= MIN_PRICE) &
-        (bhav["close"] <= MAX_PRICE) &
-        (bhav["turnover_lakhs"] >= MIN_TURNOVER_LAKHS)
-    ].head(MAX_CANDIDATES).copy()
-    log.info(f"Candidates (price ₹{MIN_PRICE:.0f}-{MAX_PRICE:.0f}): {len(cands)}")
+    # Turnover gate (liquidity floor only — price already filtered in load_universe)
+    cands = bhav[bhav["turnover_lakhs"] >= MIN_TURNOVER_LAKHS].copy()
+    log.info(f"Candidates after turnover gate: {len(cands)}")
 
     if cands.empty:
-        _send_tg(f"📋 <b>INCUBATOR v1.0 — {date_label}</b>\nNo candidates in Stone price range.")
+        _send_tg(f"📋 <b>INCUBATOR v5.0 — {date_label}</b>\nNo candidates after turnover filter.")
         return []
 
-    # Score all candidates
-    stones: List[dict] = []
+    # ── STAGE 1: Pure Quantitative & Fundamental Sweep ───────────────────────
+    preliminary_stones: List[dict] = []
     total = len(cands)
+    log.info(f"Stage 1: Running math filters on {total} candidates...")
+
     for i, (_, row) in enumerate(cands.iterrows()):
-        sym = str(row.get("symbol","")).upper()
+        sym = str(row.get("symbol", "")).upper()
         if not sym:
             continue
-        if (i + 1) % 50 == 0:
-            log.info(f"Progress: {i+1}/{total} | stones found: {len(stones)}")
+        if (i + 1) % 100 == 0:
+            log.info(f"  Stage1 progress: {i+1}/{total} | survivors: {len(preliminary_stones)}")
         try:
-            result = score_stone(sym, row.to_dict())
-            if result:
-                stones.append(result)
+            result = score_stone_math(sym, row.to_dict())
+            if result and result["math_score"] >= 45:
+                preliminary_stones.append(result)
         except Exception as e:
-            log.debug(f"score_stone {sym}: {e}")
+            log.debug(f"Stage1 {sym}: {e}")
 
-    # Sort by score descending
+    # Sort by math score, keep top 25 for deep auditing
+    preliminary_stones.sort(key=lambda x: x["math_score"], reverse=True)
+    surv_candidates = preliminary_stones[:25]
+    log.info(f"Stage 1 complete. {len(surv_candidates)} survivors → entering Sharia audit.")
+    _write_sentinel("STAGE1_DONE", {"SCANNED": total, "SURVIVORS": len(surv_candidates)})
+
+    # ── STAGE 2: Sharia Audit + Concall Catalyst Extraction ──────────────────
+    stones: List[dict] = []
+    log.info(f"Stage 2: Sharia + Concall on {len(surv_candidates)} survivors...")
+
+    for item in surv_candidates:
+        sym = item["symbol"]
+        log.info(f"  Stage2: Auditing {sym} (math={item['math_score']})...")
+
+        # Multi-layer dynamic Sharia guard
+        is_compliant, sharia_reason = dynamic_shariah_audit(sym)
+        if not is_compliant:
+            log.info(f"    ❌ SHARIAH VETO | {sym} | {sharia_reason}")
+            continue
+
+        log.info(f"    ✅ Sharia OK | {sym} | {sharia_reason}")
+        total_score = item["math_score"]
+
+        # Concall analysis — only runs on confirmed halal survivors (~20 calls max)
+        concall = {"capex_signal": False, "margin_signal": False, "summary": "", "score": 0}
+        if _OPENAI_OK:
+            try:
+                concall = analyze_concall(sym)
+                total_score += concall.get("score", 0)
+            except Exception as e:
+                log.debug(f"Concall {sym}: {e}")
+
+        # Build targets
+        g1 = item["g1"]; g2 = item["g2"]; g3 = item["g3"]
+        weekly    = item["weekly_df"]
+        box_high  = float(weekly["high"].tail(g1.get("box_weeks", 12)).max())
+        target_6m = round(box_high * 1.25, 2)
+        target_12m = round(box_high * 1.60, 2)
+        stop_loss = round(weekly["low"].tail(4).min() * 0.97, 2)
+
+        log.info(f"    ✅ STONE {sym} | total={total_score} | "
+                 f"capex={concall['capex_signal']} margin={concall['margin_signal']}")
+
+        stones.append({
+            "symbol":          sym,
+            "close":           item["close"],
+            "total_score":     total_score,
+            "stage":           "STAGE1",
+            "box_weeks":       g1.get("box_weeks", 0),
+            "box_width_pct":   g1.get("box_width_pct", 0),
+            "ma200_slope_pct": g1.get("ma200_slope_pct", 0),
+            "ma200":           g1.get("ma200", 0),
+            "stage1_score":    g1.get("score", 0),
+            "eps_growth_pct":  g2.get("eps_growth_pct", 0),
+            "eps_latest":      g2.get("eps_latest", 0),
+            "eps_prior":       g2.get("eps_prior", 0),
+            "eps_metric":      g2.get("metric", "EPS"),
+            "eps_score":       g2.get("score", 0),
+            "dry_up_weeks":    g3.get("dry_up_weeks", 0),
+            "sponge_weeks":    g3.get("sponge_weeks", 0),
+            "sponge_score":    g3.get("score", 0),
+            "capex_signal":    concall.get("capex_signal", False),
+            "margin_signal":   concall.get("margin_signal", False),
+            "concall_summary": concall.get("summary", "")[:120],
+            "concall_score":   concall.get("score", 0),
+            "box_high":        round(box_high, 2),
+            "stop_loss":       stop_loss,
+            "target_25pct":    target_6m,
+            "target_60pct":    target_12m,
+            "upside_6m_pct":   round((target_6m  / item["close"] - 1) * 100, 1),
+            "upside_12m_pct":  round((target_12m / item["close"] - 1) * 100, 1),
+            "run_date":        date_label,
+        })
+
+    # Final sort and top N selection
     stones.sort(key=lambda x: x["total_score"], reverse=True)
     top_stones = stones[:TOP_N_STONES]
 
     log.info("─" * 60)
-    log.info(f"INCUBATOR SUMMARY | scanned={total} | passed={len(stones)} | "
-             f"top{TOP_N_STONES}={[s['symbol'] for s in top_stones]}")
+    log.info(f"INCUBATOR SUMMARY | scanned={total} | s1_survivors={len(surv_candidates)} | "
+             f"sharia_passed={len(stones)} | top{TOP_N_STONES}={[s['symbol'] for s in top_stones]}")
     log.info("─" * 60)
 
-    _write_sentinel("SCORING_DONE", {
-        "SCANNED ": total,
-        "PASSED  ": len(stones),
-        "TOP_N   ": len(top_stones),
+    _write_sentinel("COMPLETE", {
+        "SCANNED  ": total,
+        "SURVIVORS": len(surv_candidates),
+        "STONES   ": len(stones),
+        "TOP_N    ": len(top_stones),
+        "SYMBOLS  ": " ".join(s["symbol"] for s in top_stones),
     })
 
     if not top_stones:
         _send_tg(
-            f"📋 <b>INCUBATOR v1.0 — {date_label}</b>\n"
-            f"Scanned {total} stocks. No Stones passed all 3 gates.\n"
-            f"Market in transition — Stones need more base-building time. 🕐"
+            f"📋 <b>INCUBATOR v5.0 — {date_label}</b>\n"
+            f"Scanned {total} stocks. No Stones passed all gates.\n"
+            f"Market in transition — base formations need more time. 🕐"
         )
         return []
 
-    # Push to Sheets
     push_stones_to_sheets(top_stones, date_label)
-
-    # Telegram
     send_telegram_stones(top_stones, date_label, total)
-
-    _write_sentinel("COMPLETE", {
-        "STONES  ": len(top_stones),
-        "SYMBOLS ": " ".join(s["symbol"] for s in top_stones),
-    })
 
     return top_stones
 
@@ -1280,17 +1361,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.symbol:
-        # Debug mode: score one symbol verbatim
         logging.getLogger().setLevel(logging.DEBUG)
         sym  = args.symbol.upper()
         bhav = load_universe()
         row  = bhav[bhav["symbol"] == sym]
         if row.empty:
             print(f"{sym} not in universe — using close=100")
-            result = score_stone(sym, {"symbol": sym, "close": 100.0,
-                                        "volume": 100000, "turnover_lakhs": 100.0})
+            result = score_stone_math(sym, {"symbol": sym, "close": 100.0,
+                                            "volume": 100000, "turnover_lakhs": 100.0})
         else:
-            result = score_stone(sym, row.iloc[0].to_dict())
-        print(json.dumps(result, indent=2, default=str) if result else f"{sym}: did not pass gates")
+            result = score_stone_math(sym, row.iloc[0].to_dict())
+        if result:
+            compliant, reason = dynamic_shariah_audit(sym)
+            result["sharia_compliant"] = compliant
+            result["sharia_reason"]    = reason
+            result.pop("weekly_df", None)   # not JSON-serialisable
+        print(json.dumps(result, indent=2, default=str) if result else f"{sym}: did not pass math gates")
     else:
         run()
