@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   PROJECT FORTRESS — INCUBATOR v7.0 (THE INSIDER SYNDICATE)                ║
+║   PROJECT FORTRESS — INCUBATOR v8.0 (THE INSIDER SYNDICATE)                ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   MISSION: Find stocks at ₹40 before they become ₹150 (3-6 month horizon) ║
@@ -63,7 +63,7 @@ log = logging.getLogger("incubator_v6")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v7.0 INSIDER SYNDICATE (500-universe + rubble+sponge → sharia → cffi-heist → insider-llm)"
+VERSION = "INCUBATOR v8.0 INSIDER SYNDICATE (strict-sharia-prompt + signal-confidence-gate)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -362,14 +362,26 @@ def dynamic_shariah_audit(symbol: str) -> Tuple[bool, str]:
     prompt = f"""You are an Islamic finance compliance auditor verifying a stock for an investment fund.
 Company Ticker: {sym} (Listed on National Stock Exchange of India)
 
-Task: Determine if this company's primary business model violates Shariah compliance principles.
-Prohibited sectors: Conventional Banking, Insurance, NBFCs, Financial Lending, Alcohol, Tobacco, Gambling, Pork, Non-Halal Entertainment, Defense/Weapons manufacturing.
+Task: Determine if this company's PRIMARY business model is itself haram.
+
+Prohibited: Conventional Banking, Insurance, NBFCs, Financial Lending, Alcohol production/distribution,
+Tobacco, Gambling, Pork, Adult entertainment, Defense/Weapons manufacturing.
+
+STRICT RULES — you must follow these exactly:
+1. Judge ONLY the company's own primary business. Do NOT reject based on who their customers are.
+2. Do NOT reject based on speculation ("may include", "could involve", "might support").
+3. Cement, construction, steel, manufacturing, logistics, transport, IT, pharma, FMCG, solar,
+   textiles, pipes, footwear, chemicals = HALAL by default unless the company itself produces
+   prohibited goods.
+4. Hotels/hospitality: only reject if the company EXPLICITLY operates bars or casinos as core business.
+5. Aviation: only reject if the company is primarily a liquor/entertainment business.
+6. Conglomerates with mixed business: assess PRIMARY revenue source only.
 
 Respond strictly in this JSON format (no markdown, no other text):
 {{
   "is_compliant": true,
-  "primary_business": "brief description of what they sell",
-  "reason": "if non-compliant, state exactly why, otherwise write NONE"
+  "primary_business": "one sentence: what they manufacture or sell",
+  "reason": "if non-compliant, cite the EXPLICIT haram activity. If compliant write NONE"
 }}"""
 
     raw = _call_openai(prompt, max_tokens=150)
@@ -1296,7 +1308,7 @@ def _send_tg(text: str):
 
 def send_telegram_stones(stones: List[dict], date_label: str, total_scanned: int):
     lines = [
-        f"🕴️ <b>INSIDER SYNDICATE v7.0 — {date_label}</b>",
+        f"🕴️ <b>INSIDER SYNDICATE v8.0 — {date_label}</b>",
         f"Scanned: {total_scanned} | Pearls found: {len(stones)}",
         "",
     ]
@@ -1386,7 +1398,7 @@ def run():
     bhav = load_universe()
     if bhav.empty:
         log.error("Universe empty — abort")
-        _send_tg(f"❌ <b>INSIDER SYNDICATE v7.0 — {date_label}</b>\nUniverse unavailable.")
+        _send_tg(f"❌ <b>INSIDER SYNDICATE v8.0 — {date_label}</b>\nUniverse unavailable.")
         return []
     _write_sentinel("UNIVERSE_LOADED", {"ROWS": len(bhav)})
 
@@ -1395,7 +1407,7 @@ def run():
     log.info(f"Candidates after turnover gate: {len(cands)}")
 
     if cands.empty:
-        _send_tg(f"📋 <b>INSIDER SYNDICATE v7.0 — {date_label}</b>\nNo candidates after turnover filter.")
+        _send_tg(f"📋 <b>INSIDER SYNDICATE v8.0 — {date_label}</b>\nNo candidates after turnover filter.")
         return []
 
     # ── STAGE 1: Pure Quantitative & Fundamental Sweep ───────────────────────
@@ -1453,6 +1465,15 @@ def run():
         # Insider Friend LLM reads the legal filings
         audit = insider_friend_audit(sym, filings, insiders)
         total_score = item["math_score"] + audit.get("score", 0)
+
+        has_signal   = audit.get("stealth_catalyst_found") or audit.get("insider_buying_found")
+        confidence   = audit.get("confidence_score", 0)
+
+        # Gate: must have an explicit signal OR confidence ≥85 (high-certainty math setup)
+        # Prevents RELAXO/IRCON-type stocks (no insider action, just good math) filling top-5
+        if not has_signal and confidence < 85:
+            log.info(f"  ⏭ SKIP {sym} | no signal + conf={confidence} < 85")
+            continue
 
         # Build targets from rubble gate data
         g1 = item["g1"]; g2 = item["g2"]; g3 = item["g3"]
@@ -1531,7 +1552,7 @@ def run():
 
     if not top_stones:
         _send_tg(
-            f"🕴️ <b>INSIDER SYNDICATE v7.0 — {date_label}</b>\n"
+            f"🕴️ <b>INSIDER SYNDICATE v8.0 — {date_label}</b>\n"
             f"Scanned {total} stocks. No Pearls surfaced this week.\n"
             f"No stealth insider action detected. We wait in the shadows. 🕐"
         )
@@ -1548,7 +1569,7 @@ def run():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fortress Incubator v7.0 Insider Syndicate")
+    parser = argparse.ArgumentParser(description="Fortress Incubator v8.0 Insider Syndicate")
     parser.add_argument("--symbol", help="Score a single symbol for debug")
     args = parser.parse_args()
 
