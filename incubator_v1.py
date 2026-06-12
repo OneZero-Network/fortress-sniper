@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   PROJECT FORTRESS — INCUBATOR v8.0 (THE INSIDER SYNDICATE)                ║
+║   PROJECT FORTRESS — INCUBATOR v10.0 (THE INSIDER SYNDICATE)                ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   MISSION: Find stocks at ₹40 before they become ₹150 (3-6 month horizon) ║
@@ -63,7 +63,7 @@ log = logging.getLogger("incubator_v6")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v8.0 INSIDER SYNDICATE (strict-sharia-prompt + signal-confidence-gate)"
+VERSION = "INCUBATOR v10.0 INSIDER SYNDICATE (yf-grounded-sharia + conf90-signal-gate)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -340,64 +340,91 @@ def halal_ok(symbol: str) -> bool:
     log.debug(f"Halal FAIL (not in HALAL_LIST): {sym}")
     return False   # Not in approved list → reject
 
-def dynamic_shariah_audit(symbol: str) -> Tuple[bool, str]:
+def dynamic_shariah_audit(symbol: str) -> Tuple[bool, str, dict]:
     """
     Late-stage Sharia audit — runs only on top 25 math survivors.
+    Returns (compliant, reason, log_data) — log_data written to SHARIA_LOG tab.
     Layer 1: Hard ticker keyword veto (instant, free).
-    Layer 2: Targeted OpenAI query audits actual business model dynamically.
-             If OpenAI disabled → pass on local gates alone.
+    Layer 2: yfinance company profile injected into prompt (prevents LLM hallucination).
+    Layer 3: OpenAI audits GROUNDED business description — not a blind ticker guess.
     """
     sym = symbol.upper().strip()
+    _ld = {"symbol": sym, "company_name": sym, "industry": "Unknown",
+           "biz_profile": "", "reason": "", "layer": "L1", "compliant": False}
 
     # Layer 1: Ticker keyword hard veto
     for kw in ["BANK", "FINANCE", "INSURE", "CAPITAL", "CREDIT",
                "INVEST", "MUTUAL", "HOLDING", "NBFC", "LEASING"]:
         if kw in sym:
-            return False, f"L1: Haram ticker keyword '{kw}'"
+            _ld["reason"] = f"Haram ticker keyword '{kw}'"
+            return False, f"L1: Haram ticker keyword '{kw}'", _ld
 
     if not _OPENAI_OK:
-        return True, "Passed local gates (AI disabled)"
+        _ld.update({"compliant": True, "layer": "L0", "reason": "AI disabled"})
+        return True, "Passed local gates (AI disabled)", _ld
 
-    # Layer 2: LLM dynamic business model audit
+    # Layer 2: Fetch real company profile from yfinance to ground the LLM
+    # Prevents gpt-4o-mini from hallucinating "INDOTHAI = industrial" when it's a brokerage
+    biz_profile  = "Not available"
+    industry     = "Unknown"
+    company_name = sym
+    try:
+        import yfinance as yf
+        info         = yf.Ticker(f"{sym}.NS").info
+        biz_profile  = (info.get("longBusinessSummary", "") or "")[:600]
+        industry     = info.get("industry", "Unknown") or "Unknown"
+        company_name = info.get("longName", sym)      or sym
+        if not biz_profile:
+            biz_profile = f"{company_name} — industry: {industry}"
+    except Exception as e:
+        log.debug(f"yfinance profile {sym}: {e}")
+
+    _ld.update({"company_name": company_name, "industry": industry,
+                "biz_profile": biz_profile[:200], "layer": "L2"})
+
+    # Layer 3: LLM audits grounded profile, not a blind ticker guess
     prompt = f"""You are an Islamic finance compliance auditor verifying a stock for an investment fund.
-Company Ticker: {sym} (Listed on National Stock Exchange of India)
+Company: {company_name} (Ticker: {sym}, NSE India)
+Industry: {industry}
+Business Profile: {biz_profile}
 
 Task: Determine if this company's PRIMARY business model is itself haram.
 
-Prohibited: Conventional Banking, Insurance, NBFCs, Financial Lending, Alcohol production/distribution,
-Tobacco, Gambling, Pork, Adult entertainment, Defense/Weapons manufacturing.
+Prohibited: Conventional Banking, Insurance, NBFCs, Financial Lending, Brokerage/Securities,
+Alcohol production/distribution, Tobacco, Gambling, Pork, Adult entertainment, Defense/Weapons.
 
-STRICT RULES — you must follow these exactly:
-1. Judge ONLY the company's own primary business. Do NOT reject based on who their customers are.
-2. Do NOT reject based on speculation ("may include", "could involve", "might support").
-3. Cement, construction, steel, manufacturing, logistics, transport, IT, pharma, FMCG, solar,
-   textiles, pipes, footwear, chemicals = HALAL by default unless the company itself produces
-   prohibited goods.
-4. Hotels/hospitality: only reject if the company EXPLICITLY operates bars or casinos as core business.
-5. Aviation: only reject if the company is primarily a liquor/entertainment business.
-6. Conglomerates with mixed business: assess PRIMARY revenue source only.
+STRICT RULES:
+1. Judge ONLY the company's own primary business — not their customers.
+2. Do NOT speculate. Only reject for EXPLICITLY prohibited activity.
+3. Manufacturing, IT, pharma, FMCG, solar, construction materials, logistics, transport,
+   textiles, pipes, footwear, chemicals = HALAL unless they make prohibited goods.
+4. Hotels: only reject if explicitly operating bars/casinos as core revenue.
+5. BPO/services: reject ONLY if the company itself provides financial lending/banking services,
+   not merely IT services TO banks.
 
-Respond strictly in this JSON format (no markdown, no other text):
+Respond ONLY in this JSON format (no markdown):
 {{
   "is_compliant": true,
-  "primary_business": "one sentence: what they manufacture or sell",
+  "primary_business": "one sentence: what they make or sell",
   "reason": "if non-compliant, cite the EXPLICIT haram activity. If compliant write NONE"
 }}"""
 
-    raw = _call_openai(prompt, max_tokens=150)
+    raw = _call_openai(prompt, max_tokens=180)
     if raw:
         try:
-            parsed = json.loads(re.sub(r"```json|```", "", raw).strip())
+            parsed    = json.loads(re.sub(r"```json|```", "", raw).strip())
             compliant = bool(parsed.get("is_compliant", False))
             reason    = str(parsed.get("reason", "NONE"))
             biz       = str(parsed.get("primary_business", "unknown"))
+            _ld.update({"compliant": compliant, "reason": reason if not compliant else "NONE"})
             if not compliant:
-                return False, f"L2 AI Audit: {reason} ({biz})"
-            return True, f"Passed AI audit: {biz}"
+                return False, f"L2 AI Audit: {reason} ({biz})", _ld
+            return True, f"Passed AI audit: {biz}", _ld
         except Exception as e:
             log.debug(f"Shariah audit parse {sym}: {e}")
 
-    return True, "Passed fallback (AI parse error)"
+    _ld.update({"compliant": True, "reason": "parse error fallback"})
+    return True, "Passed fallback (AI parse error)", _ld
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — BHAVCOPY (weekly — reads from Sheets BHAVCOPY tab first)
@@ -1249,31 +1276,39 @@ def score_stone_math(symbol: str, bhav_row: dict) -> Optional[dict]:
     close = float(bhav_row.get("close", 0))
 
     if close <= 0 or close < MIN_PRICE or close > MAX_PRICE:
-        return None
+        return {"symbol": sym, "close": close, "reject_gate": "PRICE_FILTER",
+                "reject_reason": f"close={close} outside ₹{MIN_PRICE}-{MAX_PRICE}", "math_score": 0}
 
     # Weekly history
     weekly = fetch_weekly_history(sym, weeks=52)
     if weekly.empty or len(weekly) < 13:
         log.info(f"  MATH_REJECT {sym:14s} | NO_WEEKLY_DATA bars={len(weekly)}")
-        return None
+        return {"symbol": sym, "close": close, "reject_gate": "NO_WEEKLY_DATA",
+                "reject_reason": f"bars={len(weekly)}", "math_score": 0}
 
     # GATE 1: Rubble (price ≥30% below 52W high — forgotten by public)
     g1_ok, g1 = check_rubble_gate(sym, weekly, close)
     if not g1_ok:
         log.info(f"  MATH_REJECT {sym:14s} | RUBBLE_FAIL | {g1['reason']}")
-        return None
+        return {"symbol": sym, "close": close, "reject_gate": "RUBBLE_FAIL",
+                "reject_reason": g1["reason"], "math_score": 0,
+                "g1": g1, "g2": {}, "g3": {}}
 
     # GATE 2: EPS acceleration
     g2_ok, g2 = check_eps_acceleration(sym)
     if not g2_ok:
         log.info(f"  MATH_REJECT {sym:14s} | EPS_FAIL | {g2['reason']}")
-        return None
+        return {"symbol": sym, "close": close, "reject_gate": "EPS_FAIL",
+                "reject_reason": g2["reason"], "math_score": 0,
+                "g1": g1, "g2": g2, "g3": {}}
 
     # GATE 3: Sponge volume
     g3_ok, g3 = check_sponge_volume(weekly)
     if not g3_ok:
         log.info(f"  MATH_REJECT {sym:14s} | SPONGE_FAIL | {g3['reason']}")
-        return None
+        return {"symbol": sym, "close": close, "reject_gate": "SPONGE_FAIL",
+                "reject_reason": g3["reason"], "math_score": 0,
+                "g1": g1, "g2": g2, "g3": g3}
 
     math_score = g1.get("score", 0) + g2.get("score", 0) + g3.get("score", 0)
 
@@ -1308,7 +1343,7 @@ def _send_tg(text: str):
 
 def send_telegram_stones(stones: List[dict], date_label: str, total_scanned: int):
     lines = [
-        f"🕴️ <b>INSIDER SYNDICATE v8.0 — {date_label}</b>",
+        f"🕴️ <b>INSIDER SYNDICATE v10.0 — {date_label}</b>",
         f"Scanned: {total_scanned} | Pearls found: {len(stones)}",
         "",
     ]
@@ -1377,6 +1412,82 @@ def push_stones_to_sheets(stones: List[dict], date_label: str):
         rows.append(_stone_to_row(s))
     _push_sheet("INCUBATOR", rows)
 
+# ── Sandbox Training Logs ─────────────────────────────────────────────────────
+
+_RUN_LOG_HEADER = [
+    "Date","Version","Scanned","S1_Survivors","Halal","Pearls","Top5Symbols",
+    "RunDurationSec","Notes",
+]
+
+_REJECTS_LOG_HEADER = [
+    "Date","Symbol","Close","Gate","Reason","EPS_Growth%","Discount%","MathScore",
+]
+
+_SHARIA_LOG_HEADER = [
+    "Date","Symbol","Compliant","CompanyName","Industry","BusinessProfile",
+    "ShariaReason","Layer",
+]
+
+def push_run_log(date_label: str, scanned: int, s1: int, halal: int,
+                 pearls: int, top5: List[str], duration_sec: float):
+    """Append one summary row per run to RUN_LOG tab."""
+    existing = _read_sheet("RUN_LOG")
+    rows = existing if existing else [_RUN_LOG_HEADER]
+    rows.append([
+        date_label, VERSION, scanned, s1, halal, pearls,
+        " | ".join(top5), round(duration_sec, 1), "",
+    ])
+    _push_sheet("RUN_LOG", rows)
+    log.info(f"RUN_LOG: appended run summary ✅")
+
+def push_rejects_log(rejects: List[dict], date_label: str):
+    """
+    Append all Stage 1 rejections to REJECTS_LOG tab.
+    Each reject dict: {symbol, close, gate, reason, eps_growth_pct, discount_pct, math_score}
+    This is the primary training corpus — every stock the system ever saw and why it was rejected.
+    """
+    if not rejects:
+        return
+    existing = _read_sheet("REJECTS_LOG")
+    rows = existing if existing else [_REJECTS_LOG_HEADER]
+    for r in rejects:
+        rows.append([
+            date_label,
+            r.get("symbol", ""),
+            r.get("close", 0),
+            r.get("gate", ""),
+            r.get("reason", "")[:120],
+            r.get("eps_growth_pct", ""),
+            r.get("discount_pct", ""),
+            r.get("math_score", ""),
+        ])
+    _push_sheet("REJECTS_LOG", rows)
+    log.info(f"REJECTS_LOG: {len(rejects)} rejects logged ✅")
+
+def push_sharia_log(sharia_decisions: List[dict], date_label: str):
+    """
+    Append all Stage 2 Sharia audit decisions to SHARIA_LOG tab.
+    Each dict: {symbol, compliant, company_name, industry, biz_profile, reason, layer}
+    Training corpus for fine-tuning or rule-extraction on halal/haram classifications.
+    """
+    if not sharia_decisions:
+        return
+    existing = _read_sheet("SHARIA_LOG")
+    rows = existing if existing else [_SHARIA_LOG_HEADER]
+    for d in sharia_decisions:
+        rows.append([
+            date_label,
+            d.get("symbol", ""),
+            "✅" if d.get("compliant") else "❌",
+            d.get("company_name", "")[:60],
+            d.get("industry", "")[:40],
+            d.get("biz_profile", "")[:200],
+            d.get("reason", "")[:120],
+            d.get("layer", ""),
+        ])
+    _push_sheet("SHARIA_LOG", rows)
+    log.info(f"SHARIA_LOG: {len(sharia_decisions)} decisions logged ✅")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — MAIN RUN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1393,12 +1504,13 @@ def run():
 
     date_label = datetime.today().strftime("%Y-%m-%d")
     log.info(f"Date: {date_label}")
+    run_start = time.time()
 
     # Load universe
     bhav = load_universe()
     if bhav.empty:
         log.error("Universe empty — abort")
-        _send_tg(f"❌ <b>INSIDER SYNDICATE v8.0 — {date_label}</b>\nUniverse unavailable.")
+        _send_tg(f"❌ <b>INSIDER SYNDICATE v10.0 — {date_label}</b>\nUniverse unavailable.")
         return []
     _write_sentinel("UNIVERSE_LOADED", {"ROWS": len(bhav)})
 
@@ -1407,11 +1519,12 @@ def run():
     log.info(f"Candidates after turnover gate: {len(cands)}")
 
     if cands.empty:
-        _send_tg(f"📋 <b>INSIDER SYNDICATE v8.0 — {date_label}</b>\nNo candidates after turnover filter.")
+        _send_tg(f"📋 <b>INSIDER SYNDICATE v10.0 — {date_label}</b>\nNo candidates after turnover filter.")
         return []
 
     # ── STAGE 1: Pure Quantitative & Fundamental Sweep ───────────────────────
     preliminary_stones: List[dict] = []
+    rejects_log:        List[dict] = []   # every reject → REJECTS_LOG tab
     total = len(cands)
     log.info(f"Stage 1: Running math filters on {total} candidates...")
 
@@ -1423,10 +1536,24 @@ def run():
             log.info(f"  Stage1 progress: {i+1}/{total} | survivors: {len(preliminary_stones)}")
         try:
             result = score_stone_math(sym, row.to_dict())
-            if result and result["math_score"] >= 45:
+            if result and "reject_gate" not in result and result.get("math_score", 0) >= 45:
                 preliminary_stones.append(result)
+            else:
+                # Collect reject for sandbox logging
+                rejects_log.append({
+                    "symbol":        sym,
+                    "close":         float(row.get("close", 0)),
+                    "gate":          result.get("reject_gate", "SCORE_LOW") if result else "NO_DATA",
+                    "reason":        result.get("reject_reason", "") if result else "score_stone_math returned None",
+                    "eps_growth_pct": result.get("g2", {}).get("eps_growth_pct", "") if result else "",
+                    "discount_pct":   result.get("g1", {}).get("discount_pct", "") if result else "",
+                    "math_score":     result.get("math_score", 0) if result else 0,
+                })
         except Exception as e:
             log.debug(f"Stage1 {sym}: {e}")
+            rejects_log.append({"symbol": sym, "close": float(row.get("close", 0)),
+                                 "gate": "EXCEPTION", "reason": str(e)[:100],
+                                 "eps_growth_pct": "", "discount_pct": "", "math_score": 0})
 
     # Sort by math score, keep top 25 for deep auditing
     preliminary_stones.sort(key=lambda x: x["math_score"], reverse=True)
@@ -1435,12 +1562,14 @@ def run():
     _write_sentinel("STAGE1_DONE", {"SCANNED": total, "SURVIVORS": len(surv_candidates)})
 
     # ── STAGE 2: Sharia Audit ─────────────────────────────────────────────────
-    halal_survivors: List[dict] = []
+    halal_survivors:   List[dict] = []
+    sharia_decisions:  List[dict] = []   # every decision → SHARIA_LOG tab
     log.info(f"Stage 2: Sharia audit on {len(surv_candidates)} survivors...")
 
     for item in surv_candidates:
         sym = item["symbol"]
-        is_compliant, sharia_reason = dynamic_shariah_audit(sym)
+        is_compliant, sharia_reason, sharia_log_data = dynamic_shariah_audit(sym)
+        sharia_decisions.append(sharia_log_data)   # log every decision, pass or fail
         if not is_compliant:
             log.info(f"  ❌ SHARIAH VETO | {sym} | {sharia_reason}")
             continue
@@ -1469,10 +1598,10 @@ def run():
         has_signal   = audit.get("stealth_catalyst_found") or audit.get("insider_buying_found")
         confidence   = audit.get("confidence_score", 0)
 
-        # Gate: must have an explicit signal OR confidence ≥85 (high-certainty math setup)
-        # Prevents RELAXO/IRCON-type stocks (no insider action, just good math) filling top-5
-        if not has_signal and confidence < 85:
-            log.info(f"  ⏭ SKIP {sym} | no signal + conf={confidence} < 85")
+        # Gate: explicit insider signal OR math confidence ≥90 (Weinstein: sponge volume IS stealth buying)
+        # conf<90 + no signal = skip. Raises bar vs v8's 85 to eliminate ASHOKLEY-type borderline cases.
+        if not has_signal and confidence < 90:
+            log.info(f"  ⏭ SKIP {sym} | no signal + conf={confidence} < 90")
             continue
 
         # Build targets from rubble gate data
@@ -1530,15 +1659,17 @@ def run():
 
     # Final sort — prioritise insider signal, then math
     stones.sort(key=lambda x: (
-        x["insider_buying"] + x["stealth_catalyst"],   # boolean sort key
+        x["insider_buying"] + x["stealth_catalyst"],
         x["total_score"]
     ), reverse=True)
     top_stones = stones[:TOP_N_STONES]
+    run_duration = time.time() - run_start
 
     log.info("─" * 60)
     log.info(f"SYNDICATE SUMMARY | scanned={total} | s1={len(surv_candidates)} | "
              f"halal={len(halal_survivors)} | pearls={len(stones)} | "
-             f"top{TOP_N_STONES}={[s['symbol'] for s in top_stones]}")
+             f"top{TOP_N_STONES}={[s['symbol'] for s in top_stones]} | "
+             f"duration={run_duration:.0f}s")
     log.info("─" * 60)
 
     _write_sentinel("COMPLETE", {
@@ -1548,11 +1679,27 @@ def run():
         "PEARLS     ": len(stones),
         "TOP_N      ": len(top_stones),
         "SYMBOLS    ": " ".join(s["symbol"] for s in top_stones),
+        "DURATION_S ": round(run_duration, 1),
     })
+
+    # ── Sandbox Training Logs — push every run regardless of results ──────────
+    try:
+        push_rejects_log(rejects_log, date_label)
+    except Exception as e:
+        log.warning(f"REJECTS_LOG push failed: {e}")
+    try:
+        push_sharia_log(sharia_decisions, date_label)
+    except Exception as e:
+        log.warning(f"SHARIA_LOG push failed: {e}")
+    try:
+        push_run_log(date_label, total, len(surv_candidates), len(halal_survivors),
+                     len(stones), [s["symbol"] for s in top_stones], run_duration)
+    except Exception as e:
+        log.warning(f"RUN_LOG push failed: {e}")
 
     if not top_stones:
         _send_tg(
-            f"🕴️ <b>INSIDER SYNDICATE v8.0 — {date_label}</b>\n"
+            f"🕴️ <b>INSIDER SYNDICATE v10.0 — {date_label}</b>\n"
             f"Scanned {total} stocks. No Pearls surfaced this week.\n"
             f"No stealth insider action detected. We wait in the shadows. 🕐"
         )
@@ -1569,7 +1716,7 @@ def run():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fortress Incubator v8.0 Insider Syndicate")
+    parser = argparse.ArgumentParser(description="Fortress Incubator v10.0 Insider Syndicate")
     parser.add_argument("--symbol", help="Score a single symbol for debug")
     args = parser.parse_args()
 
