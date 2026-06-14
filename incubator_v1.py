@@ -41,6 +41,12 @@ import requests
 import numpy as np
 import pandas as pd
 
+try:
+    import yfinance as yf
+    _YFINANCE_OK = True
+except ImportError:
+    _YFINANCE_OK = False
+
 # curl_cffi: Chrome TLS impersonation — defeats NSE Cloudflare 403 blocks
 # pip install curl_cffi
 try:
@@ -63,7 +69,7 @@ log = logging.getLogger("incubator_v6")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v12.0 INSIDER SYNDICATE (fixed-headers-38col + all-fields-aligned)"
+VERSION = "INCUBATOR v13.0 INSIDER SYNDICATE + INDEX ALPHA (passive-etf-flow-engine)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -99,6 +105,17 @@ STONE_SCORE_MIN    = int(os.getenv("STONE_SCORE_MIN",      "60"))     # /120 tot
 TOP_N_STONES       = int(os.getenv("TOP_N_STONES",         "5"))
 
 OUTPUTS_DIR = Path(os.getenv("CACHE_PATH", "outputs/incubator_cache.db")).parent
+
+# ── Index Alpha (Passive ETF Flow Engine) ────────────────────────────────────
+# Runs compute_rolling_index_alpha() against the top 150 liquid NSE stocks.
+# Stocks ranking ≤50 (near Nifty 50 / Next 50 inclusion boundary) get +25
+# bonus points and are upgraded to DIAMOND grade — passive ETF inflow acts as
+# a structural price catalyst independent of insider or fundamental signals.
+INDEX_ALPHA_ENABLED     = os.getenv("INDEX_ALPHA_ENABLED", "1") != "0"
+INDEX_ALPHA_UNIVERSE_N  = int(os.getenv("INDEX_ALPHA_UNIVERSE_N", "150"))  # top-N liquid symbols to scan
+INDEX_ALPHA_RANK_CUTOFF = int(os.getenv("INDEX_ALPHA_RANK_CUTOFF", "50"))  # rank ≤ this → DIAMOND bonus
+INDEX_ALPHA_BONUS_PTS   = int(os.getenv("INDEX_ALPHA_BONUS_PTS",  "25"))   # score bonus for qualifying rank
+INDEX_ALPHA_LOOKBACK    = int(os.getenv("INDEX_ALPHA_LOOKBACK",   "180"))  # days of history for rolling calc
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — NSE SESSION (curl_cffi Chrome TLS impersonation)
@@ -1700,14 +1717,187 @@ def push_sharia_log(sharia_decisions: List[dict], date_label: str):
     log.info(f"SHARIA_LOG: {len(sharia_decisions)} decisions logged ✅")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — MAIN RUN
+# SECTION 15 — INDEX ALPHA ENGINE (Passive ETF Flow Target Detection)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Nifty 50 and Nifty Next 50 rebalancing creates predictable structural demand:
+# passive ETFs tracking these indices MUST buy newly-included stocks regardless
+# of price. A stock on the cusp of index inclusion (ranked just outside top 50
+# by free-float market cap) becomes a high-conviction "structural multi-bagger"
+# because ETF inflow provides a price floor independent of any single catalyst.
+#
+# This module calculates 6-month rolling free-float market cap for the top-N
+# liquid NSE stocks and surfaces those nearest the Nifty 50 / Next 50 boundary.
+# Qualifying stocks that also pass CANSLIM compression scoring are upgraded to
+# DIAMOND grade with +25 bonus points in the main scoring loop.
+
+_INDEX_ALPHA_CACHE: Optional[pd.DataFrame] = None
+_INDEX_ALPHA_TS: float = 0.0
+_INDEX_ALPHA_LOCK = threading.Lock()
+
+
+def compute_rolling_index_alpha(universe_symbols: List[str]) -> pd.DataFrame:
+    """
+    Calculates 6-month rolling free-float market cap for every symbol in the
+    provided universe and ranks them by descending free-float capitalisation.
+
+    Used to detect stocks near the Nifty 50 / Next 50 index inclusion boundary
+    — passive ETF rebalancing creates forced structural buying at those cutoffs.
+
+    Args:
+        universe_symbols: List of NSE ticker symbols (without .NS suffix).
+
+    Returns:
+        DataFrame with columns:
+            symbol, free_float_mcap_cr, avg_turnover_cr, current_price, index_rank
+        Sorted descending by free_float_mcap_cr.
+        Empty DataFrame if yfinance is unavailable or no data fetched.
+    """
+    if not _YFINANCE_OK:
+        log.warning("Index Alpha: yfinance not installed — skipping (pip install yfinance)")
+        return pd.DataFrame()
+
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=INDEX_ALPHA_LOOKBACK)
+
+    rebalance_metrics: List[dict] = []
+    total = len(universe_symbols)
+    log.info(f"Index Alpha: computing free-float mcap for {total} symbols over "
+             f"{INDEX_ALPHA_LOOKBACK}d window...")
+
+    for idx, symbol in enumerate(universe_symbols):
+        if (idx + 1) % 25 == 0:
+            log.info(f"  Index Alpha progress: {idx+1}/{total}")
+        try:
+            ticker = yf.Ticker(f"{symbol}.NS")
+            hist   = ticker.history(start=start_date, end=end_date, interval="1d")
+
+            # Need ≥100 trading days for a meaningful rolling average
+            if hist.empty or len(hist) < 100:
+                continue
+
+            info         = ticker.info
+            total_shares = info.get("sharesOutstanding", 0)
+            if not total_shares or total_shares <= 0:
+                continue
+
+            # Float factor: ratio of freely-tradeable shares to total issued shares.
+            # Promoter/govt locked-in shares are excluded from index weight.
+            # Default 0.45 (45%) is a conservative mid-cap estimate per NSE methodology.
+            float_shares = info.get("floatShares", 0)
+            if float_shares and float_shares > 0:
+                float_factor = min(float_shares / total_shares, 1.0)
+            else:
+                float_factor = 0.45   # NSE default for unknown float
+
+            # Typical price = (H+L+C)/3 — removes single-tick close bias
+            hist["typical_price"] = (hist["High"] + hist["Low"] + hist["Close"]) / 3.0
+            hist["daily_turnover"] = hist["Close"] * hist["Volume"]
+
+            avg_close        = float(hist["Close"].mean())
+            avg_turnover_cr  = float(hist["daily_turnover"].mean() / 1e7)   # ₹ crore
+
+            # Free Float Market Cap = Total Shares × Avg Price × Float Factor
+            raw_mcap         = total_shares * avg_close
+            free_float_mcap_cr = (raw_mcap * float_factor) / 1e7   # ₹ crore
+
+            rebalance_metrics.append({
+                "symbol":            symbol,
+                "free_float_mcap_cr": round(free_float_mcap_cr, 2),
+                "avg_turnover_cr":    round(avg_turnover_cr, 2),
+                "current_price":      round(float(hist["Close"].iloc[-1]), 2),
+                "float_factor":       round(float_factor, 3),
+            })
+
+        except Exception as e:
+            log.debug(f"Index Alpha {symbol}: {e}")
+            continue
+
+    if not rebalance_metrics:
+        log.warning("Index Alpha: no metrics computed — returning empty frame")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rebalance_metrics)
+    df["index_rank"] = df["free_float_mcap_cr"].rank(ascending=False, method="min").astype(int)
+    df = df.sort_values("free_float_mcap_cr", ascending=False).reset_index(drop=True)
+
+    log.info(f"Index Alpha: ranked {len(df)} symbols. "
+             f"Top-3 by FF-Mcap: {list(df['symbol'].head(3))}")
+    return df
+
+
+def get_index_alpha(universe_symbols: List[str]) -> pd.DataFrame:
+    """
+    Thread-safe cached wrapper around compute_rolling_index_alpha().
+    Re-computes at most once per run (cached for 6 hours).
+
+    Returns the ranked DataFrame, or empty DataFrame on failure.
+    """
+    global _INDEX_ALPHA_CACHE, _INDEX_ALPHA_TS
+    with _INDEX_ALPHA_LOCK:
+        now = time.time()
+        if _INDEX_ALPHA_CACHE is not None and (now - _INDEX_ALPHA_TS) < 21600:
+            log.info("Index Alpha: returning cached result")
+            return _INDEX_ALPHA_CACHE
+
+        result = compute_rolling_index_alpha(universe_symbols)
+        _INDEX_ALPHA_CACHE = result
+        _INDEX_ALPHA_TS    = now
+        return result
+
+
+def apply_index_alpha_bonus(asset: dict, index_df: pd.DataFrame) -> dict:
+    """
+    Cross-references a scored asset against the index alpha rankings.
+    If the asset ranks within INDEX_ALPHA_RANK_CUTOFF (default ≤50), it
+    receives INDEX_ALPHA_BONUS_PTS bonus score points and is upgraded to
+    DIAMOND grade — passive ETF rebalancing acts as a structural price floor.
+
+    Args:
+        asset:    Stone dict as produced by Stage 3 scoring loop.
+        index_df: DataFrame from compute_rolling_index_alpha().
+
+    Returns:
+        Modified asset dict (mutated in-place and returned).
+    """
+    if index_df.empty:
+        return asset
+
+    sym   = asset.get("symbol", "")
+    match = index_df[index_df["symbol"] == sym]
+
+    if match.empty:
+        return asset
+
+    row  = match.iloc[0]
+    rank = int(row["index_rank"])
+    ff_mcap = round(float(row["free_float_mcap_cr"]), 0)
+
+    asset["index_rank"]    = rank
+    asset["ff_mcap_cr"]    = ff_mcap
+    asset["float_factor"]  = float(row.get("float_factor", 0))
+
+    if rank <= INDEX_ALPHA_RANK_CUTOFF:
+        asset["total_score"] += INDEX_ALPHA_BONUS_PTS
+        asset["pearl_grade"]  = "DIAMOND"
+        tag = (f" | 📊 Passive ETF Flow Target — FF-MCap ₹{ff_mcap:,.0f}Cr"
+               f" (Index Rank #{rank} — near Nifty inclusion boundary)")
+        asset["story"] = asset.get("story", "") + tag
+        log.info(f"  📊 INDEX ALPHA BONUS {sym} | rank=#{rank} | "
+                 f"ff_mcap=₹{ff_mcap:,.0f}Cr | +{INDEX_ALPHA_BONUS_PTS}pts → DIAMOND")
+
+    return asset
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 16 — MAIN RUN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run():
     log.info("=" * 70)
     log.info(f"  {VERSION}")
-    log.info(f"  Stage1: Rubble+EPS+Sponge → Stage2: Sharia → Stage3: cffi-Heist+InsiderLLM")
-    log.info(f"  Score gate: {STONE_SCORE_MIN} | Top N: {TOP_N_STONES}")
+    log.info(f"  Stage1: Rubble+EPS+Sponge → Stage2: Sharia → Stage3: cffi-Heist+InsiderLLM+IndexAlpha")
+    log.info(f"  Score gate: {STONE_SCORE_MIN} | Top N: {TOP_N_STONES} | IndexAlpha: {'ON' if INDEX_ALPHA_ENABLED else 'OFF'}")
     log.info("=" * 70)
 
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1721,7 +1911,7 @@ def run():
     bhav = load_universe()
     if bhav.empty:
         log.error("Universe empty — abort")
-        _send_tg(f"❌ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\nUniverse unavailable.")
+        _send_tg(f"❌ <b>INSIDER SYNDICATE v13.0 — {date_label}</b>\nUniverse unavailable.")
         return []
     _write_sentinel("UNIVERSE_LOADED", {"ROWS": len(bhav)})
 
@@ -1730,7 +1920,7 @@ def run():
     log.info(f"Candidates after turnover gate: {len(cands)}")
 
     if cands.empty:
-        _send_tg(f"📋 <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\nNo candidates after turnover filter.")
+        _send_tg(f"📋 <b>INSIDER SYNDICATE v13.0 — {date_label}</b>\nNo candidates after turnover filter.")
         return []
 
     # ── STAGE 1: Pure Quantitative & Fundamental Sweep ───────────────────────
@@ -1790,6 +1980,23 @@ def run():
 
     log.info(f"Stage 2 complete. {len(halal_survivors)} halal survivors → insider heist.")
     _write_sentinel("STAGE2_DONE", {"HALAL_SURVIVORS": len(halal_survivors)})
+
+    # ── INDEX ALPHA: Pre-compute free-float mcap rankings ─────────────────────
+    # Run once over the top-N liquid symbols so per-stock cross-reference is O(1).
+    # Disabled via INDEX_ALPHA_ENABLED=0 env var (e.g. to save yfinance API time).
+    index_df = pd.DataFrame()
+    if INDEX_ALPHA_ENABLED:
+        try:
+            # Use the top INDEX_ALPHA_UNIVERSE_N symbols by turnover from the
+            # bhavcopy universe (already liquidity-sorted by load_universe()).
+            alpha_symbols = list(bhav["symbol"].head(INDEX_ALPHA_UNIVERSE_N))
+            index_df = get_index_alpha(alpha_symbols)
+            if not index_df.empty:
+                _write_sentinel("INDEX_ALPHA_DONE", {"RANKED": len(index_df)})
+        except Exception as e:
+            log.warning(f"Index Alpha compute failed (non-fatal): {e}")
+    else:
+        log.info("Index Alpha: disabled via INDEX_ALPHA_ENABLED=0")
 
     # ── STAGE 3: Data Heist + Insider Friend LLM Audit ───────────────────────
     stones: List[dict] = []
@@ -1878,8 +2085,17 @@ def run():
             "target_60pct":           target_12m,
             "upside_6m_pct":          round((target_6m  / item["close"] - 1) * 100, 1),
             "upside_12m_pct":         round((target_12m / item["close"] - 1) * 100, 1),
+            # Index Alpha fields (populated by apply_index_alpha_bonus below)
+            "index_rank":             -1,
+            "ff_mcap_cr":             0.0,
+            "float_factor":           0.0,
+            "story":                  "",
             "run_date":               date_label,
         })
+
+        # ── Index Alpha cross-reference ────────────────────────────────────────
+        # Mutates the stone just appended: may award +25 pts and DIAMOND upgrade.
+        stones[-1] = apply_index_alpha_bonus(stones[-1], index_df)
 
     # Final sort — DIAMOND first, then catalyst+buying, then math score
     def _sort_key(x):
@@ -1926,7 +2142,7 @@ def run():
 
     if not top_stones:
         _send_tg(
-            f"🕴️ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\n"
+            f"🕴️ <b>INSIDER SYNDICATE v13.0 — {date_label}</b>\n"
             f"Scanned {total} stocks. No Pearls surfaced this week.\n"
             f"No stealth insider action detected. We wait in the shadows. 🕐"
         )
@@ -1943,7 +2159,7 @@ def run():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fortress Incubator v11.0 Insider Syndicate")
+    parser = argparse.ArgumentParser(description="Fortress Incubator v13.0 Insider Syndicate + Index Alpha")
     parser.add_argument("--symbol", help="Score a single symbol for debug")
     args = parser.parse_args()
 
