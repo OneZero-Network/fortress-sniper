@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   PROJECT FORTRESS — INCUBATOR v12.0 (THE INSIDER SYNDICATE)                ║
+║   PROJECT FORTRESS — INCUBATOR v14.0 (TITANIUM+)                           ║
 ║   Bismillah — In the name of Allah, the Most Gracious, the Most Merciful   ║
 ║                                                                              ║
 ║   MISSION: Find stocks at ₹40 before they become ₹150 (3-6 month horizon) ║
 ║                                                                              ║
-║   ARCHITECTURE: 3-Stage Funnel                                              ║
+║   ARCHITECTURE: 3-Stage Funnel + 3 Titanium Upgrades                       ║
 ║   RUNS: Friday 16:00 IST (11:30 UTC) via GitHub Actions — zero VPS cost    ║
 ║                                                                              ║
 ║   STAGE 1 — MATH SWEEP (all 400 candidates)                                ║
 ║     GATE-1  RUBBLE CHECK: price ≥30% below 52W high (forgotten by public)  ║
 ║     GATE-2  EPS ACCELERATION: ≥+25% QoQ (CANSLIM 'E')                     ║
+║     GATE-2b REVENUE QUALITY: OCF/PAT + ROCE + Debtor Days (soft penalty)  ║
 ║     GATE-3  SPONGE VOLUME: dry red weeks + wet green weeks (whale buying)  ║
 ║     → Top 25 math survivors advance                                         ║
 ║                                                                              ║
@@ -23,8 +24,19 @@
 ║   STAGE 3 — INSIDER DATA HEIST + LLM AUDIT (halal survivors only)         ║
 ║     curl_cffi Chrome TLS impersonation defeats NSE 403 blocks              ║
 ║     Scrapes NSE Corporate Announcements + SAST Insider Trade filings       ║
+║     TITANIUM: Block/Bulk Deal Radar — FII/DII ground-truth verification    ║
 ║     OpenAI "Insider Friend" reads legal filings for stealth catalysts      ║
-║     → Top 5 Pearls to Telegram + Google Sheets                             ║
+║     → Top 5 Pearls to Telegram + Google Sheets + OUTCOMES tracker         ║
+║                                                                              ║
+║   TITANIUM UPGRADES (v14):                                                  ║
+║     T1: FII/DII Block Deal Radar — inference → ground truth verification   ║
+║     T2: Revenue Quality Gate — OCF/PAT, ROCE, Debtor Days (value-trap shield)║
+║     T3: Outcome Tracker + CLI calibration engine (self-correcting organism) ║
+║                                                                              ║
+║   NSE RESILIENCE: 3-layer fallback on all block deal fetches               ║
+║     Layer 1: curl_cffi Chrome TLS (primary — defeats Cloudflare)           ║
+║     Layer 2: ScraperAPI proxy (secondary — rotates IPs)                    ║
+║     Layer 3: yfinance institutional holders (tertiary — zero auth needed)  ║
 ║                                                                              ║
 ║   HALAL: Dynamic OpenAI audit — no manual list maintenance required        ║
 ║   BYPASS: pip install curl_cffi required on runner                         ║
@@ -40,6 +52,12 @@ from typing import Dict, List, Optional, Tuple, Any
 import requests
 import numpy as np
 import pandas as pd
+
+try:
+    import yfinance as yf
+    _YFINANCE_OK = True
+except ImportError:
+    _YFINANCE_OK = False
 
 # curl_cffi: Chrome TLS impersonation — defeats NSE Cloudflare 403 blocks
 # pip install curl_cffi
@@ -63,7 +81,7 @@ log = logging.getLogger("incubator_v6")
 # SECTION 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "INCUBATOR v12.0 INSIDER SYNDICATE (fixed-headers-38col + all-fields-aligned)"
+VERSION = "INCUBATOR v14.0 TITANIUM+ (block-deal-radar + quality-gate + outcome-tracker)"
 
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MINI_MODEL  = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
@@ -99,6 +117,42 @@ STONE_SCORE_MIN    = int(os.getenv("STONE_SCORE_MIN",      "60"))     # /120 tot
 TOP_N_STONES       = int(os.getenv("TOP_N_STONES",         "5"))
 
 OUTPUTS_DIR = Path(os.getenv("CACHE_PATH", "outputs/incubator_cache.db")).parent
+
+# ── Index Alpha (Passive ETF Flow Engine) ────────────────────────────────────
+# Runs compute_rolling_index_alpha() against the top 150 liquid NSE stocks.
+# Stocks ranking ≤50 (near Nifty 50 / Next 50 inclusion boundary) get +25
+# bonus points and are upgraded to DIAMOND grade — passive ETF inflow acts as
+# a structural price catalyst independent of insider or fundamental signals.
+INDEX_ALPHA_ENABLED     = os.getenv("INDEX_ALPHA_ENABLED", "1") != "0"
+INDEX_ALPHA_UNIVERSE_N  = int(os.getenv("INDEX_ALPHA_UNIVERSE_N", "150"))  # top-N liquid symbols to scan
+INDEX_ALPHA_RANK_CUTOFF = int(os.getenv("INDEX_ALPHA_RANK_CUTOFF", "50"))  # rank ≤ this → DIAMOND bonus
+INDEX_ALPHA_BONUS_PTS   = int(os.getenv("INDEX_ALPHA_BONUS_PTS",  "25"))   # score bonus for qualifying rank
+INDEX_ALPHA_LOOKBACK    = int(os.getenv("INDEX_ALPHA_LOOKBACK",   "180"))  # days of history for rolling calc
+
+# ── T1: Block Deal Radar (FII/DII Ground-Truth Verification) ─────────────────
+# Fetched ONCE per run via 3-layer fallback. Per-symbol lookup is O(1) cache hit.
+# Layer 1: curl_cffi NSE APIs (block-deal + bulk-deal endpoints)
+# Layer 2: ScraperAPI proxy fallback (if curl_cffi gets 403)
+# Layer 3: yfinance institutionalHolders (no-auth last resort)
+BLOCK_DEAL_ENABLED      = os.getenv("BLOCK_DEAL_ENABLED", "1") != "0"
+BLOCK_DEAL_WINDOW_DAYS  = int(os.getenv("BLOCK_DEAL_WINDOW_DAYS", "30"))   # days to look back
+BLOCK_DEAL_BONUS_PTS    = int(os.getenv("BLOCK_DEAL_BONUS_PTS",   "20"))   # base: any block deal found
+BLOCK_DEAL_INST_BONUS   = int(os.getenv("BLOCK_DEAL_INST_BONUS",  "15"))   # additional: FII/MF confirmed
+BLOCK_DEAL_SIZE_BONUS   = int(os.getenv("BLOCK_DEAL_SIZE_BONUS",  "10"))   # additional: large block >1L shares
+
+# ── T2: Revenue Quality Gate (Value-Trap Shield) ─────────────────────────────
+# SOFT GATE — never hard-rejects. Applies score penalty for toxic balance sheets.
+# Uses yfinance quarterly CF + income + balance sheet (public XBRL, no auth).
+QUALITY_GATE_ENABLED    = os.getenv("QUALITY_GATE_ENABLED", "1") != "0"
+QUALITY_OCF_PAT_MIN     = float(os.getenv("QUALITY_OCF_PAT_MIN",  "0.50")) # OCF ≥ 50% of PAT
+QUALITY_ROCE_MIN_PCT    = float(os.getenv("QUALITY_ROCE_MIN_PCT", "10.0")) # ROCE ≥ 10%
+QUALITY_DEBTOR_MAX      = float(os.getenv("QUALITY_DEBTOR_MAX",   "0.25")) # debtor day growth ≤ +25% QoQ
+
+# ── T3: Outcome Tracker ───────────────────────────────────────────────────────
+# Writes every pick as PENDING to OUTCOMES Sheets tab.
+# Subsequent runs fill 4W / 13W / 26W returns and Nifty alpha.
+# CLI: python incubator_v14.py --calibrate  → prints gate win-rate correlation table.
+OUTCOMES_ENABLED        = os.getenv("OUTCOMES_ENABLED", "1") != "0"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — NSE SESSION (curl_cffi Chrome TLS impersonation)
@@ -956,6 +1010,163 @@ def check_eps_acceleration(symbol: str) -> Tuple[bool, dict]:
     return True, details
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9b — TITANIUM T2: REVENUE QUALITY GATE (Value-Trap Shield)
+# ══════════════════════════════════════════════════════════════════════════════
+# EPS is an accountant's opinion. Cash flow is a fact.
+# A company can print +40% EPS via deferred tax reversal or channel stuffing
+# while core operations silently deteriorate. Three metrics expose this:
+#
+#   OCF/PAT ratio  : Operating Cash Flow ÷ Net Profit.
+#                    ≥0.7 = healthy. <0.5 = accrual inflation. <0 = cash-negative.
+#   ROCE trend     : Return on Capital Employed (annualised).
+#                    Rising alongside EPS = real improvement.
+#                    Flat/falling = leverage inflating EPS.
+#   Debtor days    : (Receivables ÷ Revenue) × 365, QoQ change.
+#                    +25% surge while revenue rises = channel stuffing risk.
+#
+# SOFT GATE: Never hard-rejects. Applies score penalty only.
+# yfinance small-cap data is incomplete — hard rejection creates false negatives.
+# Missing data = 0 penalty (benefit of the doubt). Verified bad data = penalty.
+
+def check_revenue_quality(symbol: str) -> Tuple[bool, dict]:
+    """
+    Revenue Quality Gate — screens for earnings manipulation and value traps.
+    Always returns (True, details) — soft gate, score penalty only.
+
+    Penalties:
+        1 quality flag  : -10 pts
+        2 quality flags : -20 pts
+        3 quality flags : -30 pts  (all three = hard value-trap signal)
+    Bonus:
+        0 quality flags : +10 pts  (clean bill of health)
+    """
+    details = {
+        "ocf_pat_ratio":     None,
+        "roce_pct":          None,
+        "debtor_growth_pct": None,
+        "quality_score":     0,
+        "quality_flags":     [],
+        "reason":            "quality check skipped",
+    }
+
+    if not QUALITY_GATE_ENABLED or not _YFINANCE_OK:
+        return True, details
+
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        cf     = ticker.quarterly_cashflow
+        inc    = ticker.quarterly_income_stmt
+        bs     = ticker.quarterly_balance_sheet
+
+        if cf is None or cf.empty or inc is None or inc.empty:
+            details["reason"] = "yfinance: no CF/income data — soft pass"
+            return True, details
+
+        # ── 1. OCF / PAT ratio ────────────────────────────────────────────────
+        ocf = None
+        for label in ["Operating Cash Flow",
+                      "Total Cash From Operating Activities",
+                      "Cash From Operations"]:
+            if label in cf.index:
+                ocf = float(cf.loc[label].iloc[0])
+                break
+
+        pat = None
+        for label in ["Net Income", "Net Income Common Stockholders", "Net Profit"]:
+            if label in inc.index:
+                pat = float(inc.loc[label].iloc[0])
+                break
+
+        if ocf is not None and pat is not None and pat != 0:
+            ratio = ocf / abs(pat)
+            details["ocf_pat_ratio"] = round(ratio, 3)
+            if ratio < 0:
+                details["quality_flags"].append(
+                    f"OCF negative ({ratio:.2f}x) — profit not converting to cash")
+            elif ratio < QUALITY_OCF_PAT_MIN:
+                details["quality_flags"].append(
+                    f"OCF/PAT low ({ratio:.2f}x < {QUALITY_OCF_PAT_MIN:.1f}x) "
+                    f"— possible accrual inflation")
+
+        # ── 2. ROCE (most recent quarter, annualised) ─────────────────────────
+        if bs is not None and not bs.empty:
+            try:
+                total_assets = curr_liab = ebit = None
+                for label in ["Total Assets"]:
+                    if label in bs.index:
+                        total_assets = float(bs.loc[label].iloc[0]); break
+                for label in ["Current Liabilities", "Total Current Liabilities"]:
+                    if label in bs.index:
+                        curr_liab = float(bs.loc[label].iloc[0]); break
+                for label in ["EBIT", "Operating Income", "Operating Profit"]:
+                    if label in inc.index:
+                        ebit = float(inc.loc[label].iloc[0]) * 4; break  # annualise
+
+                if total_assets and curr_liab and ebit is not None:
+                    cap_employed = total_assets - curr_liab
+                    if cap_employed > 0:
+                        roce = (ebit / cap_employed) * 100
+                        details["roce_pct"] = round(roce, 1)
+                        if roce < QUALITY_ROCE_MIN_PCT:
+                            details["quality_flags"].append(
+                                f"ROCE low ({roce:.1f}% < {QUALITY_ROCE_MIN_PCT:.0f}%) "
+                                f"— capital inefficient")
+            except Exception:
+                pass
+
+        # ── 3. Debtor days QoQ trend ──────────────────────────────────────────
+        if (bs is not None and not bs.empty
+                and len(bs.columns) >= 2 and len(inc.columns) >= 2):
+            try:
+                rec_label = rev_label = None
+                for label in ["Trade Receivables", "Receivables",
+                               "Accounts Receivable", "Net Receivables"]:
+                    if label in bs.index:
+                        rec_label = label; break
+                for label in ["Total Revenue", "Revenue", "Net Revenue"]:
+                    if label in inc.index:
+                        rev_label = label; break
+
+                if rec_label and rev_label:
+                    rec_now  = float(bs.loc[rec_label].iloc[0])
+                    rec_prev = float(bs.loc[rec_label].iloc[1])
+                    rev_now  = float(inc.loc[rev_label].iloc[0])
+                    rev_prev = float(inc.loc[rev_label].iloc[1])
+                    days_now  = (rec_now  / rev_now  * 365) if rev_now  > 0 else 0
+                    days_prev = (rec_prev / rev_prev * 365) if rev_prev > 0 else 0
+                    if days_prev > 0:
+                        debtor_growth = (days_now - days_prev) / days_prev
+                        details["debtor_growth_pct"] = round(debtor_growth * 100, 1)
+                        if debtor_growth > QUALITY_DEBTOR_MAX:
+                            details["quality_flags"].append(
+                                f"Debtor days surging +{debtor_growth*100:.0f}% QoQ "
+                                f"({days_prev:.0f}d → {days_now:.0f}d) — channel stuffing risk")
+            except Exception:
+                pass
+
+        # ── Score ─────────────────────────────────────────────────────────────
+        n = len(details["quality_flags"])
+        details["quality_score"] = (
+            10  if n == 0 else
+            -10 if n == 1 else
+            -20 if n == 2 else
+            -30
+        )
+        details["reason"] = (
+            "Quality ✅ all clean" if not details["quality_flags"]
+            else " | ".join(details["quality_flags"])
+        )
+        if details["quality_flags"]:
+            log.info(f"  ⚠️ QUALITY {symbol} ({n} flags, {details['quality_score']:+d}pts) "
+                     f"| {details['reason'][:100]}")
+
+    except Exception as e:
+        log.debug(f"check_revenue_quality {symbol}: {e}")
+        details["reason"] = f"quality check exception: {e}"
+
+    return True, details   # always soft pass
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 10 — GATE 3: SPONGE VOLUME PROFILE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1280,6 +1491,317 @@ def fetch_insider_and_filings(symbol: str) -> Tuple[str, str, float]:
     return filings_text, insider_text, pledge_pct
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11c — TITANIUM T1: FII/DII BLOCK DEAL RADAR
+# ══════════════════════════════════════════════════════════════════════════════
+# The Sponge Volume gate is an INFERENCE gate — it guesses institutional buying
+# from volume patterns. Block Deal Radar is a VERIFICATION gate — it reads the
+# NSE's legally disclosed block and bulk trade filings to name the buyer.
+#
+# A block deal = ≥5 lakh shares OR ≥₹5Cr negotiated off-market in one shot.
+# A bulk deal  = single broker crosses 0.5% of total shares in one session.
+# Both are mandatory NSE disclosures by 6pm on the trade date.
+#
+# If Sponge says "someone is accumulating quietly" and Block Deal says
+# "Nippon India MF just crossed 5L shares" — you no longer have a theory.
+# You have a fact.
+#
+# 3-LAYER FALLBACK ARCHITECTURE (NSE Cloudflare resilience):
+#   Layer 1 (PRIMARY)  : curl_cffi Chrome TLS — /api/block-deal + /api/bulk-deal
+#   Layer 2 (SECONDARY): ScraperAPI proxy — rotates IPs, defeats fingerprinting
+#   Layer 3 (TERTIARY) : yfinance institutionHolders — zero auth, always works
+#
+# Fetched ONCE per run into a shared cache. Per-symbol lookup = O(1) dict get.
+
+_BLOCK_DEAL_CACHE:    Optional[Dict[str, list]] = None
+_BLOCK_DEAL_TS:       float = 0.0
+_BLOCK_DEAL_LOCK      = threading.Lock()
+
+# Institutional buyer keywords — client names that confirm FII/DII involvement
+_INST_BUYER_KW = [
+    "FII", "FPI", "MUTUAL FUND", "MF", "LIC", "INSURANCE", "PENSION",
+    "HDFC MF", "SBI MF", "ICICI PRU", "NIPPON", "MIRAE", "AXIS MF",
+    "KOTAK MF", "MOTILAL", "TRUST", "BIRLA", "FRANKLIN", "UTI",
+    "TATA MF", "QUANTUM", "PPFAS", "WHITEOAK", "EDELWEISS MF",
+]
+
+
+def _parse_block_deal_items(items: list, deal_type: str,
+                             cutoff: datetime) -> Dict[str, list]:
+    """
+    Normalise raw NSE block/bulk deal JSON into a symbol-keyed dict.
+    Filters: buy-side only, within date cutoff.
+    NSE uses inconsistent field names across block vs bulk endpoints —
+    this function handles both schemas transparently.
+    """
+    result: Dict[str, list] = {}
+    for item in (items or []):
+        sym = str(item.get("symbol", item.get("Symbol", ""))).strip().upper()
+        if not sym:
+            continue
+
+        # Keep buy side only — seller data is noise for accumulation thesis
+        buy_sell = str(item.get("buySell", item.get("BS", "B"))).upper()
+        if "S" in buy_sell and "B" not in buy_sell:
+            continue
+
+        # Date filter
+        dt_raw = str(item.get("date", item.get("BD_DT_DATE", "")))
+        try:
+            dt_parsed = datetime.strptime(dt_raw[:10], "%Y-%m-%d")
+            if dt_parsed < cutoff:
+                continue
+        except Exception:
+            pass  # unparseable date → keep (better false positive than miss)
+
+        client = str(item.get("clientName", item.get("BD_CLIENT_NAME", "Unknown")))
+        qty    = int(float(item.get("quantity", item.get("BD_QTY", 0)) or 0))
+        price  = float(item.get("price", item.get("BD_TP_WATP", 0)) or 0)
+
+        if sym not in result:
+            result[sym] = []
+        result[sym].append({
+            "date":   dt_raw[:10],
+            "client": client[:60],
+            "qty":    qty,
+            "price":  round(price, 2),
+            "type":   deal_type,
+        })
+    return result
+
+
+def _fetch_block_deals_layer1(cutoff: datetime) -> Dict[str, list]:
+    """
+    Layer 1: curl_cffi Chrome TLS against NSE /api/block-deal and /api/bulk-deal.
+    Returns combined symbol-keyed dict. Returns {} on any 403 or timeout.
+    """
+    combined: Dict[str, list] = {}
+    sess = _get_nse_session()
+    if not sess:
+        return combined
+
+    endpoints = [
+        ("BLOCK", "https://www.nseindia.com/api/block-deal"),
+        ("BULK",  "https://www.nseindia.com/api/bulk-deal"),
+    ]
+    for deal_type, url in endpoints:
+        try:
+            r = sess.get(url, headers={**_NSE_HEADERS,
+                         "Accept": "application/json",
+                         "X-Requested-With": "XMLHttpRequest"},
+                         timeout=15)
+            if r.status_code == 403:
+                log.warning(f"Block deal L1 403 on {deal_type} — will try fallback")
+                return {}   # signal layer 1 failure to caller
+            if r.status_code != 200:
+                log.debug(f"Block deal L1 {deal_type}: HTTP {r.status_code}")
+                continue
+            data  = r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            partial = _parse_block_deal_items(items, deal_type, cutoff)
+            for sym, deals in partial.items():
+                combined.setdefault(sym, []).extend(deals)
+        except Exception as e:
+            log.debug(f"Block deal L1 {deal_type}: {e}")
+    return combined
+
+
+def _fetch_block_deals_layer2(cutoff: datetime) -> Dict[str, list]:
+    """
+    Layer 2: ScraperAPI proxy fallback.
+    Rotates residential IPs — defeats NSE Cloudflare IP-based blocking.
+    Only attempted if SCRAPERAPI_KEY is set and Layer 1 returned empty.
+    """
+    if not SCRAPERAPI_KEY:
+        return {}
+
+    combined: Dict[str, list] = {}
+    endpoints = [
+        ("BLOCK", "https://www.nseindia.com/api/block-deal"),
+        ("BULK",  "https://www.nseindia.com/api/bulk-deal"),
+    ]
+    for deal_type, target_url in endpoints:
+        try:
+            r = requests.get(
+                "https://api.scraperapi.com/",
+                params={
+                    "api_key":  SCRAPERAPI_KEY,
+                    "url":      target_url,
+                    "render":   "false",
+                    "country_code": "in",   # Indian exit node — NSE geo-gates
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                log.debug(f"Block deal L2 {deal_type}: HTTP {r.status_code}")
+                continue
+            data  = r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            partial = _parse_block_deal_items(items, deal_type, cutoff)
+            for sym, deals in partial.items():
+                combined.setdefault(sym, []).extend(deals)
+            log.info(f"Block deal L2 ScraperAPI {deal_type}: "
+                     f"{sum(len(v) for v in partial.values())} buy-side entries")
+        except Exception as e:
+            log.debug(f"Block deal L2 {deal_type}: {e}")
+    return combined
+
+
+def _fetch_block_deals_layer3_yf(universe_symbols: List[str]) -> Dict[str, list]:
+    """
+    Layer 3: yfinance institutionHolders — zero auth, always accessible.
+    This is the tertiary fallback when both NSE layers fail (e.g. GitHub Actions
+    IP block during a crackdown). Data is less granular (no specific deal dates,
+    no individual trade prices) but confirms institutional presence.
+
+    Returns the same dict schema as layers 1/2 for transparent consumption.
+    dateReported from yfinance used as approximate date.
+    """
+    if not _YFINANCE_OK:
+        return {}
+
+    combined: Dict[str, list] = {}
+    cutoff_str = (datetime.today() - timedelta(days=BLOCK_DEAL_WINDOW_DAYS)).strftime("%Y-%m-%d")
+
+    for sym in universe_symbols[:50]:   # limit to avoid rate-limiting on L3
+        try:
+            holders = yf.Ticker(f"{sym}.NS").institutional_holders
+            if holders is None or holders.empty:
+                continue
+            for _, row in holders.iterrows():
+                holder = str(row.get("Holder", "Unknown"))
+                pct    = float(row.get("% Out", 0) or 0)
+                shares = int(row.get("Shares", 0) or 0)
+                # Only flag significant institutional positions (>0.5% of shares)
+                if pct < 0.5 or shares < 50_000:
+                    continue
+                date_rep = str(row.get("Date Reported", ""))[:10]
+                if date_rep < cutoff_str:
+                    continue
+                if sym not in combined:
+                    combined[sym] = []
+                combined[sym].append({
+                    "date":   date_rep or datetime.today().strftime("%Y-%m-%d"),
+                    "client": holder[:60],
+                    "qty":    shares,
+                    "price":  0.0,   # yfinance doesn't give trade price
+                    "type":   "YF_INST",
+                })
+        except Exception:
+            continue
+
+    log.info(f"Block deal L3 yfinance: {sum(len(v) for v in combined.values())} "
+             f"institutional positions across {len(combined)} symbols")
+    return combined
+
+
+def _fetch_all_block_deals(universe_symbols: Optional[List[str]] = None) -> Dict[str, list]:
+    """
+    Master block deal fetcher with 3-layer fallback.
+    Called ONCE per run. Thread-safe. Cached for 6 hours.
+
+    Cascade:
+        Layer 1 → curl_cffi NSE API (primary)
+        Layer 2 → ScraperAPI proxy (if L1 returns empty or 403)
+        Layer 3 → yfinance institutionHolders (if L1+L2 both fail)
+
+    Returns: {SYMBOL: [{"date", "client", "qty", "price", "type"}]}
+    """
+    global _BLOCK_DEAL_CACHE, _BLOCK_DEAL_TS
+    with _BLOCK_DEAL_LOCK:
+        now = time.time()
+        if _BLOCK_DEAL_CACHE is not None and (now - _BLOCK_DEAL_TS) < 21600:
+            return _BLOCK_DEAL_CACHE
+
+        cutoff  = datetime.today() - timedelta(days=BLOCK_DEAL_WINDOW_DAYS)
+        result: Dict[str, list] = {}
+
+        # Layer 1
+        log.info("Block deal radar: trying Layer 1 (curl_cffi NSE API)...")
+        result = _fetch_block_deals_layer1(cutoff)
+        total  = sum(len(v) for v in result.values())
+
+        if total == 0:
+            log.warning("Block deal Layer 1 returned empty — trying Layer 2 (ScraperAPI)...")
+            result = _fetch_block_deals_layer2(cutoff)
+            total  = sum(len(v) for v in result.values())
+
+        if total == 0:
+            log.warning("Block deal Layer 2 returned empty — trying Layer 3 (yfinance)...")
+            syms = universe_symbols or []
+            result = _fetch_block_deals_layer3_yf(syms)
+            total  = sum(len(v) for v in result.values())
+            if total == 0:
+                log.warning("Block deal radar: all 3 layers returned empty — "
+                            "NSE may be down or all IPs blocked. Continuing without.")
+
+        log.info(f"Block deal radar: {total} buy-side entries across {len(result)} symbols "
+                 f"(window={BLOCK_DEAL_WINDOW_DAYS}d)")
+        _BLOCK_DEAL_CACHE = result
+        _BLOCK_DEAL_TS    = now
+        return result
+
+
+def check_block_deal_signal(symbol: str) -> dict:
+    """
+    Cross-reference symbol against the cached block/bulk deal data.
+    Called per-symbol in Stage 3 — O(1) dict lookup after prefetch.
+
+    Signal tiers:
+        Any buy-side deal in window      → block_deal_found=True  (+20 pts)
+        FII/MF/LIC in client name        → institutional_buyer=True (+15 pts)
+        Deal size > 1 lakh shares        → large_block=True (+10 pts)
+
+    Max block deal contribution: +45 pts
+    """
+    deals = _fetch_all_block_deals().get(symbol, [])
+    result = {
+        "block_deal_found":    False,
+        "block_deal_count":    0,
+        "large_block":         False,
+        "institutional_buyer": False,
+        "block_deal_layer":    "",     # which layer sourced the data
+        "block_deal_summary":  "",
+        "block_deal_score":    0,
+    }
+    if not deals:
+        return result
+
+    result["block_deal_found"]  = True
+    result["block_deal_count"]  = len(deals)
+    result["block_deal_layer"]  = deals[0].get("type", "UNKNOWN")
+
+    # Institutional buyer detection
+    for deal in deals:
+        cn = deal["client"].upper()
+        if any(kw in cn for kw in _INST_BUYER_KW):
+            result["institutional_buyer"] = True
+            break
+
+    # Largest single deal by share count
+    max_deal = max(deals, key=lambda d: d["qty"])
+    result["large_block"] = max_deal["qty"] > 100_000   # >1L shares = significant
+
+    # Summary string for Telegram + Sheets
+    lines = []
+    for d in sorted(deals, key=lambda d: d["qty"], reverse=True)[:3]:
+        qty_str = f"{d['qty']:,}" if d["qty"] > 0 else "n/a"
+        px_str  = f"@ ₹{d['price']}" if d["price"] > 0 else ""
+        lines.append(f"[{d['date']}] {d['client']} | {qty_str} shares {px_str} ({d['type']})")
+    result["block_deal_summary"] = " | ".join(lines)[:200]
+
+    # Score
+    score = BLOCK_DEAL_BONUS_PTS
+    if result["institutional_buyer"]: score += BLOCK_DEAL_INST_BONUS
+    if result["large_block"]:         score += BLOCK_DEAL_SIZE_BONUS
+    result["block_deal_score"] = score
+
+    log.info(f"  🏦 BLOCK DEAL {symbol} | count={len(deals)} "
+             f"inst={result['institutional_buyer']} large={result['large_block']} "
+             f"layer={result['block_deal_layer']} +{score}pts")
+    return result
+
+
 def insider_friend_audit(symbol: str, filings: str, insiders: str,
                          pledge_pct: float = -1.0) -> dict:
     """
@@ -1471,14 +1993,27 @@ def score_stone_math(symbol: str, bhav_row: dict) -> Optional[dict]:
     math_score = max(0, math_score + sector_alpha)
     log.debug(f"  SectorAlpha {sym}: {sector_desc} → score adj {sector_alpha:+d}")
 
+    # TITANIUM T2: Revenue Quality Gate (soft — penalises score, never hard-rejects)
+    # Only runs after EPS gate passes — quality check on a failing business is redundant.
+    _, gq = check_revenue_quality(sym)
+    quality_adj = gq.get("quality_score", 0)
+    math_score  = max(0, math_score + quality_adj)
+    log.debug(f"  Quality {sym}: {quality_adj:+d}pts | {gq.get('reason','')[:80]}")
+
     return {
-        "symbol":       sym,
-        "close":        close,
-        "math_score":   math_score,
-        "sector_alpha": sector_alpha,
-        "sector_desc":  sector_desc,
-        "industry":     industry,
-        "weekly_df":    weekly,
+        "symbol":            sym,
+        "close":             close,
+        "math_score":        math_score,
+        "sector_alpha":      sector_alpha,
+        "sector_desc":       sector_desc,
+        "industry":          industry,
+        "weekly_df":         weekly,
+        # Quality fields — surfaced in stone dict and Sheets
+        "quality_score":     quality_adj,
+        "quality_flags":     gq.get("quality_flags", []),
+        "ocf_pat_ratio":     gq.get("ocf_pat_ratio", None),
+        "roce_pct":          gq.get("roce_pct", None),
+        "debtor_growth_pct": gq.get("debtor_growth_pct", None),
         "g1": g1, "g2": g2, "g3": g3,
     }
 
@@ -1505,30 +2040,47 @@ def _send_tg(text: str):
 
 def send_telegram_stones(stones: List[dict], date_label: str, total_scanned: int):
     lines = [
-        f"🕴️ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>",
+        f"🕴️ <b>INSIDER SYNDICATE v14.0 TITANIUM+ — {date_label}</b>",
         f"Scanned: {total_scanned} | Pearls found: {len(stones)}",
         "",
     ]
     for s in stones[:TOP_N_STONES]:
         grade      = s.get("pearl_grade", "WATCH")
         grade_icon = {"DIAMOND": "💎", "PEARL": "🪨", "WATCH": "👁", "UNKNOWN": "❓"}.get(grade, "🪨")
-        catalyst_tag = "🔥 CATALYST"    if s.get("stealth_catalyst") else ""
-        insider_tag  = "👤 INSIDER BUY" if s.get("insider_buying")   else ""
-        capex_tag    = "🏗 CAPEX"       if s.get("capex_signal")     else ""
-        tags = " | ".join(t for t in [catalyst_tag, insider_tag, capex_tag] if t)
+        catalyst_tag = "🔥 CATALYST"       if s.get("stealth_catalyst")   else ""
+        insider_tag  = "👤 INSIDER BUY"   if s.get("insider_buying")     else ""
+        capex_tag    = "🏗 CAPEX"          if s.get("capex_signal")       else ""
+        inst_tag     = "🏦 INST BLOCK"     if s.get("institutional_buyer") else (
+                       "📦 BLOCK DEAL"     if s.get("block_deal_found")   else "")
+        quality_tag  = f"⚠️ QUALITY ({len(s.get('quality_flags','').split('|'))}FL)" if s.get("quality_flags") else ""
+        tags = " | ".join(t for t in [catalyst_tag, insider_tag, capex_tag, inst_tag, quality_tag] if t)
         pledge_str = f" | Pledge {s['pledge_pct']:.0f}%" if s.get("pledge_pct", -1) >= 0 else ""
         sector_str = f"\n   📊 {s['sector_desc']}" if s.get("sector_alpha", 0) != 0 and s.get("sector_desc") else ""
+        index_str  = (f"\n   📈 Index Rank #{s['index_rank']} | FF-MCap ₹{s['ff_mcap_cr']:,.0f}Cr"
+                      if s.get("index_rank", -1) > 0 and s["index_rank"] <= 50 else "")
         lines += [
             f"{grade_icon} <b>{s['symbol']}</b> [{grade}] — Score {s['total_score']} | Conf {s.get('insider_confidence',0)}%{pledge_str}",
             f"   Close ₹{s['close']:.0f} | {s.get('discount_pct',0):.0f}% below 52W High",
-            f"   EPS {s.get('eps_growth_pct',0):+.0f}% QoQ | Sponge {s.get('sponge_weeks',0)}w{sector_str}",
+            f"   EPS {s.get('eps_growth_pct',0):+.0f}% QoQ | Sponge {s.get('sponge_weeks',0)}w{sector_str}{index_str}",
             f"   Target ₹{s['target_25pct']:.0f} (+{s['upside_6m_pct']:.0f}% in 6m) | Stop ₹{s['stop_loss']:.0f}",
             f"   {tags}",
         ]
         if s.get("insider_summary") and "DATA_MISSING" not in s.get("insider_summary", ""):
             lines.append(f"   🤫 <i>{s['insider_summary'][:120]}</i>")
+        if s.get("block_deal_summary"):
+            lines.append(f"   🏦 <i>{s['block_deal_summary'][:120]}</i>")
         if s.get("risk_flags") and s.get("risk_flags") not in ("NONE", ""):
             lines.append(f"   ⚠️ <i>Risk: {s['risk_flags'][:100]}</i>")
+        if s.get("quality_flags"):
+            lines.append(f"   📉 <i>Quality flags: {s['quality_flags'][:80]}</i>")
+        ocf = s.get("ocf_pat_ratio")
+        roce = s.get("roce_pct")
+        if ocf is not None or roce is not None:
+            ocf_str  = f"OCF/PAT {ocf:.2f}x" if ocf is not None else ""
+            roce_str = f"ROCE {roce:.1f}%" if roce is not None else ""
+            qual_line = " | ".join(x for x in [ocf_str, roce_str] if x)
+            if qual_line:
+                lines.append(f"   💵 {qual_line}")
         lines.append("")
     if not stones:
         lines.append("No stealth insider action detected this week.")
@@ -1543,12 +2095,15 @@ _INCUBATOR_HEADER = [
     # Identity
     "Date", "Symbol", "PearlGrade",
     # Scores
-    "TotalScore", "RubbleScore", "EPSScore", "SpongeScore", "SectorAlpha", "InsiderScore",
+    "TotalScore", "RubbleScore", "EPSScore", "SpongeScore", "SectorAlpha",
+    "InsiderScore", "BlockDealScore", "QualityScore",
     # Price & technicals
     "Close", "MA200", "Discount%", "High52W", "Low52W",
     "BoxWeeks", "BoxWidth%", "MA200Slope%",
     # EPS
     "EPS_Growth%", "EPS_Latest", "EPS_Prior", "EPS_Metric",
+    # T2: Revenue Quality
+    "OCF_PAT_Ratio", "ROCE%", "DebtorGrowth%", "QualityFlags",
     # Volume
     "DryUpWeeks", "SpongeWeeks",
     # Sector
@@ -1556,8 +2111,15 @@ _INCUBATOR_HEADER = [
     # Insider audit
     "StealthCatalyst", "InsiderBuying", "CapexSignal",
     "Pledge%", "InsiderConfidence", "RiskPenalty", "InsiderSummary", "RiskFlags",
+    # T1: Block Deal Radar
+    "BlockDealFound", "BlockDealCount", "InstitutionalBuyer",
+    "LargeBlock", "BlockDealLayer", "BlockDealSummary",
+    # Index Alpha
+    "IndexRank", "FF_MCap_Cr",
     # Targets
     "StopLoss", "Target30%", "Target80%", "Upside6m%", "Upside12m%",
+    # Story
+    "Story",
 ]
 
 def _stone_to_row(s: dict) -> list:
@@ -1573,6 +2135,8 @@ def _stone_to_row(s: dict) -> list:
         s.get("sponge_score", 0),
         s.get("sector_alpha", 0),
         s.get("insider_score", 0),
+        s.get("block_deal_score", 0),
+        s.get("quality_score", 0),
         # Price & technicals
         s.get("close", 0),
         s.get("ma200", 0),
@@ -1587,6 +2151,11 @@ def _stone_to_row(s: dict) -> list:
         s.get("eps_latest", 0),
         s.get("eps_prior", 0),
         s.get("eps_metric", "EPS"),
+        # T2: Revenue Quality
+        s.get("ocf_pat_ratio", ""),
+        s.get("roce_pct", ""),
+        s.get("debtor_growth_pct", ""),
+        s.get("quality_flags", "")[:120],
         # Volume
         s.get("dry_up_weeks", 0),
         s.get("sponge_weeks", 0),
@@ -1602,12 +2171,24 @@ def _stone_to_row(s: dict) -> list:
         s.get("risk_penalty", 0),
         s.get("insider_summary", "")[:120],
         s.get("risk_flags", "")[:100],
+        # T1: Block Deal Radar
+        "✅" if s.get("block_deal_found")    else "",
+        s.get("block_deal_count", 0),
+        "✅" if s.get("institutional_buyer") else "",
+        "✅" if s.get("large_block")         else "",
+        s.get("block_deal_layer", ""),
+        s.get("block_deal_summary", "")[:120],
+        # Index Alpha
+        s.get("index_rank", -1),
+        s.get("ff_mcap_cr", 0),
         # Targets
         s.get("stop_loss", 0),
         s.get("target_25pct", 0),
         s.get("target_60pct", 0),
         s.get("upside_6m_pct", 0),
         s.get("upside_12m_pct", 0),
+        # Story
+        s.get("story", "")[:200],
     ]
 
 def push_stones_to_sheets(stones: List[dict], date_label: str):
@@ -1700,14 +2281,490 @@ def push_sharia_log(sharia_decisions: List[dict], date_label: str):
     log.info(f"SHARIA_LOG: {len(sharia_decisions)} decisions logged ✅")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — MAIN RUN
+# SECTION 14b — TITANIUM T3: OUTCOME TRACKER + CALIBRATION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+# Every trading system degrades over time due to regime shifts. Without a
+# feedback loop, scoring weights set in v1 stay forever.
+#
+# This module closes the loop:
+#   1. Write every Friday's picks as PENDING rows in OUTCOMES Sheets tab.
+#   2. Each subsequent run fetches current prices for PENDING rows and fills
+#      in 4W / 13W / 26W return columns plus Nifty 50 alpha.
+#   3. CLI flag --calibrate prints gate win-rate correlation table:
+#      which gates predict WINNER outcomes vs which are noise.
+#
+# "GateFlags" encodes which signals fired per pick:
+#   R = Rubble  E = EPS  S = Sponge  I = Insider  B = Block Deal
+#   Q = Quality clean (+)  X = Index Alpha top-50
+# This lets calibration slice win rate by any gate combination.
+
+_OUTCOMES_HEADER = [
+    "PickDate", "Symbol", "EntryPrice", "PearlGrade", "TotalScore", "GateFlags",
+    # Filled in on subsequent runs:
+    "Price_4W",  "Return_4W%",  "Nifty_4W%",  "Alpha_4W%",
+    "Price_13W", "Return_13W%", "Nifty_13W%", "Alpha_13W%",
+    "Price_26W", "Return_26W%", "Nifty_26W%", "Alpha_26W%",
+    "OutcomeGrade",   # WINNER (>15%) / FLAT (0-15%) / LOSER (<0%) / PENDING
+    "Notes",
+]
+
+_nifty_return_cache: Dict[str, float] = {}
+
+
+def _get_current_price_yf(symbol: str) -> float:
+    """Fetch latest close for a symbol. Returns 0.0 on failure."""
+    try:
+        hist = yf.Ticker(f"{symbol}.NS").history(period="5d")
+        return float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
+    except Exception:
+        return 0.0
+
+
+def _get_nifty_return_since(from_date_str: str) -> float:
+    """
+    Returns Nifty 50 total return (%) from from_date to today.
+    Cached per run — avoids repeated yfinance calls for same date.
+    """
+    if from_date_str in _nifty_return_cache:
+        return _nifty_return_cache[from_date_str]
+    try:
+        from_dt = datetime.strptime(from_date_str, "%Y-%m-%d")
+        hist    = yf.Ticker("^NSEI").history(
+            start=from_dt - timedelta(days=5),
+            end=datetime.today()
+        )
+        if hist.empty or len(hist) < 2:
+            return 0.0
+        entry   = float(hist["Close"].iloc[0])
+        current = float(hist["Close"].iloc[-1])
+        ret     = round((current - entry) / entry * 100, 2) if entry > 0 else 0.0
+        _nifty_return_cache[from_date_str] = ret
+        return ret
+    except Exception:
+        return 0.0
+
+
+def push_outcomes(stones: List[dict], date_label: str):
+    """
+    Titanium T3: Outcome Tracker.
+
+    1. For existing PENDING rows whose pick date is ≥4W ago, fetch current
+       price and fill in whichever return windows have elapsed (4W / 13W / 26W).
+    2. Resolve outcome at 26W: WINNER (>15% return), FLAT (0-15%), LOSER (<0%).
+    3. Append today's picks as new PENDING rows.
+
+    The OUTCOMES tab is both input and output: read first, update, then write back.
+    """
+    if not OUTCOMES_ENABLED or not _YFINANCE_OK:
+        log.info("Outcomes tracker: disabled or yfinance unavailable")
+        return
+
+    existing = _read_sheet("OUTCOMES")
+    header   = _OUTCOMES_HEADER
+
+    # Determine column index lookup
+    def pi(col_name: str) -> int:
+        return header.index(col_name)
+
+    today = datetime.today()
+    rows: list = [header]   # always write fresh header
+
+    # ── Update existing PENDING rows ──────────────────────────────────────────
+    data_rows = existing[1:] if len(existing) > 1 else []
+    updated_count = 0
+
+    for row in data_rows:
+        if not row or len(row) < 6:
+            rows.append(row)
+            continue
+
+        # Pad short rows (older runs with fewer columns)
+        while len(row) < len(header):
+            row.append("")
+
+        outcome_grade = str(row[pi("OutcomeGrade")])
+        if outcome_grade not in ("PENDING", ""):
+            rows.append(row)   # already resolved — keep as-is
+            continue
+
+        pick_date_str = str(row[pi("PickDate")])
+        sym           = str(row[pi("Symbol")])
+        entry_price   = float(row[pi("EntryPrice")] or 0)
+
+        if entry_price <= 0 or not sym:
+            rows.append(row)
+            continue
+        try:
+            pick_dt = datetime.strptime(pick_date_str, "%Y-%m-%d")
+        except Exception:
+            rows.append(row)
+            continue
+
+        weeks_elapsed = (today - pick_dt).days / 7
+        if weeks_elapsed < 3.5:   # not yet 4 weeks — too early to update
+            rows.append(row)
+            continue
+
+        current_px  = _get_current_price_yf(sym)
+        if current_px <= 0:
+            rows.append(row)
+            continue
+
+        current_ret = round((current_px - entry_price) / entry_price * 100, 2)
+        nifty_ret   = _get_nifty_return_since(pick_date_str)
+        alpha       = round(current_ret - nifty_ret, 2)
+        row         = list(row)   # make mutable
+
+        # Fill whichever windows have elapsed (fill only once per window)
+        if weeks_elapsed >= 4 and not row[pi("Price_4W")]:
+            row[pi("Price_4W")]    = round(current_px, 2)
+            row[pi("Return_4W%")] = current_ret
+            row[pi("Nifty_4W%")] = nifty_ret
+            row[pi("Alpha_4W%")] = alpha
+            updated_count += 1
+
+        if weeks_elapsed >= 13 and not row[pi("Price_13W")]:
+            row[pi("Price_13W")]    = round(current_px, 2)
+            row[pi("Return_13W%")] = current_ret
+            row[pi("Nifty_13W%")] = nifty_ret
+            row[pi("Alpha_13W%")] = alpha
+            updated_count += 1
+
+        if weeks_elapsed >= 26 and not row[pi("Price_26W")]:
+            row[pi("Price_26W")]    = round(current_px, 2)
+            row[pi("Return_26W%")] = current_ret
+            row[pi("Nifty_26W%")] = nifty_ret
+            row[pi("Alpha_26W%")] = alpha
+            # Resolve final outcome grade at 26W
+            if current_ret > 15:
+                row[pi("OutcomeGrade")] = "WINNER"
+            elif current_ret < 0:
+                row[pi("OutcomeGrade")] = "LOSER"
+            else:
+                row[pi("OutcomeGrade")] = "FLAT"
+            updated_count += 1
+
+        rows.append(row)
+
+    # ── Write new picks as PENDING ────────────────────────────────────────────
+    for s in stones:
+        gate_flags = "|".join(filter(None, [
+            "R" if s.get("rubble_score", 0) > 20           else "",
+            "E" if s.get("eps_growth_pct", 0) > 25         else "",
+            "S" if s.get("sponge_weeks", 0) > 0            else "",
+            "I" if s.get("insider_buying")                  else "",
+            "B" if s.get("block_deal_found")                else "",
+            "Q" if s.get("quality_score", 0) > 0           else "",
+            "X" if 0 < s.get("index_rank", 999) <= 50      else "",
+        ]))
+        new_row = [""] * len(header)
+        new_row[pi("PickDate")]      = date_label
+        new_row[pi("Symbol")]        = s["symbol"]
+        new_row[pi("EntryPrice")]    = s["close"]
+        new_row[pi("PearlGrade")]    = s.get("pearl_grade", "")
+        new_row[pi("TotalScore")]    = s.get("total_score", 0)
+        new_row[pi("GateFlags")]     = gate_flags
+        new_row[pi("OutcomeGrade")]  = "PENDING"
+        rows.append(new_row)
+
+    _push_sheet("OUTCOMES", rows)
+    log.info(f"OUTCOMES: {len(stones)} new picks written | "
+             f"{updated_count} return windows filled | "
+             f"{len(rows)-1} total rows ✅")
+
+
+def run_calibration_report():
+    """
+    Titanium T3: Gate Calibration Engine.
+    Reads OUTCOMES tab and prints statistical win-rate correlation table.
+
+    CLI: python incubator_v14.py --calibrate
+
+    Output: which gate combinations predict WINNER vs LOSER outcomes.
+    Use this monthly to tune scoring weights from data, not intuition.
+    A correct screener gate should show win rate ≥60%.
+    A gate below 40% is noise — consider reducing its score weight.
+    """
+    if not _gs_ok():
+        print("Calibration requires Google Sheets connection (set GOOGLE_SHEET_ID + GOOGLE_CREDS_JSON)")
+        return
+
+    rows = _read_sheet("OUTCOMES")
+    if not rows or len(rows) < 10:
+        print("Insufficient outcome data — need ≥10 rows in OUTCOMES tab")
+        return
+
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    df = df[df["OutcomeGrade"].isin(["WINNER", "LOSER", "FLAT"])]
+    if df.empty:
+        print("No resolved outcomes yet — all rows are PENDING (check back in 26 weeks)")
+        return
+
+    for col in ["TotalScore", "Return_26W%", "Alpha_26W%", "Return_13W%", "Alpha_13W%"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["is_winner"] = df["OutcomeGrade"] == "WINNER"
+    n_total  = len(df)
+    n_winner = int(df["is_winner"].sum())
+
+    print("\n" + "═" * 65)
+    print(f"  INCUBATOR CALIBRATION REPORT — v14.0 TITANIUM+")
+    print(f"  Resolved picks: {n_total} | Winners: {n_winner} | "
+          f"Win rate: {n_winner/n_total*100:.1f}%")
+    print("═" * 65)
+
+    # ── Gate flag analysis ────────────────────────────────────────────────────
+    gate_meta = {
+        "R": ("Rubble gate",         "Price ≥30% below 52W high"),
+        "E": ("EPS acceleration",    "≥+25% QoQ earnings growth"),
+        "S": ("Sponge volume",       "Dry red + wet green weeks"),
+        "I": ("Insider buying",      "SAST/PIT promoter trades"),
+        "B": ("Block deal radar",    "FII/DII block/bulk confirmation"),
+        "Q": ("Quality gate clean",  "OCF/PAT + ROCE + Debtor days OK"),
+        "X": ("Index alpha top-50",  "Near Nifty 50 inclusion boundary"),
+    }
+    print(f"\n  {'GATE':<28} {'WIN RATE':>10} {'AVG RET 26W':>13} {'N':>5}")
+    print(f"  {'-'*28} {'-'*10} {'-'*13} {'-'*5}")
+    for code, (name, _) in gate_meta.items():
+        if "GateFlags" not in df.columns:
+            break
+        mask = df["GateFlags"].str.contains(code, na=False)
+        if mask.sum() < 3:
+            continue
+        wr  = df[mask]["is_winner"].mean() * 100
+        ret = df[mask]["Return_26W%"].mean() if "Return_26W%" in df.columns else float("nan")
+        n   = mask.sum()
+        flag = "  ↑ STRONG" if wr > 65 else ("  ↓ WEAK" if wr < 40 else "")
+        print(f"  {name:<28} {wr:>9.1f}% {ret:>+12.1f}% {n:>5}{flag}")
+
+    # ── Grade correlation ─────────────────────────────────────────────────────
+    print(f"\n  {'GRADE':<12} {'WIN RATE':>10} {'AVG RET 26W':>13} {'AVG ALPHA':>11} {'N':>5}")
+    print(f"  {'-'*12} {'-'*10} {'-'*13} {'-'*11} {'-'*5}")
+    for grade in ["DIAMOND", "PEARL", "WATCH"]:
+        mask = df["PearlGrade"] == grade
+        if mask.sum() < 2:
+            continue
+        wr   = df[mask]["is_winner"].mean() * 100
+        ret  = df[mask]["Return_26W%"].mean() if "Return_26W%" in df.columns else float("nan")
+        alp  = df[mask]["Alpha_26W%"].mean()  if "Alpha_26W%"  in df.columns else float("nan")
+        n    = mask.sum()
+        print(f"  {grade:<12} {wr:>9.1f}% {ret:>+12.1f}% {alp:>+10.1f}% {n:>5}")
+
+    # ── Score bucket analysis ─────────────────────────────────────────────────
+    print(f"\n  {'SCORE BUCKET':<14} {'WIN RATE':>10} {'AVG RET 26W':>13} {'N':>5}")
+    print(f"  {'-'*14} {'-'*10} {'-'*13} {'-'*5}")
+    df["bucket"] = pd.cut(
+        df["TotalScore"],
+        bins=[0, 80, 100, 120, 140, 200, 9999],
+        labels=["<80", "80-100", "100-120", "120-140", "140-200", "200+"]
+    )
+    for bucket, grp in df.groupby("bucket", observed=True):
+        if len(grp) < 2:
+            continue
+        wr  = grp["is_winner"].mean() * 100
+        ret = grp["Return_26W%"].mean() if "Return_26W%" in df.columns else float("nan")
+        print(f"  {str(bucket):<14} {wr:>9.1f}% {ret:>+12.1f}% {len(grp):>5}")
+
+    # ── Weight tuning recommendations ─────────────────────────────────────────
+    print(f"\n  WEIGHT TUNING RECOMMENDATIONS:")
+    for code, (name, desc) in gate_meta.items():
+        if "GateFlags" not in df.columns:
+            break
+        mask = df["GateFlags"].str.contains(code, na=False)
+        if mask.sum() < 3:
+            continue
+        wr = df[mask]["is_winner"].mean() * 100
+        if wr > 65:
+            print(f"  ↑ INCREASE weight: {name} ({wr:.1f}% win rate — above 65% threshold)")
+        elif wr < 40:
+            print(f"  ↓ REDUCE weight:   {name} ({wr:.1f}% win rate — below 40% threshold)")
+
+    print("═" * 65 + "\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 15 — INDEX ALPHA ENGINE (Passive ETF Flow Target Detection)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Nifty 50 and Nifty Next 50 rebalancing creates predictable structural demand:
+# passive ETFs tracking these indices MUST buy newly-included stocks regardless
+# of price. A stock on the cusp of index inclusion (ranked just outside top 50
+# by free-float market cap) becomes a high-conviction "structural multi-bagger"
+# because ETF inflow provides a price floor independent of any single catalyst.
+#
+# This module calculates 6-month rolling free-float market cap for the top-N
+# liquid NSE stocks and surfaces those nearest the Nifty 50 / Next 50 boundary.
+# Qualifying stocks that also pass CANSLIM compression scoring are upgraded to
+# DIAMOND grade with +25 bonus points in the main scoring loop.
+
+_INDEX_ALPHA_CACHE: Optional[pd.DataFrame] = None
+_INDEX_ALPHA_TS: float = 0.0
+_INDEX_ALPHA_LOCK = threading.Lock()
+
+
+def compute_rolling_index_alpha(universe_symbols: List[str]) -> pd.DataFrame:
+    """
+    Calculates 6-month rolling free-float market cap for every symbol in the
+    provided universe and ranks them by descending free-float capitalisation.
+
+    Used to detect stocks near the Nifty 50 / Next 50 index inclusion boundary
+    — passive ETF rebalancing creates forced structural buying at those cutoffs.
+
+    Args:
+        universe_symbols: List of NSE ticker symbols (without .NS suffix).
+
+    Returns:
+        DataFrame with columns:
+            symbol, free_float_mcap_cr, avg_turnover_cr, current_price, index_rank
+        Sorted descending by free_float_mcap_cr.
+        Empty DataFrame if yfinance is unavailable or no data fetched.
+    """
+    if not _YFINANCE_OK:
+        log.warning("Index Alpha: yfinance not installed — skipping (pip install yfinance)")
+        return pd.DataFrame()
+
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=INDEX_ALPHA_LOOKBACK)
+
+    rebalance_metrics: List[dict] = []
+    total = len(universe_symbols)
+    log.info(f"Index Alpha: computing free-float mcap for {total} symbols over "
+             f"{INDEX_ALPHA_LOOKBACK}d window...")
+
+    for idx, symbol in enumerate(universe_symbols):
+        if (idx + 1) % 25 == 0:
+            log.info(f"  Index Alpha progress: {idx+1}/{total}")
+        try:
+            ticker = yf.Ticker(f"{symbol}.NS")
+            hist   = ticker.history(start=start_date, end=end_date, interval="1d")
+
+            # Need ≥100 trading days for a meaningful rolling average
+            if hist.empty or len(hist) < 100:
+                continue
+
+            info         = ticker.info
+            total_shares = info.get("sharesOutstanding", 0)
+            if not total_shares or total_shares <= 0:
+                continue
+
+            # Float factor: ratio of freely-tradeable shares to total issued shares.
+            # Promoter/govt locked-in shares are excluded from index weight.
+            # Default 0.45 (45%) is a conservative mid-cap estimate per NSE methodology.
+            float_shares = info.get("floatShares", 0)
+            if float_shares and float_shares > 0:
+                float_factor = min(float_shares / total_shares, 1.0)
+            else:
+                float_factor = 0.45   # NSE default for unknown float
+
+            # Typical price = (H+L+C)/3 — removes single-tick close bias
+            hist["typical_price"] = (hist["High"] + hist["Low"] + hist["Close"]) / 3.0
+            hist["daily_turnover"] = hist["Close"] * hist["Volume"]
+
+            avg_close        = float(hist["Close"].mean())
+            avg_turnover_cr  = float(hist["daily_turnover"].mean() / 1e7)   # ₹ crore
+
+            # Free Float Market Cap = Total Shares × Avg Price × Float Factor
+            raw_mcap         = total_shares * avg_close
+            free_float_mcap_cr = (raw_mcap * float_factor) / 1e7   # ₹ crore
+
+            rebalance_metrics.append({
+                "symbol":            symbol,
+                "free_float_mcap_cr": round(free_float_mcap_cr, 2),
+                "avg_turnover_cr":    round(avg_turnover_cr, 2),
+                "current_price":      round(float(hist["Close"].iloc[-1]), 2),
+                "float_factor":       round(float_factor, 3),
+            })
+
+        except Exception as e:
+            log.debug(f"Index Alpha {symbol}: {e}")
+            continue
+
+    if not rebalance_metrics:
+        log.warning("Index Alpha: no metrics computed — returning empty frame")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rebalance_metrics)
+    df["index_rank"] = df["free_float_mcap_cr"].rank(ascending=False, method="min").astype(int)
+    df = df.sort_values("free_float_mcap_cr", ascending=False).reset_index(drop=True)
+
+    log.info(f"Index Alpha: ranked {len(df)} symbols. "
+             f"Top-3 by FF-Mcap: {list(df['symbol'].head(3))}")
+    return df
+
+
+def get_index_alpha(universe_symbols: List[str]) -> pd.DataFrame:
+    """
+    Thread-safe cached wrapper around compute_rolling_index_alpha().
+    Re-computes at most once per run (cached for 6 hours).
+
+    Returns the ranked DataFrame, or empty DataFrame on failure.
+    """
+    global _INDEX_ALPHA_CACHE, _INDEX_ALPHA_TS
+    with _INDEX_ALPHA_LOCK:
+        now = time.time()
+        if _INDEX_ALPHA_CACHE is not None and (now - _INDEX_ALPHA_TS) < 21600:
+            log.info("Index Alpha: returning cached result")
+            return _INDEX_ALPHA_CACHE
+
+        result = compute_rolling_index_alpha(universe_symbols)
+        _INDEX_ALPHA_CACHE = result
+        _INDEX_ALPHA_TS    = now
+        return result
+
+
+def apply_index_alpha_bonus(asset: dict, index_df: pd.DataFrame) -> dict:
+    """
+    Cross-references a scored asset against the index alpha rankings.
+    If the asset ranks within INDEX_ALPHA_RANK_CUTOFF (default ≤50), it
+    receives INDEX_ALPHA_BONUS_PTS bonus score points and is upgraded to
+    DIAMOND grade — passive ETF rebalancing acts as a structural price floor.
+
+    Args:
+        asset:    Stone dict as produced by Stage 3 scoring loop.
+        index_df: DataFrame from compute_rolling_index_alpha().
+
+    Returns:
+        Modified asset dict (mutated in-place and returned).
+    """
+    if index_df.empty:
+        return asset
+
+    sym   = asset.get("symbol", "")
+    match = index_df[index_df["symbol"] == sym]
+
+    if match.empty:
+        return asset
+
+    row  = match.iloc[0]
+    rank = int(row["index_rank"])
+    ff_mcap = round(float(row["free_float_mcap_cr"]), 0)
+
+    asset["index_rank"]    = rank
+    asset["ff_mcap_cr"]    = ff_mcap
+    asset["float_factor"]  = float(row.get("float_factor", 0))
+
+    if rank <= INDEX_ALPHA_RANK_CUTOFF:
+        asset["total_score"] += INDEX_ALPHA_BONUS_PTS
+        asset["pearl_grade"]  = "DIAMOND"
+        tag = (f" | 📊 Passive ETF Flow Target — FF-MCap ₹{ff_mcap:,.0f}Cr"
+               f" (Index Rank #{rank} — near Nifty inclusion boundary)")
+        asset["story"] = asset.get("story", "") + tag
+        log.info(f"  📊 INDEX ALPHA BONUS {sym} | rank=#{rank} | "
+                 f"ff_mcap=₹{ff_mcap:,.0f}Cr | +{INDEX_ALPHA_BONUS_PTS}pts → DIAMOND")
+
+    return asset
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 16 — MAIN RUN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run():
     log.info("=" * 70)
     log.info(f"  {VERSION}")
-    log.info(f"  Stage1: Rubble+EPS+Sponge → Stage2: Sharia → Stage3: cffi-Heist+InsiderLLM")
-    log.info(f"  Score gate: {STONE_SCORE_MIN} | Top N: {TOP_N_STONES}")
+    log.info(f"  Stage1: Rubble+EPS+Sponge → Stage2: Sharia → Stage3: cffi-Heist+InsiderLLM+IndexAlpha")
+    log.info(f"  Score gate: {STONE_SCORE_MIN} | Top N: {TOP_N_STONES} | IndexAlpha: {'ON' if INDEX_ALPHA_ENABLED else 'OFF'}")
     log.info("=" * 70)
 
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1721,7 +2778,7 @@ def run():
     bhav = load_universe()
     if bhav.empty:
         log.error("Universe empty — abort")
-        _send_tg(f"❌ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\nUniverse unavailable.")
+        _send_tg(f"❌ <b>INSIDER SYNDICATE v13.0 — {date_label}</b>\nUniverse unavailable.")
         return []
     _write_sentinel("UNIVERSE_LOADED", {"ROWS": len(bhav)})
 
@@ -1730,7 +2787,7 @@ def run():
     log.info(f"Candidates after turnover gate: {len(cands)}")
 
     if cands.empty:
-        _send_tg(f"📋 <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\nNo candidates after turnover filter.")
+        _send_tg(f"📋 <b>INSIDER SYNDICATE v13.0 — {date_label}</b>\nNo candidates after turnover filter.")
         return []
 
     # ── STAGE 1: Pure Quantitative & Fundamental Sweep ───────────────────────
@@ -1791,6 +2848,39 @@ def run():
     log.info(f"Stage 2 complete. {len(halal_survivors)} halal survivors → insider heist.")
     _write_sentinel("STAGE2_DONE", {"HALAL_SURVIVORS": len(halal_survivors)})
 
+    # ── INDEX ALPHA: Pre-compute free-float mcap rankings ─────────────────────
+    # Run once over the top-N liquid symbols so per-stock cross-reference is O(1).
+    # Disabled via INDEX_ALPHA_ENABLED=0 env var (e.g. to save yfinance API time).
+    index_df = pd.DataFrame()
+    if INDEX_ALPHA_ENABLED:
+        try:
+            # Use the top INDEX_ALPHA_UNIVERSE_N symbols by turnover from the
+            # bhavcopy universe (already liquidity-sorted by load_universe()).
+            alpha_symbols = list(bhav["symbol"].head(INDEX_ALPHA_UNIVERSE_N))
+            index_df = get_index_alpha(alpha_symbols)
+            if not index_df.empty:
+                _write_sentinel("INDEX_ALPHA_DONE", {"RANKED": len(index_df)})
+        except Exception as e:
+            log.warning(f"Index Alpha compute failed (non-fatal): {e}")
+    else:
+        log.info("Index Alpha: disabled via INDEX_ALPHA_ENABLED=0")
+
+    # ── TITANIUM T1: Block Deal prefetch ──────────────────────────────────────
+    # Hits NSE once for the entire run. Per-symbol lookup below is O(1) cache hit.
+    # 3-layer fallback: curl_cffi → ScraperAPI → yfinance (zero infrastructure).
+    if BLOCK_DEAL_ENABLED:
+        try:
+            universe_syms = list(bhav["symbol"].head(200))
+            _fetch_all_block_deals(universe_syms)
+            _write_sentinel("BLOCK_DEAL_DONE", {
+                "SYMBOLS": len(_BLOCK_DEAL_CACHE or {}),
+                "ENTRIES": sum(len(v) for v in (_BLOCK_DEAL_CACHE or {}).values()),
+            })
+        except Exception as e:
+            log.warning(f"Block deal prefetch failed (non-fatal): {e}")
+    else:
+        log.info("Block deal radar: disabled via BLOCK_DEAL_ENABLED=0")
+
     # ── STAGE 3: Data Heist + Insider Friend LLM Audit ───────────────────────
     stones: List[dict] = []
     log.info(f"Stage 3: NSE heist + Insider LLM on {len(halal_survivors)} stocks...")
@@ -1804,17 +2894,27 @@ def run():
 
         # Insider Friend LLM reads the legal filings (+ risk extraction + pledge classification)
         audit = insider_friend_audit(sym, filings, insiders, pledge_pct)
-        total_score = item["math_score"] + audit.get("score", 0)
+
+        # TITANIUM T1: Block Deal Radar — O(1) cache lookup, 3-layer fallback
+        bd = check_block_deal_signal(sym) if BLOCK_DEAL_ENABLED else {
+            "block_deal_found": False, "block_deal_count": 0,
+            "large_block": False, "institutional_buyer": False,
+            "block_deal_layer": "", "block_deal_summary": "", "block_deal_score": 0,
+        }
+
+        total_score = item["math_score"] + audit.get("score", 0) + bd["block_deal_score"]
 
         # Hard veto: promoter buying under debt stress (pledge > 50%)
         if audit.get("pearl_grade") == "RED_FLAG":
             log.info(f"  🚩 RED_FLAG VETO {sym} | pledge={pledge_pct:.0f}% debt stress — skip")
             continue
 
-        has_signal   = audit.get("stealth_catalyst_found") or audit.get("insider_buying_found")
+        has_signal   = (audit.get("stealth_catalyst_found")
+                        or audit.get("insider_buying_found")
+                        or bd.get("block_deal_found"))   # T1: block deal = verified signal
         confidence   = audit.get("confidence_score", 0)
 
-        # Gate: explicit insider signal OR math confidence ≥90 (Weinstein: sponge volume IS stealth buying)
+        # Gate: explicit insider/block-deal signal OR math confidence ≥90 (Weinstein: sponge volume IS stealth buying)
         # conf<90 + no signal = skip. Raises bar vs v8's 85 to eliminate ASHOKLEY-type borderline cases.
         if not has_signal and confidence < 90:
             log.info(f"  ⏭ SKIP {sym} | no signal + conf={confidence} < 90")
@@ -1831,6 +2931,7 @@ def run():
         log.info(f"  💎 PEARL {sym} | total={total_score} | "
                  f"catalyst={audit['stealth_catalyst_found']} "
                  f"insider_buy={audit['insider_buying_found']} "
+                 f"block_deal={bd['block_deal_found']} "
                  f"conf={audit['confidence_score']}")
 
         stones.append({
@@ -1857,6 +2958,12 @@ def run():
             "eps_prior":              g2.get("eps_prior", 0),
             "eps_metric":             g2.get("metric", "EPS"),
             "eps_score":              g2.get("score", 0),
+            # TITANIUM T2: Revenue Quality
+            "quality_score":          item.get("quality_score", 0),
+            "quality_flags":          "|".join(item.get("quality_flags", []))[:150],
+            "ocf_pat_ratio":          item.get("ocf_pat_ratio", None),
+            "roce_pct":               item.get("roce_pct", None),
+            "debtor_growth_pct":      item.get("debtor_growth_pct", None),
             # Sponge
             "dry_up_weeks":           g3.get("dry_up_weeks", 0),
             "sponge_weeks":           g3.get("sponge_weeks", 0),
@@ -1872,14 +2979,31 @@ def run():
             "insider_summary":        audit.get("insider_summary", "")[:150],
             "insider_confidence":     audit.get("confidence_score", 0),
             "insider_score":          audit.get("score", 0),
+            # TITANIUM T1: Block Deal Radar
+            "block_deal_found":       bd.get("block_deal_found", False),
+            "block_deal_count":       bd.get("block_deal_count", 0),
+            "institutional_buyer":    bd.get("institutional_buyer", False),
+            "large_block":            bd.get("large_block", False),
+            "block_deal_layer":       bd.get("block_deal_layer", ""),
+            "block_deal_summary":     bd.get("block_deal_summary", "")[:150],
+            "block_deal_score":       bd.get("block_deal_score", 0),
             # Targets
             "stop_loss":              stop_loss,
             "target_25pct":           target_6m,
             "target_60pct":           target_12m,
             "upside_6m_pct":          round((target_6m  / item["close"] - 1) * 100, 1),
             "upside_12m_pct":         round((target_12m / item["close"] - 1) * 100, 1),
+            # Index Alpha fields (populated by apply_index_alpha_bonus below)
+            "index_rank":             -1,
+            "ff_mcap_cr":             0.0,
+            "float_factor":           0.0,
+            "story":                  "",
             "run_date":               date_label,
         })
+
+        # ── Index Alpha cross-reference ────────────────────────────────────────
+        # Mutates the stone just appended: may award +25 pts and DIAMOND upgrade.
+        stones[-1] = apply_index_alpha_bonus(stones[-1], index_df)
 
     # Final sort — DIAMOND first, then catalyst+buying, then math score
     def _sort_key(x):
@@ -1926,7 +3050,7 @@ def run():
 
     if not top_stones:
         _send_tg(
-            f"🕴️ <b>INSIDER SYNDICATE v12.0 — {date_label}</b>\n"
+            f"🕴️ <b>INSIDER SYNDICATE v13.0 — {date_label}</b>\n"
             f"Scanned {total} stocks. No Pearls surfaced this week.\n"
             f"No stealth insider action detected. We wait in the shadows. 🕐"
         )
@@ -1934,6 +3058,12 @@ def run():
 
     push_stones_to_sheets(top_stones, date_label)
     send_telegram_stones(top_stones, date_label, total)
+
+    # TITANIUM T3: Outcome Tracker — write picks + update previous returns
+    try:
+        push_outcomes(top_stones, date_label)
+    except Exception as e:
+        log.warning(f"OUTCOMES push failed (non-fatal): {e}")
 
     return top_stones
 
@@ -1943,11 +3073,18 @@ def run():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fortress Incubator v11.0 Insider Syndicate")
-    parser.add_argument("--symbol", help="Score a single symbol for debug")
+    parser = argparse.ArgumentParser(
+        description="Fortress Incubator v14.0 TITANIUM+ | "
+                    "Block Deal Radar + Quality Gate + Outcome Tracker"
+    )
+    parser.add_argument("--symbol",    help="Score a single symbol for debug")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Print gate win-rate calibration report from OUTCOMES tab")
     args = parser.parse_args()
 
-    if args.symbol:
+    if args.calibrate:
+        run_calibration_report()
+    elif args.symbol:
         logging.getLogger().setLevel(logging.DEBUG)
         sym  = args.symbol.upper()
         bhav = load_universe()
@@ -1959,9 +3096,12 @@ if __name__ == "__main__":
         else:
             result = score_stone_math(sym, row.iloc[0].to_dict())
         if result:
-            compliant, reason = dynamic_shariah_audit(sym)
+            compliant, reason, _ = dynamic_shariah_audit(sym)
             result["sharia_compliant"] = compliant
             result["sharia_reason"]    = reason
+            # Also run block deal check for single-symbol debug
+            bd = check_block_deal_signal(sym)
+            result["block_deal"] = bd
             result.pop("weekly_df", None)   # not JSON-serialisable
         print(json.dumps(result, indent=2, default=str) if result else f"{sym}: did not pass math gates")
     else:
