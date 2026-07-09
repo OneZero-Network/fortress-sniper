@@ -51,7 +51,13 @@ jobs:
           restore-keys: |
             pip-v7-${{ runner.os }}-
 
-      # ── 4. Install dependencies ───────────────────────────────────────────────
+      # ── 4a. System deps for scanned-PDF OCR (v8.3) ────────────────────────────
+      - name: Install System Dependencies for Image OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr libtesseract-dev poppler-utils
+
+      # ── 4b. Install dependencies ───────────────────────────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
@@ -65,7 +71,10 @@ jobs:
             google-auth-oauthlib \
             openai \
             beautifulsoup4 \
-            lxml
+            lxml \
+            pypdf \
+            pytesseract>=0.3.10 \
+            pdf2image>=1.17.0
 
       # ── 5. Restore sniper DB cache ────────────────────────────────────────────
       - name: Restore sniper DB cache
