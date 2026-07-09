@@ -62,6 +62,18 @@ except ImportError:
     _CURL_CFFI_OK = False
     log_placeholder = None  # will use log after init
 
+# v8.3: Optional OCR stack for scanned-image corporate announcement PDFs.
+# Degrades gracefully — if tesseract/poppler aren't installed on the runner,
+# OCR is simply skipped rather than crashing the whole run.
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    _OCR_OK = True
+except ImportError:
+    _OCR_OK = False
+
+_OCR_STATS = {"attempted": 0, "success": 0, "failed": 0}
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.basicConfig(
     level=logging.INFO,
@@ -1470,6 +1482,81 @@ def fetch_filings(days_back: int = 14) -> dict:
 # Only fires for symbols that already cleared Fortress math gate.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _extract_scanned_pdf_ocr(pdf_content: bytes, symbol: str = "") -> str:
+    """
+    Converts PDF raw bytes to images and runs Tesseract OCR.
+    Strictly limits conversion to pages 1-2 (passed directly into
+    convert_from_bytes, NOT sliced after) to avoid loading a 60-page
+    annual report fully into RAM and OOM-killing the GHA runner.
+    """
+    global _OCR_STATS
+    if not _OCR_OK:
+        return ""
+    _OCR_STATS["attempted"] += 1
+
+    if not pdf_content or len(pdf_content) < 1000:
+        _OCR_STATS["failed"] += 1
+        return ""
+
+    try:
+        images = convert_from_bytes(pdf_content, first_page=1, last_page=2)
+        extracted_text = ""
+        for img in images:
+            text = pytesseract.image_to_string(img)
+            if text:
+                extracted_text += text + "\n"
+
+        if extracted_text.strip():
+            _OCR_STATS["success"] += 1
+            log.info(f"OCR Success {symbol}: extracted {len(extracted_text)} chars")
+            return extracted_text.strip()
+        _OCR_STATS["failed"] += 1
+        return ""
+    except Exception as e:
+        _OCR_STATS["failed"] += 1
+        log.warning(f"OCR Extraction Exception for {symbol}: {str(e)[:100]}")
+        return ""
+
+
+def fetch_filing_ocr_text(symbol: str, attachment_url: str) -> str:
+    """
+    v8.3: Downloads a corporate announcement PDF and extracts its text.
+    Tries the plain-text layer first (fast, most NSE PDFs are text-based);
+    only falls back to OCR if that yields near-nothing, since OCR is the
+    expensive path (image conversion + tesseract) and should stay rare.
+
+    NOTE: this is only ever called on gate-survivors (post fort_pts>=45),
+    from the enrichment stage — never from the bulk 400-candidate scan.
+    """
+    if not attachment_url:
+        return ""
+    try:
+        sess = _get_nse_session()
+        r = sess.get(attachment_url, timeout=15,
+                     headers={**_NSE_HEADERS, "Accept": "application/pdf"})
+        if r.status_code != 200 or not r.content:
+            return ""
+        pdf_bytes = r.content
+
+        raw_text = ""
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            for page in reader.pages[:2]:
+                raw_text += (page.extract_text() or "") + "\n"
+        except Exception:
+            raw_text = ""
+
+        if not raw_text or len(raw_text.strip()) < 50:
+            log.debug(f"Filing for {symbol} appears scanned — running OCR")
+            raw_text = _extract_scanned_pdf_ocr(pdf_bytes, symbol)
+
+        return raw_text[:5000]
+    except Exception as e:
+        log.debug(f"fetch_filing_ocr_text {symbol}: {e}")
+        return ""
+
+
 def fetch_target_intel(symbol: str) -> tuple:
     """
     v8.1 PATCH 2: Late-stage precision intel heist for a single survivor symbol.
@@ -1486,7 +1573,7 @@ def fetch_target_intel(symbol: str) -> tuple:
     """
     sess = _get_nse_session()
     insider_data: dict = {"count": 0, "total_cr": 0.0, "person": ""}
-    filing_data:  dict = {"score": 15, "subject": "None"}
+    filing_data:  dict = {"score": 15, "subject": "None", "attachment_url": ""}
 
     # ── Precision insider / SAST pull ────────────────────────────────────────
     try:
@@ -1538,6 +1625,7 @@ def fetch_target_intel(symbol: str) -> tuple:
             items = items if isinstance(items, list) else items.get("data", [])
             score = 15
             subj  = "None"
+            attach_url = ""
             for item in items[:5]:
                 subj_raw = str(item.get("subject", "") or item.get("desc", ""))
                 if not subj_raw:
@@ -1550,7 +1638,10 @@ def fetch_target_intel(symbol: str) -> tuple:
                     if w in sl: score -= 8
                 if subj == "None":
                     subj = subj_raw[:100]
-            filing_data = {"score": score, "subject": subj}
+                    # v8.3: capture PDF link for the first (most relevant) item only —
+                    # OCR is expensive, we only ever want to read one filing per symbol.
+                    attach_url = str(item.get("attchmntFile", "") or "")
+            filing_data = {"score": score, "subject": subj, "attachment_url": attach_url}
             log.debug(f"TargetIntel {symbol}: filing score={score}")
     except Exception as e:
         log.debug(f"fetch_target_intel filing {symbol}: {e}")
@@ -2407,6 +2498,40 @@ def bayes_win_probability(fortress: dict, apex: dict,
 # SECTION 16 — LLM STORY ENRICHMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _get_market_cap_cr(symbol: str, close_price: float) -> float:
+    """
+    v8.3 FIX: replaces the fabricated `close * 5e6` placeholder with a real
+    market-cap estimate pulled from yfinance's actual shares-outstanding.
+    Cached for 1 day (reuses llm_cache table) since this only runs on
+    gate-survivors, so call volume is low, but yfinance is still slow/
+    rate-limited enough to be worth caching.
+    Returns 0.0 on any failure — callers must treat 0 as "unknown", never
+    silently substitute a guessed number.
+    """
+    cache_key = hashlib.sha256(f"mcap:{symbol}".encode()).hexdigest()
+    cached = _llm_cache_get(cache_key)
+    if cached is not None:
+        try:
+            return float(cached)
+        except Exception:
+            pass
+    mcap_cr = 0.0
+    try:
+        import yfinance as yf
+        info   = yf.Ticker(f"{symbol}.NS").info
+        shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 0
+        if shares and close_price and close_price > 0:
+            mcap_cr = round((shares * close_price) / 1e7, 1)  # paise->₹ Cr
+    except Exception as e:
+        log.debug(f"_get_market_cap_cr {symbol}: {e}")
+        mcap_cr = 0.0
+    try:
+        _llm_cache_put(cache_key, str(mcap_cr), "mcap", "yfinance", ttl_days=1)
+    except Exception:
+        pass
+    return mcap_cr
+
+
 def llm_enrich_pick(symbol: str, fortress: dict, apex: dict,
                     bayes_pct: float, macro: dict, fii_data: dict,
                     insider_map: dict, filings: dict,
@@ -2426,6 +2551,16 @@ def llm_enrich_pick(symbol: str, fortress: dict, apex: dict,
     ins    = insider_map.get(sym, {})
     fil    = filings.get(sym, {})
 
+    # v8.3 FIX: real market cap via yfinance shares outstanding, not a
+    # hardcoded 5e6-share guess. Cached so we only hit yfinance once per
+    # symbol per day (this function already only runs on gate-survivors).
+    mcap_cr = _get_market_cap_cr(sym, close)
+    mcap_display = f"₹{round(mcap_cr, 0):.0f} Cr" if mcap_cr > 0 else "UNKNOWN"
+
+    # v8.3: OCR'd filing text (only populated if the announcement PDF was
+    # a scanned image and OCR was attempted — see fetch_filing_ocr_text).
+    filing_ocr_text = fil.get("ocr_text", "")[:5000]
+
     prompt = f"""You are a concise quant analyst for NSE India mid/small-cap stocks.
 
 SETUP: {sym} | Sector: {fortress.get('sector','?')} | Grade: {fortress.get('grade','?')}
@@ -2436,15 +2571,20 @@ RSI={fortress.get('rsi14',50):.0f} ADX={fortress.get('adx14',0):.0f}
 ATR stop: ₹{stop:.0f} | R1:R = {risk_r:.1f}:1 | Whale={fortress.get('whale_flag',False)}
 Insider: {f"₹{ins.get('total_cr',0):.0f}Cr bought" if ins.get('count') else "None"}
 Filing: {fil.get('subject','None')[:60]}
+Filing text (OCR'd from scanned disclosure, may be empty): {filing_ocr_text}
 Alt-data: {alt_match.get('match_label','') or 'None'}
 Delivery%: {fortress.get('delivery_pct',0):.0f}% | VolRatio: {fortress.get('vol_ratio',1):.1f}x
 
-CRITICAL MATERIALITY RULE (v8.0):
-- The company market cap is approximately ₹{round(fortress.get('close',0) * 5e6 / 1e7, 0):.0f} Cr (estimated).
-- If any tender/contract/export value is mentioned in the alt-data or filing, you MUST check:
-  Is the monetary value >= 2% of the estimated market cap?
-  If NO → classify that catalyst as "NOISE" and set "has_material_catalyst" to false.
-  If YES → it is material; set "has_material_catalyst" to true.
+CRITICAL MATERIALITY RULE (v8.3):
+- The company's actual market capitalization is {mcap_display}.
+- Analyze the disclosure/filing text. Look for explicitly stated values of
+  order wins, contracts, or promoter purchases.
+- Apply the 2% Rule: if market cap is known, is the verified value of this
+  contract/order win >= 2% of market cap? If market cap is UNKNOWN, judge
+  whether the contract value seems structurally significant for a mid/small-cap.
+- If the value is not material (or no explicit value is stated), classify
+  the catalyst as "NOISE" and set "has_material_catalyst" to false.
+- If clearly material, set "has_material_catalyst" to true.
 - Do NOT hype small-value contracts as "NEW CONTRACT WIN" for large companies.
 
 Respond ONLY as JSON (no markdown):
@@ -3184,6 +3324,20 @@ def score_one_symbol(args: tuple) -> Optional[dict]:
         # RS percentile
         rs_pct = _compute_rs_pct(sym, hist, hist_cache, hist_lock)
 
+        # v8.3: OCR the announcement PDF (only for gate-survivors reaching
+        # this point — never during the bulk 400-candidate scan) if the
+        # filing has an attachment and looks like it could be scanned.
+        try:
+            fil_entry = live_filings.get(sym, {})
+            attach_url = fil_entry.get("attachment_url", "")
+            if attach_url:
+                ocr_text = fetch_filing_ocr_text(sym, attach_url)
+                if ocr_text:
+                    fil_entry["ocr_text"] = ocr_text
+                    live_filings[sym] = fil_entry
+        except Exception as e:
+            log.debug(f"OCR hook {sym}: {e}")
+
         # LLM narrative
         llm = llm_enrich_pick(sym, fort, apex_d, bayes_p, macro,
                               fii_data, live_insider_map, live_filings, alt_match)
@@ -3854,6 +4008,9 @@ def run():
         log.info(f"  Uptrend gate      : Price>50MA>200MA (required for VCP pts)")
         log.info(f"  Regime            : {macro['macro_state']} VIX={macro['vix_val']}")
         log.info(f"  FII               : {fii_data['label']}")
+        log.info(f"  OCR Engine        : {_OCR_STATS['attempted']} attempted | "
+                 f"{_OCR_STATS['success']} succeeded | {_OCR_STATS['failed']} failed/empty"
+                 + ("" if _OCR_OK else "  [tesseract/pdf2image NOT installed — OCR disabled]"))
         log.info("  → Search 'GATE FORT_PTS_LOW' above to see which stocks hit this wall")
         log.info("  → Search 'GATE FUSED_LOW' to see which stocks failed fused score")
         log.info("  → Search 'GATE CONFIDENCE_LOW' to see confidence rejections")
@@ -3920,6 +4077,16 @@ def run():
     # 13. Telegram alert
     send_telegram_picks(winners, macro, fii_data, date_label,
                         options=options, kelly_stats=kelly_stats)
+
+    # v8.3: surface OCR engine stats in Telegram too, not just the log —
+    # last time a silent tracking failure went unnoticed for a month
+    # because nothing user-facing reported it.
+    if _OCR_STATS["attempted"] > 0:
+        _send_tg(f"🔍 OCR Engine: {_OCR_STATS['attempted']} attempted | "
+                 f"{_OCR_STATS['success']} succeeded | "
+                 f"{_OCR_STATS['failed']} failed/empty")
+    elif not _OCR_OK:
+        _send_tg("⚠️ OCR disabled — tesseract/pdf2image not installed on runner.")
 
     # 14. Outcome engine
     try:
