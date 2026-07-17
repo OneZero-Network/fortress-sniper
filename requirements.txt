@@ -1,37 +1,9 @@
-# ══════════════════════════════════════════════════════════════════════
-# UNIFIED HALAL SNIPER v5.4 — requirements.txt
-# Core dependencies — required for every GitHub Actions job.
-# Tested: Python 3.11 | ubuntu-latest
-# Bismillah
-# ══════════════════════════════════════════════════════════════════════
-
-# ── HTTP / networking ─────────────────────────────────────────────────
-requests>=2.31.0           # Telegram, OpenAI/Anthropic REST, NSE bhavcopy
-urllib3>=2.0.0             # requests transport; pin for security patches
-
-# ── Market data ───────────────────────────────────────────────────────
-yfinance>=0.2.38           # OHLCV history, VIX, NIFTY, macro regime data
-
-# ── Data processing ───────────────────────────────────────────────────
-pandas>=2.1.0              # OHLCV DataFrames, indicators, bhavcopy parsing
-numpy>=1.26.0              # MC simulation (600 paths), ATR/vol/percentile maths
-
-# ── Scientific / statistics ───────────────────────────────────────────
-scipy>=1.11.0              # argrelextrema (swing pivots), Student-t MC tails,
-                           # Bayesian prior fitting, distribution tests
-
-# ── Machine learning (meta-model) ────────────────────────────────────
-scikit-learn>=1.4.0        # RandomForestClassifier, GradientBoostingClassifier
-                           # CalibratedClassifierCV (Platt scaling)
-                           # brier_score_loss, roc_auc_score, cross_val_score
-                           # StandardScaler, Pipeline
-jugaad-data>=0.33.0
-# ── Google Sheets (bhavcopy fallback) ────────────────────────────────
-gspread>=6.0.0             # Google Sheets client
-
-openpyxl
-
-pytesseract>=0.3.10
-pdf2image>=1.17.0
-google-auth>=2.27.0        # Service account credentials
-google-auth-oauthlib>=1.2.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+gspread>=6.0.0
+google-auth>=2.25.0
+openai>=1.30.0
+anthropic>=0.34.0
+curl_cffi>=0.6.0
+yfinance>=0.2.40
