@@ -60,8 +60,11 @@ def _get_workbook():
         return None
 
 
-def _get_ws(tab: str, rows: int = 2000, cols: int = 60):
-    """Get or create a worksheet tab."""
+def _get_ws(tab: str, rows: int = 2000, cols: int = 60, create: bool = True):
+    """Get (and optionally create) a worksheet tab. Reads pass create=False
+    so a missing tab is just a missing tab — the first live run showed
+    read_sheet auto-creating an empty PERFORMANCE tab as a side effect,
+    which is wrong for a read path."""
     wb = _get_workbook()
     if wb is None:
         return None
@@ -70,6 +73,8 @@ def _get_ws(tab: str, rows: int = 2000, cols: int = 60):
     try:
         ws = wb.worksheet(tab)
     except Exception:
+        if not create:
+            return None
         try:
             ws = wb.add_worksheet(title=tab, rows=rows, cols=cols)
             log.info(f"Sheets: created new tab '{tab}'")
@@ -97,7 +102,7 @@ def push_sheet(tab: str, rows: List[list]) -> bool:
 
 def read_sheet(tab: str) -> list:
     """Read all rows from a tab. Returns [] on any failure (never raises)."""
-    ws = _get_ws(tab)
+    ws = _get_ws(tab, create=False)
     if ws is None:
         return []
     try:

@@ -175,6 +175,9 @@ def fortress_score(symbol: str, close: float, hist: pd.DataFrame, sector: str,
         "rsi14": rsi14, "adx14": adx14, "mfi": ind["mfi"], "atr14": round(atr14, 2),
         "natr14": ind["natr14"], "natr100": ind["natr100"],
         "whale_score": whale_score, "vol_ratio": vol_ratio, "at_vpoc": at_vpoc,
+        "hi52": hi52, "lo52": lo52,
+        "delivery_pct": float(order_flow.get("delivery_pct", -1.0)),
+        "whale_available": bool(order_flow.get("whale_available", False)),
         "story": " | ".join(story_parts) if story_parts else f"Fortress {fort_pts}pts",
         "uptrend_ok": uptrend_ok, "uptrend_reason": uptrend_reason,
         "ma50": ind["ma50"], "ma200": ind["ma200"],
@@ -216,15 +219,25 @@ def fused_score(fortress: dict, apex: dict, bayes_pct: float) -> float:
 
 
 def compute_confidence_score(fort_pts: float, apex_comp: float, bayes_pct: float,
-                              whale_score: float, rsi14: float, adx14: float) -> float:
+                              whale_score: float, rsi14: float, adx14: float,
+                              whale_available: bool = True) -> float:
+    """Signal-agreement confidence. TWO FIXES from the first live run:
+    1. whale_n is only included when whale data actually exists — the
+       dummy stub's hardwired 0 inflated the std and zeroed EVERY
+       candidate's confidence ("Cold scan: 0 passed all gates").
+    2. The disagreement penalty is floored at CONFIDENCE_PENALTY_FLOOR so
+       divergent-but-strong signal sets are dampened, never annihilated."""
     fort_n = min(fort_pts / 200, 1.0)
     apex_n = min(apex_comp / 100, 1.0)
     bayes_n = min(bayes_pct / 100, 1.0)
-    whale_n = min(whale_score / 30, 1.0)
     rsi_n = 1.0 if 45 <= rsi14 <= 65 else 0.7 if (35 <= rsi14 < 45 or 65 < rsi14 <= 72) else \
             0.2 if rsi14 > 80 else 0.5
     adx_n = min(adx14 / 40, 1.0)
-    signals = np.array([fort_n, apex_n, bayes_n, whale_n, rsi_n, adx_n])
+    sig = [fort_n, apex_n, bayes_n, rsi_n, adx_n]
+    if whale_available:
+        sig.append(min(whale_score / 30, 1.0))
+    signals = np.array(sig)
     mean_s, std_s = float(signals.mean()), float(signals.std())
-    conf = mean_s * max(0.0, 1.0 - std_s / config.CONFIDENCE_STD_MAX)
+    penalty = max(config.CONFIDENCE_PENALTY_FLOOR, 1.0 - std_s / config.CONFIDENCE_STD_MAX)
+    conf = mean_s * penalty
     return round(min(max(conf, 0.0), 1.0), 4)

@@ -53,6 +53,41 @@ def _save_macro_cache(macro: dict) -> None:
         log.debug(f"_save_macro_cache: {e}")
 
 
+def _yfinance_macro_tier() -> Optional[dict]:
+    """GHA-friendly macro tier: NSE's API is Akamai-blocked from datacenter
+    IPs, but Yahoo isn't — ^INDIAVIX and ^NSEI give real VIX + NIFTY change
+    (breadth unavailable there, so it's held neutral)."""
+    try:
+        import yfinance as yf
+        vix_h = yf.Ticker("^INDIAVIX").history(period="5d")
+        nifty_h = yf.Ticker("^NSEI").history(period="5d")
+        if vix_h.empty or nifty_h.empty or len(nifty_h) < 2:
+            return None
+        vix_val = float(vix_h["Close"].iloc[-1])
+        c0, c1 = float(nifty_h["Close"].iloc[-2]), float(nifty_h["Close"].iloc[-1])
+        nifty_chg = (c1 - c0) / c0 * 100 if c0 > 0 else 0.0
+
+        if vix_val <= config.VIX_TREND_MAX:
+            state, atr_mult = "TREND", config.ATR_MULT_TREND
+        elif vix_val <= config.VIX_CHOP_MAX:
+            state, atr_mult = "CHOP", config.ATR_MULT_CHOP
+        else:
+            state, atr_mult = "BUNKER", config.ATR_MULT_BUNKER
+        if vix_val > 30 and nifty_chg < -2.5:
+            state, atr_mult = "MASSACRE", config.ATR_MULT_BUNKER * 1.3
+        elif vix_val > 25 and nifty_chg < -1.5:
+            state, atr_mult = "PANIC", config.ATR_MULT_BUNKER * 1.1
+
+        macro = {"macro_state": state, "vix_val": round(vix_val, 2),
+                 "nifty_chg": round(nifty_chg, 2), "breadth_ok": True,
+                 "atr_mult": atr_mult, "advance_ratio": 0.5, "source": "YFINANCE"}
+        log.info(f"Macro regime (yfinance): {state} VIX={vix_val:.1f} NIFTY={nifty_chg:+.2f}%")
+        return macro
+    except Exception as e:
+        log.debug(f"_yfinance_macro_tier: {e}")
+        return None
+
+
 def fetch_macro_regime() -> dict:
     """NSE-native macro regime: VIX + NIFTY chg + breadth. Falls back to
     cached/fallback CHOP on any failure — this is a shared read-only signal,
@@ -110,7 +145,12 @@ def fetch_macro_regime() -> dict:
                  f"breadth={advance_ratio:.0%}")
         return macro
     except Exception as e:
-        log.warning(f"fetch_macro_regime failed ({e}) — using cached/fallback")
+        log.info(f"NSE macro unavailable ({e}) — trying yfinance tier")
+        yf_macro = _yfinance_macro_tier()
+        if yf_macro:
+            _save_macro_cache(yf_macro)
+            return yf_macro
+        log.warning("yfinance macro tier also failed — using cached/fallback")
         cached = _load_cached_macro()
         if cached:
             cached["atr_mult"] = {"TREND": config.ATR_MULT_TREND, "CHOP": config.ATR_MULT_CHOP,

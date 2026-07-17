@@ -73,6 +73,31 @@ _SESSION_LOCK = threading.Lock()
 _SESSION_CACHE: Optional[requests.Session] = None
 _SESSION_TS = 0.0
 
+# ── NSE per-symbol circuit breaker ──────────────────────────────────────────
+# On GHA datacenter IPs, NSE's Akamai blocks most API calls. Without a
+# breaker, every one of 400 symbols pays a full connect+timeout on the NSE
+# attempt before falling back to yfinance. After NSE_CIRCUIT_MAX_FAILS
+# consecutive failures, all per-symbol NSE calls short-circuit for the rest
+# of the process; one later success resets it.
+_NSE_FAILS = 0
+_NSE_CIRCUIT_LOCK = threading.Lock()
+
+
+def nse_circuit_ok() -> bool:
+    return _NSE_FAILS < config.NSE_CIRCUIT_MAX_FAILS
+
+
+def nse_circuit_report(success: bool) -> None:
+    global _NSE_FAILS
+    with _NSE_CIRCUIT_LOCK:
+        if success:
+            _NSE_FAILS = 0
+        else:
+            _NSE_FAILS += 1
+            if _NSE_FAILS == config.NSE_CIRCUIT_MAX_FAILS:
+                log.warning(f"NSE circuit breaker OPEN after {_NSE_FAILS} consecutive "
+                            "failures — skipping NSE per-symbol calls for this run")
+
 
 def get_nse_session() -> requests.Session:
     """3-step Cloudflare-aware session handshake, cached for NSE_SESSION_TTL."""
@@ -82,6 +107,9 @@ def get_nse_session() -> requests.Session:
         if _SESSION_CACHE is not None and (now - _SESSION_TS) < config.NSE_SESSION_TTL:
             return _SESSION_CACHE
         sess = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=24, pool_maxsize=24)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
         try:
             sess.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
             time.sleep(0.5)
@@ -292,32 +320,45 @@ def load_bhavcopy(date_label: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
 
 
 def fetch_history(symbol: str, days: int = 300) -> pd.DataFrame:
-    """Daily OHLCV history — NSE first, yfinance fallback."""
-    try:
-        sess = get_nse_session()
-        resp = sess.get(
-            f"https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}",
-            headers={**NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json().get("data", [])
-            if data:
-                df = pd.DataFrame(data)
-                df.columns = [c.strip().lower() for c in df.columns]
-                rename = {"ch_timestamp": "date", "ch_closing_price": "close",
-                          "ch_trade_high_price": "high", "ch_trade_low_price": "low",
-                          "ch_tot_traded_qty": "volume"}
-                df = df.rename(columns=rename)
-                needed = {"close", "high", "low", "volume"}
-                if needed.issubset(df.columns):
-                    for c in needed:
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-                    df = df.dropna(subset=["close"]).tail(days).reset_index(drop=True)
-                    if len(df) >= 20:
-                        return df
-    except Exception as e:
-        log.debug(f"fetch_history NSE {symbol}: {e}")
+    """Daily OHLCV history with a 'date' column (yyyy-mm-dd strings) — NSE
+    first (circuit-breaker protected), yfinance fallback. NaN-safe: rows
+    with NaN in close/high/low are dropped (they crashed the incubator's
+    rubble gate via np.max NaN propagation in the first live run)."""
+    if nse_circuit_ok():
+        try:
+            sess = get_nse_session()
+            resp = sess.get(
+                f"https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}",
+                headers={**NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"},
+                timeout=12,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                if data:
+                    df = pd.DataFrame(data)
+                    df.columns = [c.strip().lower() for c in df.columns]
+                    rename = {"ch_timestamp": "date", "ch_closing_price": "close",
+                              "ch_trade_high_price": "high", "ch_trade_low_price": "low",
+                              "ch_tot_traded_qty": "volume"}
+                    df = df.rename(columns=rename)
+                    needed = {"close", "high", "low", "volume"}
+                    if needed.issubset(df.columns):
+                        for c in needed:
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                        df = df.dropna(subset=["close", "high", "low"])
+                        df["volume"] = df["volume"].fillna(0)
+                        if "date" in df.columns:
+                            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                        else:
+                            df["date"] = ""
+                        df = df.tail(days).reset_index(drop=True)
+                        if len(df) >= 20:
+                            nse_circuit_report(True)
+                            return df[["date", "close", "high", "low", "volume"]]
+            nse_circuit_report(False)
+        except Exception as e:
+            log.debug(f"fetch_history NSE {symbol}: {e}")
+            nse_circuit_report(False)
 
     if _YFINANCE_OK:
         try:
@@ -325,9 +366,15 @@ def fetch_history(symbol: str, days: int = 300) -> pd.DataFrame:
             h = t.history(period=f"{days}d")
             if not h.empty:
                 df = h.reset_index().rename(columns={
-                    "Close": "close", "High": "high", "Low": "low", "Volume": "volume",
+                    "Date": "date", "Close": "close", "High": "high",
+                    "Low": "low", "Volume": "volume",
                 })
-                return df[["close", "high", "low", "volume"]].reset_index(drop=True)
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                for c in ("close", "high", "low", "volume"):
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df.dropna(subset=["close", "high", "low"])
+                df["volume"] = df["volume"].fillna(0)
+                return df[["date", "close", "high", "low", "volume"]].reset_index(drop=True)
         except Exception as e:
             log.debug(f"fetch_history yfinance {symbol}: {e}")
     return pd.DataFrame()

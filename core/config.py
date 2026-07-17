@@ -287,3 +287,17 @@ HARAM_SECTOR_TERMS = (
     "BANK", "FINANCIAL", "INSURANCE", "NBFC", "BREWERY", "DISTILLERY",
     "TOBACCO", "CASINO", "GAMBLING", "LIQUOR", "ALCOHOL",
 )
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1 ADDITIONS — full port constants
+# ══════════════════════════════════════════════════════════════════════════
+OUTCOME_TIMEOUT_DAYS = _int("OUTCOME_TIMEOUT_DAYS", "20")
+NSE_CIRCUIT_MAX_FAILS = _int("NSE_CIRCUIT_MAX_FAILS", "5")
+CONFIDENCE_PENALTY_FLOOR = _float("CONFIDENCE_PENALTY_FLOOR", "0.25")
+RS_LOOKBACK_DAYS = _int("RS_LOOKBACK_DAYS", "63")
+META_MIN_TRAINING_ROWS = _int("META_MIN_TRAINING_ROWS", "30")
+META_VETO_PWIN = _float("META_VETO_PWIN", "0.35")
+INTEL_LOOKBACK_DAYS = _int("INTEL_LOOKBACK_DAYS", "90")
+CATALYST_KEYWORDS = ("ORDER", "CONTRACT", "WIN", "ACQUISITION", "EXPANSION",
+                     "CAPACITY", "APPROVAL", "PATENT", "LAUNCH", "PARTNERSHIP",
+                     "BUYBACK", "PREFERENTIAL")
