@@ -124,7 +124,66 @@ moving" is a better signal than either fact alone.
   loop: it posts to Telegram and logs to `WEEKLY_REVIEWS`, it does not
   auto-edit `config.py`.
 
-## Known trim-for-this-build items (documented, not hidden)
+## Intelligence upgrades (mentor-review response)
+
+A live run surfaced two real gaps a manual review caught that the pipeline
+couldn't: MTNL (₹31,944 Cr debt, NPA loans) passed Shariah because the old
+check only looked at ticker keywords + sector name, never a balance sheet;
+and several picks (EPIGRAL ₹1,068, SHARDACROP ₹893) exceeded a ₹300
+block-accumulation ceiling that wasn't encoded anywhere. Both are now real,
+automated gates — verified against the mentor's exact numbers:
+
+- **`core/shariah.py: debt_ratio_screen()` (Layer 4)** — quantitative
+  AAOIFI-style screen (debt/assets ≤ 33%, debt/equity ≤ 0.45 by default,
+  both tunable in `config.py`). Fails safe (rejects) when debt data is
+  unavailable, matching the fail-closed philosophy of L1-L3. Tested against
+  synthetic MTNL-like ratios (65% debt/assets) → correctly rejects; IPL-like
+  (5% debt/assets) → correctly passes.
+- **`workflows/incubator_weekly.py: check_price_ceiling()`** — a *strategy*
+  gate, deliberately separate from the liquidity `MIN_PRICE`/`MAX_PRICE`
+  band, enforcing `config.PRICE_CEILING_BLOCK` (default ₹300) /
+  `PRICE_FLOOR_BLOCK` (default ₹20). Tested against the mentor's own
+  examples: EPIGRAL (₹1,068) → rejected, IPL (₹163) / ACL (₹49.35) → pass.
+- **`core/factors.py` — Composite Z-Score factor model** (your friends'
+  Method 1). Cross-sectional Z-scores for Momentum (63-day residual return
+  vs NIFTY), Value (inverse P/E, falls back to inverse P/B), and Quality
+  (ROE%), blended via configurable weights (`FACTOR_W_MOMENTUM/VALUE/QUALITY`,
+  default 50/25/25) into one `z_composite` per pearl, written to the
+  `INCUBATOR` sheet and used to re-rank pearls before they hit the
+  watchlist. Below `FACTOR_MIN_UNIVERSE_N` (default 30) candidates, scores
+  degrade to neutral (50.0) rather than producing unstable Z-scores off a
+  too-small sample — tested and verified.
+- **`core/macro_commentary.py`** — explicitly NOT a prediction engine
+  (see module docstring for why "predict sector rotation from tariffs/
+  dollar index" isn't something an LLM can responsibly claim to do). Asks
+  for a labeled sector-level OPINION once every few hours, applies a
+  small, hard-capped nudge (`MACRO_COMMENTARY_MAX_BONUS`, default ±5 pts
+  on the 0-100 conviction scale) only when the LLM states confidence at
+  or above `MACRO_COMMENTARY_MIN_CONFIDENCE` (default 0.6/"medium"), and
+  logs the bonus + reasoning in its own `MacroBonus`/`MacroNote` columns
+  in `SCREENER` so it's always distinguishable from and auditable against
+  the technical/fundamental score — never silently folded in.
+- **`core/fundamentals.py: debt_and_quality_ratios()`** — the new data
+  layer both the debt screen and the Z-score model draw from (P/E, P/B,
+  ROE%, debt/equity, debt/assets, total debt in ₹Cr), sourced from
+  yfinance with `None` (not 0) on any unavailable field so downstream
+  consumers never mistake missing data for a clean balance sheet.
+
+### What this deliberately does NOT attempt
+
+Per your friends' broader notes: HFT/market-making needs colocated
+infrastructure this system will never have and isn't worth chasing.
+Statistical arbitrage/pairs trading and a genuine regime-switching ML
+meta-model (their Method 2) are real, buildable ideas but need dedicated
+modules and real backtested validation before they should touch live
+capital — flagged as a future addition, not built speculatively today.
+"Predict the bounce"/RSI-divergence-as-prediction and 2pm auction-market
+arbitrage are both real trader techniques but carry execution/slippage
+risk that's inappropriate to automate without you first understanding
+and manually validating the edge — these stay manual-watch items, not
+automated gates.
+
+
 
 To keep this deliverable end-to-end runnable rather than a 4,000-line
 line-by-line port, a few legacy sniper_v7 features are stubbed with a
