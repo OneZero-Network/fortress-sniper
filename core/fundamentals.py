@@ -21,7 +21,9 @@ EPS gate semantics (NaN-safe, data-gap-safe):
 from __future__ import annotations
 import logging
 import math
-from typing import Dict
+from typing import Dict, Tuple
+
+from . import config
 
 log = logging.getLogger("fortress.fundamentals")
 
@@ -106,12 +108,16 @@ def debt_and_quality_ratios(symbol: str) -> Dict:
     sym = symbol.upper()
     out = {"debt_to_equity": None, "debt_to_assets": None,
            "pe_ratio": None, "pb_ratio": None, "roe_pct": None,
-           "total_debt_cr": None, "market_cap_cr": None}
+           "total_debt_cr": None, "market_cap_cr": None, "trailing_eps": None}
     if not _YF:
         return out
     try:
         t = yf.Ticker(f"{sym}.NS")
         info = t.info or {}
+
+        eps = info.get("trailingEps")
+        if _finite(eps) and eps is not None:
+            out["trailing_eps"] = round(float(eps), 2)
 
         pe = info.get("trailingPE", info.get("forwardPE"))
         if _finite(pe) and pe is not None and pe > 0:
@@ -157,6 +163,39 @@ def debt_and_quality_ratios(symbol: str) -> Dict:
     except Exception as e:
         log.debug(f"debt_and_quality_ratios {sym}: {e}")
     return out
+
+
+def quality_veto(symbol: str, ratios: Dict) -> Tuple[bool, str]:
+    """
+    Separate hard-reject gate, distinct from the Shariah debt screen. Catches
+    the exact case your mentor flagged with MAXIND: passes the debt screen
+    cleanly (D/E 0.24) but is a "financial void" — ROE -29.84%, EPS -23.17.
+    A Shariah audit answers "is the balance sheet structure compliant?";
+    this answers "is this actually a viable business?" — genuinely separate
+    questions, so this is intentionally NOT folded into shariah.py.
+
+    FAIL-SAFE POLICY (differs from the Shariah screen on purpose): this is
+    a quality/viability check, not a compliance gate. Missing ROE/EPS data
+    does NOT veto — it simply means "can't be evaluated on this axis",
+    and the candidate passes through un-vetoed on that axis rather than
+    being blocked by a data gap. Only an AFFIRMATIVELY bad number (present
+    and below threshold) triggers the veto.
+    """
+    if not config.QUALITY_VETO_ENABLED:
+        return True, "quality veto disabled"
+
+    roe = ratios.get("roe_pct")
+    eps = ratios.get("trailing_eps")
+    reasons = []
+
+    if roe is not None and roe < config.QUALITY_VETO_MIN_ROE_PCT:
+        reasons.append(f"ROE {roe:.1f}% < {config.QUALITY_VETO_MIN_ROE_PCT:.1f}%")
+    if eps is not None and eps < config.QUALITY_VETO_MIN_EPS:
+        reasons.append(f"EPS {eps:.2f} < {config.QUALITY_VETO_MIN_EPS:.2f}")
+
+    if reasons:
+        return False, "Wealth-destroyer: " + " | ".join(reasons)
+    return True, "Quality OK" if (roe is not None or eps is not None) else "Quality veto: no ROE/EPS data (not vetoed)"
 
 
 def eps_acceleration(symbol: str) -> Dict:

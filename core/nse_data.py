@@ -380,6 +380,60 @@ def fetch_history(symbol: str, days: int = 300) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def fetch_live_price(symbol: str) -> Optional[Dict]:
+    """
+    Live/last-traded quote for the re-validation tool (scripts/check_entry.py).
+    Returns {last_price, change_pct, timestamp, source} or None on total
+    failure. This is intentionally separate from fetch_history() — it's a
+    single-quote lookup, not an OHLCV series, and it's meant to be called
+    on-demand right before you act on a pick, not during the batch scan.
+    """
+    if nse_circuit_ok():
+        try:
+            sess = get_nse_session()
+            resp = sess.get(
+                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}",
+                headers={**NSE_HEADERS, "X-Requested-With": "XMLHttpRequest"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                price_info = j.get("priceInfo", {})
+                last = price_info.get("lastPrice")
+                if last is not None:
+                    nse_circuit_report(True)
+                    return {
+                        "last_price": float(last),
+                        "change_pct": float(price_info.get("pChange", 0.0)),
+                        "timestamp": j.get("metadata", {}).get("lastUpdateTime", ""),
+                        "source": "NSE_LIVE",
+                    }
+            nse_circuit_report(False)
+        except Exception as e:
+            log.debug(f"fetch_live_price NSE {symbol}: {e}")
+            nse_circuit_report(False)
+
+    if _YFINANCE_OK:
+        try:
+            t = yf.Ticker(f"{symbol}.NS")
+            fi = getattr(t, "fast_info", None)
+            last = fi.get("lastPrice") if fi else None
+            if last is None:
+                h = t.history(period="2d")
+                if not h.empty:
+                    last = float(h["Close"].iloc[-1])
+                    prev = float(h["Close"].iloc[-2]) if len(h) >= 2 else last
+                    return {"last_price": last,
+                            "change_pct": round((last - prev) / prev * 100, 2) if prev else 0.0,
+                            "timestamp": "", "source": "YFINANCE_HISTORY"}
+            if last is not None:
+                return {"last_price": float(last), "change_pct": 0.0,
+                        "timestamp": "", "source": "YFINANCE_FAST_INFO"}
+        except Exception as e:
+            log.debug(f"fetch_live_price yfinance {symbol}: {e}")
+    return None
+
+
 def fetch_weekly_history(symbol: str, weeks: int = 52) -> pd.DataFrame:
     daily = fetch_history(symbol, days=weeks * 7 + 30)
     if daily.empty:

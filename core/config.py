@@ -314,7 +314,23 @@ CATALYST_KEYWORDS = ("ORDER", "CONTRACT", "WIN", "ACQUISITION", "EXPANSION",
 # already returns None (not 0) on unavailable data — see debt_and_quality_ratios().
 SHARIAH_DEBT_SCREEN_ENABLED = _bool("SHARIAH_DEBT_SCREEN_ENABLED", "true")
 SHARIAH_MAX_DEBT_TO_ASSETS = _float("SHARIAH_MAX_DEBT_TO_ASSETS", "0.33")   # AAOIFI ~33%
-SHARIAH_MAX_DEBT_TO_EQUITY = _float("SHARIAH_MAX_DEBT_TO_EQUITY", "0.45")   # secondary cross-check
+# SINGLE THRESHOLD applied to BOTH debt/assets AND debt/equity — your
+# mentor's review caught that the old 0.45 D/E ceiling was looser than the
+# 0.33 standard actually being enforced by hand (Ala Hazrat's limit), which
+# is why DOLLAR (D/E 0.34) and ARIS/RSYSTEMS passed the code but were
+# rejected by manual review. One number, one standard, no drift between them.
+#
+# DELIBERATE DECISION — hard line, no safety-margin buffer: a D/E of
+# EXACTLY 0.32 (i.e. under 0.33) PASSES this screen by design. Your
+# mentor's manual review additionally rejected a 0.32 case (FABTECH) for
+# sitting "too close to the edge" — that is a stricter personal margin-
+# of-safety judgment layered on top of the stated 0.33 rule, not evidence
+# that the code's rule is wrong. If you want that extra conservatism
+# encoded (e.g. treat anything within some % of the limit as a reject),
+# that needs to be a new, explicitly separate buffer constant — deferred
+# per your explicit choice to keep this a hard line at 0.33 with no buffer.
+SHARIAH_MAX_DEBT_TO_EQUITY = _float("SHARIAH_MAX_DEBT_TO_EQUITY",
+                                     str(SHARIAH_MAX_DEBT_TO_ASSETS))
 
 # ══════════════════════════════════════════════════════════════════════════
 # CAPITAL-EFFICIENCY PRICE CEILING (your ₹20-300 block-accumulation rule)
@@ -355,3 +371,21 @@ FACTOR_MIN_UNIVERSE_N = _int("FACTOR_MIN_UNIVERSE_N", "30")  # below this, Z-sco
 MACRO_COMMENTARY_ENABLED = _bool("MACRO_COMMENTARY_ENABLED", "true")
 MACRO_COMMENTARY_MAX_BONUS = _float("MACRO_COMMENTARY_MAX_BONUS", "5.0")  # +/- 5 pts max, on a 0-100 scale
 MACRO_COMMENTARY_MIN_CONFIDENCE = _float("MACRO_COMMENTARY_MIN_CONFIDENCE", "0.6")
+
+# ══════════════════════════════════════════════════════════════════════════
+# QUALITY VETO — separate hard-reject gate, distinct from Shariah debt screen
+# ══════════════════════════════════════════════════════════════════════════
+# Your mentor's review caught MAXIND: passes the debt screen cleanly
+# (D/E 0.24) but has ROE -29.84% and EPS -23.17 — a "financial void" /
+# wealth destroyer. A debt screen was never meant to catch this; it's a
+# genuinely separate question ("is the balance sheet halal-compliant?"
+# vs "is this company actually profitable?"). This is intentionally NOT
+# folded into shariah.py — a stock can be 100% Shariah-compliant and still
+# be a terrible business, and conflating the two gates would make the
+# Shariah audit's reasoning harder to trust/audit independently.
+# Fail-safe policy: missing ROE/EPS data does NOT trigger this veto (it's
+# not a compliance gate) — it simply can't be evaluated, so it passes
+# through silently un-vetoed rather than blocking on a data gap.
+QUALITY_VETO_ENABLED = _bool("QUALITY_VETO_ENABLED", "true")
+QUALITY_VETO_MIN_ROE_PCT = _float("QUALITY_VETO_MIN_ROE_PCT", "0.0")   # ROE must be >= this (0 = must not be negative)
+QUALITY_VETO_MIN_EPS = _float("QUALITY_VETO_MIN_EPS", "0.0")           # trailing EPS must be >= this (0 = must not be negative)
