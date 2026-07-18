@@ -50,7 +50,7 @@ from core.bayes import bayes_win_probability
 from core.order_flow import compute_eod_order_flow
 from core.target_intel import fetch_target_intel, fetch_fii_dii, pledge_gate_ok
 from core.alt_data import match_company_to_tenders
-from core.fundamentals import get_company_profile, debt_and_quality_ratios
+from core.fundamentals import get_company_profile, debt_and_quality_ratios, quality_veto
 from core.macro_commentary import macro_commentary_bonus
 from core.shariah import ticker_veto, full_audit
 from core.meta_labeler import meta_labeler_veto, compute_kelly_multiplier, record_meta_label
@@ -140,6 +140,12 @@ def enrich_phase2(r: Dict) -> Optional[Dict]:
     if not audit["compliant"]:
         log.info(f"  GATE SHARIAH  | {sym:14s} | {audit['reason'][:70]}")
         return None
+
+    qual_ok, qual_reason = quality_veto(sym, debt_ratios)
+    if not qual_ok:
+        log.info(f"  GATE QUALITY  | {sym:14s} | {qual_reason[:70]}")
+        return None
+
     r["halal_tier"] = audit["layer"]
     if profile["sector"] and not r.get("sector"):
         r["sector"] = profile["sector"]
@@ -336,6 +342,20 @@ def send_alerts(winners: List[Dict], macro: Dict, date_label: str,
         lines.append(f"<b>{w['symbol']}</b> {badge}{cat} — Conviction {w['conviction_score']}/100")
         lines.append(f"   {w['grade']} | Entry ₹{w['close']:.0f} | SL ₹{w['stop_loss']:.0f} | "
                      f"R1 ₹{w['r1']:.0f} | Size {w['kelly_shares']}sh | RS {w.get('rs_pct','—')}%")
+        # ── Room-to-stop warning ──────────────────────────────────────────
+        # This scan runs on yesterday's EOD close. By the time you act on
+        # this alert, price may have already moved toward (or through) the
+        # stop — the "ghost entry" issue your mentor caught on ASPINWALL,
+        # where the scanner's entry (₹257) had already drifted down onto
+        # its own stop-loss line (₹240) by the time of manual review.
+        # This is a scan-vs-execution staleness gap that can't be fully
+        # closed without live intraday data, but flagging it loudly here
+        # means you never act on a setup that's silently already broken.
+        room_pct = ((w["close"] - w["stop_loss"]) / w["close"] * 100) if w["close"] > 0 else 0
+        if room_pct < 3.0:
+            lines.append(f"   ⚠️ THIN MARGIN: only {room_pct:.1f}% between scan-time entry and "
+                         f"stop — verify current price before acting, this setup may already "
+                         f"be broken by the time you read this")
         if w.get("catalyst_note"):
             lines.append(f"   ⚡ {w['catalyst_note'][:90]}")
         if w["ignited"]:

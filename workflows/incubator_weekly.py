@@ -39,7 +39,7 @@ from core.db import init_db
 from core.nse_data import load_bhavcopy, fetch_weekly_history
 from core.shariah import full_audit, ticker_veto
 from core.fundamentals import (eps_acceleration, revenue_quality, get_company_profile,
-                                debt_and_quality_ratios)
+                                debt_and_quality_ratios, quality_veto)
 from core.factors import compute_residual_momentum, compute_composite_zscores
 from core.bridge import upsert_pearl, expire_stale_pearls
 from core.telegram import send as send_telegram
@@ -308,6 +308,18 @@ def run() -> List[dict]:
                 rejects.append([date_label, sym, "SHARIAH", audit["reason"][:90]])
                 log.info(f"  SHARIAH VETO | {sym} | {audit['reason'][:60]}")
                 continue
+
+            # ── Quality veto (separate from Shariah) ──────────────────────
+            # Catches wealth-destroyers that pass the debt screen cleanly
+            # but are fundamentally non-viable (e.g. MAXIND: D/E 0.24 OK,
+            # but ROE -29.84%, EPS -23.17). Deliberately a distinct gate
+            # from Shariah compliance — see fundamentals.quality_veto().
+            qual_ok, qual_reason = quality_veto(sym, item.get("debt_ratios", {}))
+            if not qual_ok:
+                rejects.append([date_label, sym, "QUALITY_VETO", qual_reason[:90]])
+                log.info(f"  QUALITY VETO  | {sym} | {qual_reason[:60]}")
+                continue
+
             thesis = (f"Rubble {item['g1']['discount_pct']}% below 52W high | "
                       f"box {item['g1']['box_weeks']}w | sponge {item['g3']['sponge_weeks']}w"
                       + (f" | EPS accel {item['eps']['g1']}%" if item["eps"]["accel"] else "")
