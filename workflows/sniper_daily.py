@@ -50,7 +50,8 @@ from core.bayes import bayes_win_probability
 from core.order_flow import compute_eod_order_flow
 from core.target_intel import fetch_target_intel, fetch_fii_dii, pledge_gate_ok
 from core.alt_data import match_company_to_tenders
-from core.fundamentals import get_company_profile
+from core.fundamentals import get_company_profile, debt_and_quality_ratios
+from core.macro_commentary import macro_commentary_bonus
 from core.shariah import ticker_veto, full_audit
 from core.meta_labeler import meta_labeler_veto, compute_kelly_multiplier, record_meta_label
 from core.outcomes import evaluate_open_outcomes, record_pick
@@ -131,9 +132,11 @@ def enrich_phase2(r: Dict) -> Optional[Dict]:
     sym = r["symbol"]
     profile = get_company_profile(sym)
 
+    debt_ratios = debt_and_quality_ratios(sym)
     audit = full_audit(sym, company_name=profile["name"],
                         industry=profile["industry"] or profile["sector"],
-                        biz_profile=profile["summary"])
+                        biz_profile=profile["summary"],
+                        debt_ratios=debt_ratios)
     if not audit["compliant"]:
         log.info(f"  GATE SHARIAH  | {sym:14s} | {audit['reason'][:70]}")
         return None
@@ -157,6 +160,19 @@ def enrich_phase2(r: Dict) -> Optional[Dict]:
 
     if r["catalyst"]:
         r["conviction_score"] = round(min(100.0, r["conviction_score"] + 4.0), 1)
+
+    # ── Macro commentary — capped, clearly-logged OPINION, never a signal ──
+    # See core/macro_commentary.py docstring: this is NOT prediction. It's a
+    # small, hard-capped nudge (+/- config.MACRO_COMMENTARY_MAX_BONUS points)
+    # logged in its own column so it's always distinguishable from the
+    # technical/fundamental conviction score and easy to audit or strip out.
+    mc = macro_commentary_bonus(sym, sector_hint=r.get("sector", ""))
+    r["macro_bonus"] = mc["bonus"]
+    r["macro_note"] = f"{mc['sector']}:{mc['bias']}({mc['confidence']}) {mc['note']}".strip()
+    if mc["bonus"] != 0:
+        r["conviction_score"] = round(max(0.0, min(100.0, r["conviction_score"] + mc["bonus"])), 1)
+        log.info(f"  MACRO OPINION | {sym:14s} | {mc['bonus']:+.1f} pts | {r['macro_note'][:70]}")
+
     return r
 
 
@@ -280,7 +296,7 @@ def push_results_to_sheets(winners: List[Dict], date_label: str) -> None:
     header = ["Date", "Symbol", "Source", "Conviction", "Fused", "FortPts", "ApexComp",
               "BayesPct", "Confidence", "RS%", "Catalyst", "IsPearl", "Ignited",
               "Grade", "Close", "StopLoss", "R1", "R2", "R3", "Shares",
-              "Delivery%", "HalalTier", "Story"]
+              "Delivery%", "HalalTier", "MacroBonus", "MacroNote", "Story"]
     rows = [header]
     for w in winners:
         rows.append([date_label, w["symbol"], w["source"], w["conviction_score"],
@@ -290,7 +306,8 @@ def push_results_to_sheets(winners: List[Dict], date_label: str) -> None:
                      "YES" if w["is_pearl"] else "", "YES" if w["ignited"] else "",
                      w["grade"], w["close"], w["stop_loss"], w["r1"], w["r2"], w["r3"],
                      w["kelly_shares"], w.get("delivery_pct", -1),
-                     w.get("halal_tier", ""), w["story"][:150]])
+                     w.get("halal_tier", ""), w.get("macro_bonus", 0.0),
+                     w.get("macro_note", "")[:100], w["story"][:150]])
     existing = read_sheet("SCREENER")
     if existing and len(existing) > 1:
         body = [r for r in existing[1:] if not (r and r[0] == date_label)]

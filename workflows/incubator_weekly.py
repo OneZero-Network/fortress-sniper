@@ -38,7 +38,9 @@ from core import config, preflight_secrets
 from core.db import init_db
 from core.nse_data import load_bhavcopy, fetch_weekly_history
 from core.shariah import full_audit, ticker_veto
-from core.fundamentals import eps_acceleration, revenue_quality, get_company_profile
+from core.fundamentals import (eps_acceleration, revenue_quality, get_company_profile,
+                                debt_and_quality_ratios)
+from core.factors import compute_residual_momentum, compute_composite_zscores
 from core.bridge import upsert_pearl, expire_stale_pearls
 from core.telegram import send as send_telegram
 from core.sheets_client import push_sheet, read_sheet
@@ -157,12 +159,32 @@ def check_sponge_volume(weekly: pd.DataFrame) -> Tuple[bool, dict]:
     return True, details
 
 
+def check_price_ceiling(close: float) -> Tuple[bool, str]:
+    """
+    Your ₹20-300 block-accumulation rule — a STRATEGY preference, checked
+    separately from the liquidity MIN_PRICE/MAX_PRICE band in score_stone().
+    A stock above the ceiling isn't 'bad', it just doesn't fit the capital-
+    efficiency playbook this pipeline is tuned for (buying high quantity
+    per rupee of capital) — see config.py for the full rationale.
+    """
+    if not config.PRICE_CEILING_ENABLED:
+        return True, ""
+    if close > config.PRICE_CEILING_BLOCK:
+        return False, f"₹{close:.0f} exceeds block-accumulation ceiling ₹{config.PRICE_CEILING_BLOCK:.0f}"
+    if close < config.PRICE_FLOOR_BLOCK:
+        return False, f"₹{close:.0f} below block-accumulation floor ₹{config.PRICE_FLOOR_BLOCK:.0f}"
+    return True, ""
+
+
 def score_stone(symbol: str, close: float) -> Dict:
     """Full gate cascade for one symbol. Returns either a survivor dict or
     a reject dict {reject_gate, reject_reason}. Raises nothing critical —
     caller still wraps with try/except for absolute isolation."""
     if close <= 0 or close < config.MIN_PRICE or close > config.MAX_PRICE:
         return {"reject_gate": "PRICE_BAND", "reject_reason": f"close={close}"}
+    ceiling_ok, ceiling_reason = check_price_ceiling(close)
+    if not ceiling_ok:
+        return {"reject_gate": "PRICE_CEILING_BLOCK", "reject_reason": ceiling_reason}
     vetoed, vreason = ticker_veto(symbol)
     if vetoed:
         return {"reject_gate": "TICKER_VETO", "reject_reason": vreason}
@@ -232,7 +254,46 @@ def run() -> List[dict]:
     survivors.sort(key=lambda x: x["math_score"], reverse=True)
     top = survivors[:25]
     log.info(f"Stage 1: {len(survivors)} survivors ({exceptions} exceptions isolated) "
-             f"→ top {len(top)} to Shariah")
+             f"→ top {len(top)} to factor scoring + Shariah")
+
+    # ── Composite Z-score factor model (Method 1) ──────────────────────────
+    # Cross-sectional across THIS week's top-25 survivors — momentum is the
+    # 63-day return already implicit in "distance below 52W high" being
+    # closed, but we compute a cleaner residual-vs-NIFTY version here plus
+    # bring in value/quality from fundamentals for the composite score.
+    nifty_hist = fetch_weekly_history("NIFTYBEES", weeks=14)  # proxy for NIFTY 63d return
+    nifty_ret_63d = None
+    if not nifty_hist.empty and len(nifty_hist) >= 13:
+        c0, c1 = _nan_safe(nifty_hist["close"].iloc[-13]), _nan_safe(nifty_hist["close"].iloc[-1])
+        if c0 > 0:
+            nifty_ret_63d = (c1 - c0) / c0
+
+    factor_inputs = []
+    for item in top:
+        sym = item["symbol"]
+        weekly = fetch_weekly_history(sym, weeks=14)
+        raw_ret = None
+        if not weekly.empty and len(weekly) >= 13:
+            c0, c1 = _nan_safe(weekly["close"].iloc[-13]), _nan_safe(weekly["close"].iloc[-1])
+            if c0 > 0:
+                raw_ret = (c1 - c0) / c0
+        ratios = debt_and_quality_ratios(sym)
+        item["debt_ratios"] = ratios
+        factor_inputs.append({
+            "symbol": sym,
+            "residual_return": (raw_ret - nifty_ret_63d if raw_ret is not None and nifty_ret_63d is not None
+                                else raw_ret),
+            "pe_ratio": ratios.get("pe_ratio"), "pb_ratio": ratios.get("pb_ratio"),
+            "roe_pct": ratios.get("roe_pct"),
+        })
+
+    factor_inputs = compute_composite_zscores(factor_inputs)
+    factor_map = {f["symbol"]: f for f in factor_inputs}
+    for item in top:
+        f = factor_map.get(item["symbol"], {})
+        item["factor_score_0_100"] = f.get("factor_score_0_100", 50.0)
+        item["z_composite"] = f.get("z_composite", 0.0)
+        item["factor_note"] = f.get("factor_note", "")
 
     pearls = []
     for item in top:
@@ -241,7 +302,8 @@ def run() -> List[dict]:
             profile = get_company_profile(sym)
             audit = full_audit(sym, company_name=profile["name"],
                                 industry=profile["industry"] or profile["sector"],
-                                biz_profile=profile["summary"])
+                                biz_profile=profile["summary"],
+                                debt_ratios=item.get("debt_ratios"))
             if not audit["compliant"]:
                 rejects.append([date_label, sym, "SHARIAH", audit["reason"][:90]])
                 log.info(f"  SHARIAH VETO | {sym} | {audit['reason'][:60]}")
@@ -249,16 +311,18 @@ def run() -> List[dict]:
             thesis = (f"Rubble {item['g1']['discount_pct']}% below 52W high | "
                       f"box {item['g1']['box_weeks']}w | sponge {item['g3']['sponge_weeks']}w"
                       + (f" | EPS accel {item['eps']['g1']}%" if item["eps"]["accel"] else "")
-                      + f" | score {item['math_score']}")
+                      + f" | score {item['math_score']} | factorZ {item['z_composite']:+.2f}")
             upsert_pearl(sym, thesis, item["g1"], float(item["math_score"]),
                           pearl_grade="PEARL", sector=profile["sector"] or "Unknown",
                           quality_flags=item["quality_flags"], sharia_compliant=True)
             pearls.append({**item, "thesis": thesis, "sector": profile["sector"]})
-            log.info(f"  💎 PEARL {sym} score={item['math_score']} "
+            log.info(f"  💎 PEARL {sym} score={item['math_score']} factorZ={item['z_composite']:+.2f} "
                      f"[{item['quality_flags'] or 'no flags'}]")
         except Exception as e:
             rejects.append([date_label, sym, "EXCEPTION", str(e)[:90]])
             log.debug(f"EXCEPTION shariah-stage {sym}: {e}")
+
+    pearls.sort(key=lambda p: p["math_score"] + p.get("z_composite", 0.0) * 10, reverse=True)
 
     # ── REJECTS_LOG: keep this run's rows + last ~2000 historical ────────
     try:
@@ -271,11 +335,12 @@ def run() -> List[dict]:
         log.warning(f"REJECTS_LOG push: {e}")
 
     if pearls:
-        header = ["Date", "Symbol", "Sector", "MathScore", "Discount%", "BoxWeeks",
+        header = ["Date", "Symbol", "Sector", "MathScore", "FactorZ", "Discount%", "BoxWeeks",
                   "SpongeWeeks", "EPSg1%", "QualityFlags", "Thesis"]
         rows = [[date_label, p["symbol"], p.get("sector", ""), p["math_score"],
-                 p["g1"]["discount_pct"], p["g1"]["box_weeks"], p["g3"]["sponge_weeks"],
-                 p["eps"]["g1"], p["quality_flags"], p["thesis"]] for p in pearls]
+                 p.get("z_composite", 0.0), p["g1"]["discount_pct"], p["g1"]["box_weeks"],
+                 p["g3"]["sponge_weeks"], p["eps"]["g1"], p["quality_flags"], p["thesis"]]
+                for p in pearls]
         existing = read_sheet("INCUBATOR")
         old = existing[1:] if len(existing) > 1 else []
         push_sheet("INCUBATOR", [header] + old + rows)
