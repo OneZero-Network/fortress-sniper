@@ -129,11 +129,62 @@ Respond ONLY in this JSON format (no markdown):
         return False, "LLM parse error — fail-safe reject"
 
 
-def full_audit(symbol: str, company_name: str = "", industry: str = "",
-               biz_profile: str = "") -> dict:
+def debt_ratio_screen(symbol: str, ratios: dict) -> Tuple[bool, str]:
     """
-    Full 3-layer audit used by both entrypoints. Returns a dict (not just
+    Layer 4: quantitative AAOIFI-style debt screen. This is the check your
+    mentor's manual review caught missing — MTNL passed the old L1-L3
+    checks (no haram keyword, no haram sector) despite ~₹31,944 Cr of debt
+    and NPA-classified loans, because nothing in L1-L3 looks at a balance
+    sheet at all.
+
+    This is a SEPARATE compliance leg from business-model screening:
+    interest-bearing debt above the threshold is itself considered
+    non-compliant under standard Islamic finance screens (AAOIFI ~33% of
+    assets), independent of what the company actually makes or sells.
+
+    ratios must come from fundamentals.debt_and_quality_ratios(). Missing
+    data (None) is NOT treated as a pass — it's treated as "screen
+    inconclusive", and the caller (full_audit) decides whether an
+    inconclusive debt screen should block a pick. Given your mentor's
+    finding, the default policy is fail-safe: no debt data -> reject,
+    matching the fail-closed philosophy used everywhere else in this file.
+    """
+    if not config.SHARIAH_DEBT_SCREEN_ENABLED:
+        return True, "debt screen disabled"
+
+    dta = ratios.get("debt_to_assets")
+    dte = ratios.get("debt_to_equity")
+
+    if dta is None and dte is None:
+        return False, "no debt data available — fail-safe reject (debt screen inconclusive)"
+
+    if dta is not None and dta > config.SHARIAH_MAX_DEBT_TO_ASSETS:
+        return False, (f"Debt/Assets {dta:.0%} > {config.SHARIAH_MAX_DEBT_TO_ASSETS:.0%} "
+                       f"AAOIFI threshold")
+    if dte is not None and dte > config.SHARIAH_MAX_DEBT_TO_EQUITY:
+        return False, (f"Debt/Equity {dte:.2f} > {config.SHARIAH_MAX_DEBT_TO_EQUITY:.2f} threshold")
+
+    parts = []
+    if dta is not None:
+        parts.append(f"D/A={dta:.0%}")
+    if dte is not None:
+        parts.append(f"D/E={dte:.2f}")
+    return True, f"Debt screen OK ({', '.join(parts)})"
+
+
+def full_audit(symbol: str, company_name: str = "", industry: str = "",
+               biz_profile: str = "", debt_ratios: dict = None) -> dict:
+    """
+    Full 4-layer audit used by both entrypoints. Returns a dict (not just
     a bool) so callers can log/store the reasoning for the training archive.
+
+    debt_ratios: pass fundamentals.debt_and_quality_ratios(symbol) here to
+    enable Layer 4. If omitted, Layer 4 is skipped entirely (backward
+    compatible for callers that haven't fetched fundamentals yet) — this
+    is different from "debt data unavailable", which fails closed. Skipping
+    the layer is a caller choice; having the layer and finding no data is
+    a fail-safe reject. Callers scoring real candidates for the watchlist
+    should always pass debt_ratios.
     """
     result = {"symbol": symbol.upper(), "compliant": False, "layer": "L1", "reason": ""}
 
@@ -142,19 +193,29 @@ def full_audit(symbol: str, company_name: str = "", industry: str = "",
         result.update(layer="L1", reason=reason)
         return result
 
+    business_ok = False
     sheet_ok, sheet_reason = sheet_check(symbol)
     if sheet_ok:
+        business_ok = True
         result.update(compliant=True, layer="L2", reason=sheet_reason)
-        return result
-
-    # Sheet didn't confirm — try grounded LLM audit if we have a profile.
-    if biz_profile or industry:
+    elif biz_profile or industry:
         llm_ok, llm_reason = llm_business_audit(symbol, company_name or symbol,
                                                   industry or "Unknown",
                                                   biz_profile or "Not available")
+        business_ok = llm_ok
         result.update(compliant=llm_ok, layer="L3", reason=llm_reason)
+    else:
+        result.update(compliant=False, layer="L2", reason=sheet_reason)
+
+    if not business_ok:
         return result
 
-    # No sheet hit and no profile to ground an LLM check — fail-safe reject.
-    result.update(compliant=False, layer="L2", reason=sheet_reason)
+    # ── Layer 4: quantitative debt screen (only runs if ratios provided) ──
+    if debt_ratios is not None:
+        debt_ok, debt_reason = debt_ratio_screen(symbol, debt_ratios)
+        if not debt_ok:
+            result.update(compliant=False, layer="L4", reason=debt_reason)
+            return result
+        result["reason"] = f"{result['reason']} | {debt_reason}"
+
     return result

@@ -301,3 +301,57 @@ INTEL_LOOKBACK_DAYS = _int("INTEL_LOOKBACK_DAYS", "90")
 CATALYST_KEYWORDS = ("ORDER", "CONTRACT", "WIN", "ACQUISITION", "EXPANSION",
                      "CAPACITY", "APPROVAL", "PATENT", "LAUNCH", "PARTNERSHIP",
                      "BUYBACK", "PREFERENTIAL")
+
+# ══════════════════════════════════════════════════════════════════════════
+# QUANTITATIVE SHARIAH DEBT SCREEN (AAOIFI-style)
+# ══════════════════════════════════════════════════════════════════════════
+# Your mentor's review flagged that the old Shariah engine only checked
+# ticker keywords + sector name — it had no actual debt-ratio screen, which
+# is why MTNL (₹31,944 Cr debt, NPA loans) sailed through. This is the
+# standard interest-bearing-debt screen most halal index providers use.
+# Missing data → treated as FAIL-SAFE PASS-THROUGH-TO-OTHER-LAYERS (i.e.
+# this specific check is skipped, not auto-passed) since fundamentals.py
+# already returns None (not 0) on unavailable data — see debt_and_quality_ratios().
+SHARIAH_DEBT_SCREEN_ENABLED = _bool("SHARIAH_DEBT_SCREEN_ENABLED", "true")
+SHARIAH_MAX_DEBT_TO_ASSETS = _float("SHARIAH_MAX_DEBT_TO_ASSETS", "0.33")   # AAOIFI ~33%
+SHARIAH_MAX_DEBT_TO_EQUITY = _float("SHARIAH_MAX_DEBT_TO_EQUITY", "0.45")   # secondary cross-check
+
+# ══════════════════════════════════════════════════════════════════════════
+# CAPITAL-EFFICIENCY PRICE CEILING (your ₹20-300 block-accumulation rule)
+# ══════════════════════════════════════════════════════════════════════════
+# This is a STRATEGY preference, not a compliance rule — separate on purpose
+# from MIN_PRICE/MAX_PRICE (which are liquidity/junk-penny filters). When
+# enabled, a pearl above the ceiling is still tracked (for information) but
+# is excluded from the WATCHLIST/winners a human would actually size into,
+# so next week's Incubator run stops surfacing ₹1,000+ stocks as "picks"
+# when your actual playbook only works below the ceiling.
+PRICE_CEILING_ENABLED = _bool("PRICE_CEILING_ENABLED", "true")
+PRICE_CEILING_BLOCK = _float("PRICE_CEILING_BLOCK", "300.0")
+PRICE_FLOOR_BLOCK = _float("PRICE_FLOOR_BLOCK", "20.0")   # mirrors MIN_PRICE by default
+
+# ══════════════════════════════════════════════════════════════════════════
+# COMPOSITE Z-SCORE FACTOR MODEL (Method 1 — momentum + value + quality)
+# ══════════════════════════════════════════════════════════════════════════
+# Z_composite = w_mom*Z_mom + w_val*Z_val + w_qual*Z_qual, each Z-scored
+# against the SAME scan universe on the SAME day (cross-sectional, not
+# against history) — the only way a Z-score is meaningful here, since we
+# don't have a stable long-run per-stock distribution to normalize against.
+# Weights are configurable; default favors momentum per your mentor's note
+# that momentum is the highest-conviction leg of your existing pipeline.
+FACTOR_ZSCORE_ENABLED = _bool("FACTOR_ZSCORE_ENABLED", "true")
+FACTOR_W_MOMENTUM = _float("FACTOR_W_MOMENTUM", "0.50")
+FACTOR_W_VALUE = _float("FACTOR_W_VALUE", "0.25")
+FACTOR_W_QUALITY = _float("FACTOR_W_QUALITY", "0.25")
+FACTOR_MIN_UNIVERSE_N = _int("FACTOR_MIN_UNIVERSE_N", "30")  # below this, Z-scores are unstable — skip
+
+# ══════════════════════════════════════════════════════════════════════════
+# MACRO COMMENTARY BONUS (qualitative LLM opinion — capped, clearly logged)
+# ══════════════════════════════════════════════════════════════════════════
+# NOT a prediction engine. This asks an LLM for a labeled OPINION on
+# sector positioning given current macro headlines (tariffs/dollar/war),
+# and applies a small, hard-capped nudge to conviction_score — logged
+# separately so it's always auditable and never confused with a real
+# signal. If the LLM call fails or returns low confidence, the bonus is 0.
+MACRO_COMMENTARY_ENABLED = _bool("MACRO_COMMENTARY_ENABLED", "true")
+MACRO_COMMENTARY_MAX_BONUS = _float("MACRO_COMMENTARY_MAX_BONUS", "5.0")  # +/- 5 pts max, on a 0-100 scale
+MACRO_COMMENTARY_MIN_CONFIDENCE = _float("MACRO_COMMENTARY_MIN_CONFIDENCE", "0.6")

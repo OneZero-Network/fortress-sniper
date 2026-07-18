@@ -91,6 +91,74 @@ def _quarterly_series(symbol: str, statement: str, row_names: list):
     return None
 
 
+def debt_and_quality_ratios(symbol: str) -> Dict:
+    """
+    Pulls the ratios needed for (a) the quantitative Shariah debt screen
+    and (b) the Value/Quality factor Z-scores:
+      - debt_to_equity   : total debt / total equity (balance sheet)
+      - debt_to_assets   : total debt / total assets (AAOIFI-style leg)
+      - pe_ratio         : trailing P/E (value factor)
+      - pb_ratio         : price/book (value factor, backup)
+      - roe_pct          : return on equity % (quality factor)
+    All fields default to None (not 0) when unavailable — callers must
+    treat None as "no data", never as "zero debt" or "zero P/E".
+    """
+    sym = symbol.upper()
+    out = {"debt_to_equity": None, "debt_to_assets": None,
+           "pe_ratio": None, "pb_ratio": None, "roe_pct": None,
+           "total_debt_cr": None, "market_cap_cr": None}
+    if not _YF:
+        return out
+    try:
+        t = yf.Ticker(f"{sym}.NS")
+        info = t.info or {}
+
+        pe = info.get("trailingPE", info.get("forwardPE"))
+        if _finite(pe) and pe is not None and pe > 0:
+            out["pe_ratio"] = round(float(pe), 2)
+
+        pb = info.get("priceToBook")
+        if _finite(pb) and pb is not None and pb > 0:
+            out["pb_ratio"] = round(float(pb), 2)
+
+        roe = info.get("returnOnEquity")
+        if _finite(roe) and roe is not None:
+            out["roe_pct"] = round(float(roe) * 100, 2)
+
+        de = info.get("debtToEquity")  # yfinance reports this as a % already (e.g. 45.2 = 0.452)
+        if _finite(de) and de is not None:
+            out["debt_to_equity"] = round(float(de) / 100, 4)
+
+        mcap = info.get("marketCap")
+        if _finite(mcap) and mcap:
+            out["market_cap_cr"] = round(float(mcap) / 1e7, 1)
+
+        # Balance-sheet fallback / cross-check for debt-to-assets
+        bs = getattr(t, "quarterly_balance_sheet", None)
+        if bs is not None and not bs.empty:
+            def _row(names):
+                for n in names:
+                    if n in bs.index:
+                        s = bs.loc[n].dropna()
+                        if len(s):
+                            return float(s.iloc[0])
+                return None
+
+            total_debt = _row(["Total Debt", "Long Term Debt", "Net Debt"])
+            total_assets = _row(["Total Assets"])
+            total_equity = _row(["Stockholders Equity", "Common Stock Equity"])
+
+            if total_debt is not None and _finite(total_debt):
+                out["total_debt_cr"] = round(total_debt / 1e7, 1)
+                if total_assets and _finite(total_assets) and total_assets > 0:
+                    out["debt_to_assets"] = round(total_debt / total_assets, 4)
+                if out["debt_to_equity"] is None and total_equity and _finite(total_equity) and total_equity > 0:
+                    out["debt_to_equity"] = round(total_debt / total_equity, 4)
+    except Exception as e:
+        log.debug(f"debt_and_quality_ratios {sym}: {e}")
+    return out
+
+
 def eps_acceleration(symbol: str) -> Dict:
     """See module docstring for gate semantics."""
     out = {"available": False, "accel": False, "g1": 0.0, "g2": 0.0,
