@@ -87,7 +87,57 @@ moving" is a better signal than either fact alone.
    keeps heist-style enrichment for the pearl watchlist (small N, always
    worth it) and defers broad-scan enrichment to post-gate survivors only.
 
-## Setup
+## Second mentor-review round (debt threshold precision + live re-validation)
+
+A follow-up live run surfaced three more real gaps:
+
+1. **Debt threshold was looser than the standard actually being enforced.**
+   The code used 0.45 for debt/equity while your mentor's manual review
+   holds everything to 0.33 (Ala Hazrat's limit) — that's why DOLLAR
+   (D/E 0.34), ARIS (D/E 1.61), and RSYSTEMS (D/E 0.49) passed the code
+   but failed manual review. Fixed: `SHARIAH_MAX_DEBT_TO_EQUITY` now
+   defaults to the SAME value as `SHARIAH_MAX_DEBT_TO_ASSETS` (0.33) — one
+   threshold, one standard, set via a single config constant. Verified
+   against all four of your mentor's flagged tickers.
+
+   **Deliberately NOT changed:** FABTECH's D/E of 0.32 is under 0.33 and
+   passes this screen by design — your mentor's rejection of it was an
+   extra personal margin-of-safety judgment ("too close to the edge"), not
+   evidence the 0.33 rule itself was violated. Per your explicit choice,
+   the code keeps a hard line at 0.33 with no safety buffer; a stricter
+   buffer would need to be a new, separately-named constant if you want it
+   later — see the comment in `config.py` for the exact reasoning.
+
+2. **MAXIND-style "wealth destroyers"** (clean debt ratios, catastrophic
+   ROE/EPS) needed a gate the Shariah debt screen was never meant to be.
+   Added `core/fundamentals.py: quality_veto()` — a genuinely separate
+   hard-reject gate (not folded into Shariah, since "is the balance sheet
+   halal-compliant" and "is this a viable business" are different
+   questions with different fail-safe policies: missing ROE/EPS data does
+   NOT veto, since this isn't a compliance gate). Verified against MAXIND's
+   exact numbers (ROE -29.84%, EPS -23.17) → correctly rejected; IPL's
+   healthy numbers → correctly passes; missing data → correctly passes
+   through un-vetoed rather than blocking on a data gap.
+
+3. **The ASPINWALL "ghost entry" problem** — the scanner's entry (₹257)
+   and stop (₹240) were computed from yesterday's EOD close; by the time
+   of manual review, live price had already drifted down onto the stop
+   line. This is a scan-vs-action staleness gap that no amount of smarter
+   scan-time scoring can fix — it needs a live check at the moment you're
+   about to act. Built `scripts/check_entry.py`: run
+   `python scripts/check_entry.py ASPINWALL` right before entering a
+   position, and it fetches live price and tells you plainly whether the
+   setup is BROKEN (price already hit/breached stop), CRITICAL (sitting
+   within 1.5% of stop, exactly like the ASPINWALL case), DRIFTED (moved
+   meaningfully from scan-time entry but still technically valid),
+   TARGET_HIT (already past R1 — don't chase), or VALID. Verified against
+   the exact ASPINWALL numbers: live price at ₹240 → BROKEN, ₹242 → CRITICAL,
+   ₹258 → VALID. Also added a same-alert thin-margin warning in
+   `sniper_daily.py` for setups whose scan-time entry/stop gap was already
+   under 3% before any drift — a different, complementary check (catches
+   inherently thin setups, not live drift).
+
+
 
 1. `pip install -r requirements.txt`
 2. Set GitHub Actions secrets: `OPENAI_API_KEY`, `TELEGRAM_TOKEN`,
