@@ -49,6 +49,7 @@ from core.crypto import regime as regime_module
 from core.crypto import evidence
 from core.crypto import pearl_score
 from core.crypto import pearl_flywheel
+from core.crypto import velocity_divergence
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -96,6 +97,7 @@ def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
     result["news"] = news
     result["whale_accum"] = whale_accum
     result["risk"] = risk
+    result["_pct_7d"] = coin_snapshot.get("pct_7d") if coin_snapshot else None
     return result
 
 
@@ -123,6 +125,20 @@ def _format_candidate(c: dict) -> str:
     if c["reasons_why"]:
         lines.append(f"   Why it surfaced: {'; '.join(c['reasons_why'])}")
     lines.append(f"   Would be invalidated by: {'; '.join(c['invalidation_conditions'])}")
+
+    vel = c.get("velocity")
+    div = c.get("divergence")
+    if vel:
+        vel_bits = []
+        if vel.get("volume_label"):
+            vel_bits.append(f"volume {vel['volume_label']} ({vel['volume_ratio']}x 7d avg)")
+        if vel.get("acceleration_label"):
+            vel_bits.append(f"momentum {vel['acceleration_label']} ({vel['price_acceleration_pct']:+.1f}pp)")
+        if vel_bits:
+            lines.append(f"   ⚡ Velocity (Level 0, observation only): {'; '.join(vel_bits)}")
+    if div and div.get("available") and div.get("label") != "ALIGNED":
+        emoji = "🧩" if div["label"] == "BULLISH_DIVERGENCE" else "⚠️"
+        lines.append(f"   {emoji} Divergence (Level 0, observation only): {div['detail']}")
     if c.get("pearl_thesis"):
         lines.append(f"   Incubator thesis: {c['pearl_thesis']}")
     lines.append(f"   Status: <b>{c['status']}</b>")
@@ -238,6 +254,24 @@ def run() -> None:
     candidate_tier = [c for c in all_scored if c.get("tier") == "CANDIDATE"]
     watch_tier = [c for c in all_scored if c.get("tier") == "WATCH"]
     false_pearl_tier = [c for c in all_scored if c.get("tier") == "FALSE_PEARL"]
+
+    # ── v3.0 Change & Divergence Engine — Level 0 observation layer,
+    # computed SELECTIVELY only for the shortlist that will be displayed
+    # (Pearl/High-Potential/Candidate), never for the full scanned
+    # universe, since it costs one extra OHLC fetch per candidate.
+    # PURELY ADDITIVE: does not touch discovery_score, tier, or ranking
+    # anywhere — see core/crypto/velocity_divergence.py's module docstring.
+    for c in pearl_tier + high_potential_tier + candidate_tier:
+        coin_id = coin_id_by_symbol.get(c["symbol"])
+        try:
+            vd = velocity_divergence.get_velocity_and_divergence(
+                coin_id, c.get("_pct_7d"), c.get("whale_accum"))
+            c["velocity"] = vd["velocity"]
+            c["divergence"] = vd["divergence"]
+        except Exception as e:
+            log.debug(f"velocity/divergence check failed for {c['symbol']}: {e}")
+            c["velocity"] = None
+            c["divergence"] = {"available": False, "label": "NONE", "detail": "check failed"}
 
     # keep the old grouping names for the rest of the message-building
     # code below — pearl+high-potential+candidate tiers all surface as
