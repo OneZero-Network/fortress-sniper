@@ -1,0 +1,41 @@
+name: Fortress Crypto Pearl Metrics Report (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      comparison_label:
+        description: 'Optional: comparison period label (leave blank for baseline-only report)'
+        required: false
+        default: ''
+
+concurrency:
+  group: fortress-crypto-metrics-report
+  cancel-in-progress: true
+
+jobs:
+  metrics-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run Pearl Metrics rollup report
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CRYPTO_COMPARISON_LABEL: ${{ inputs.comparison_label }}
+        run: python scripts/pearl_metrics_report.py
