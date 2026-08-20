@@ -50,6 +50,7 @@ from core.crypto import bridge_crypto
 from core.crypto import news_sentiment
 from core.crypto import outcome_tracker
 from core.crypto import risk_engine
+from core.crypto import regime as regime_module
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -59,9 +60,10 @@ COLD_SCAN_TOP_N = int(os.getenv("CRYPTO_COLD_SCAN_TOP_N", "60"))
 
 
 def _macro_subscore() -> float:
-    """Placeholder neutral 50.0 — see README_CRYPTO.md 'what's stubbed'.
-    BTC realized-vol regime scoring is a legitimate future addition, not
-    guessed at here."""
+    """DEPRECATED — kept only so nothing else that imports this breaks.
+    The real regime read now lives in core/crypto/regime.py and is
+    computed ONCE per run (not per-coin, to avoid re-fetching BTC data
+    58+ times) and threaded through score_symbol() as a parameter."""
     return 50.0
 
 
@@ -94,7 +96,7 @@ def _estimated_hold_days(entry: float, target: float, atr14: float) -> float:
 
 
 def score_symbol(symbol: str, coin_id: str, is_pearl: bool, pearl_row: dict = None,
-                  coin_snapshot: dict = None) -> dict:
+                  coin_snapshot: dict = None, macro_score: float = 50.0) -> dict:
     hist = cdata.fetch_daily_ohlc(coin_id, days=95)
     if hist.empty or len(hist) < 25:
         return {"symbol": symbol, "skip": True,
@@ -125,7 +127,6 @@ def score_symbol(symbol: str, coin_id: str, is_pearl: bool, pearl_row: dict = No
     trigger_adjusted = max(0.0, min(100.0, trigger_raw + trend["adjustment"]))
 
     thesis_score = pearl_row.get("incubator_score", 50.0) if (is_pearl and pearl_row) else 50.0
-    macro_score = _macro_subscore()
     entry_score = 100.0
 
     fused = bridge_crypto.apply_pedigree_bonus(trigger_adjusted, is_pearl, ignition["ignited"])
@@ -245,12 +246,20 @@ def run() -> None:
 
     results: List[dict] = []
 
+    # ── MARKET REGIME — computed ONCE per run using BTC as the market
+    # anchor, replacing the hardcoded neutral 50.0 every score used
+    # before. See core/crypto/regime.py for the honest scope note (BTC-
+    # anchored, not a full macro model).
+    regime = regime_module.detect_market_regime()
+    log.info(f"Regime: {regime['label']} (macro_score={regime['macro_score']})")
+
     watchlist = bridge_crypto.load_active_watchlist()
     log.info(f"PASS A: {len(watchlist)} active pearl(s) on crypto watchlist")
     skip_count = 0
     for pearl in watchlist:
         try:
-            r = score_symbol(pearl["symbol"], pearl["coin_id"], is_pearl=True, pearl_row=pearl)
+            r = score_symbol(pearl["symbol"], pearl["coin_id"], is_pearl=True, pearl_row=pearl,
+                              macro_score=regime["macro_score"])
             if r.get("skip"):
                 skip_count += 1
                 log.info(f"PASS A SKIP {pearl['symbol']}: {r.get('reason')}")
@@ -272,7 +281,8 @@ def run() -> None:
         if coin["symbol"] in watchlist_symbols:
             continue
         try:
-            r = score_symbol(coin["symbol"], coin["id"], is_pearl=False, coin_snapshot=coin)
+            r = score_symbol(coin["symbol"], coin["id"], is_pearl=False, coin_snapshot=coin,
+                              macro_score=regime["macro_score"])
             if r.get("skip"):
                 skip_count_b += 1
                 continue
@@ -316,7 +326,9 @@ def run() -> None:
                           "detail": "risk check errored"}
 
     if fortress_alerts or swing_alerts:
-        lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})", ""]
+        lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})",
+                 f"🌐 Market regime: <b>{regime['label']}</b>" + (f" ({regime.get('trend_detail','')}; {regime.get('vol_detail','')})" if regime.get("available") else ""),
+                 ""]
         if fortress_alerts:
             lines.append(f"🏰 <b>FORTRESS-tier (higher conviction, target {ccfg.PEARL_TARGET_LOW_PCT:.0f}-{ccfg.PEARL_TARGET_HIGH_PCT:.0f}%)</b>")
             for r in fortress_alerts[:10]:
@@ -336,7 +348,8 @@ def run() -> None:
         send_telegram(
             f"ℹ️ FORTRESS_CRYPTO Daily Scan ({datetime.now(timezone.utc).strftime('%Y-%m-%d')}): "
             f"ran successfully, {len(results)} candidate(s) scored, "
-            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}). No trade alert today.\n\n"
+            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}). No trade alert today.\n"
+            f"🌐 Market regime: {regime['label']}\n\n"
             f"{outcome_tracker.format_stats_summary()}"
         )
 
