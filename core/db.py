@@ -135,13 +135,22 @@ def init_crypto_tables() -> None:
             pnl_pct             REAL, conviction_score REAL
         );
 
-        CREATE TABLE IF NOT EXISTS crypto_score_cache (
+                CREATE TABLE IF NOT EXISTS crypto_score_cache (
             symbol      TEXT,
             date_label  TEXT,
             close       REAL,
             result_json TEXT,
             created_at  TEXT,
             PRIMARY KEY (symbol, date_label)
+        );
+
+        CREATE TABLE IF NOT EXISTS crypto_whale_snapshots (
+            symbol          TEXT,
+            chain           TEXT,
+            snapshot_date   TEXT,
+            top1_pct        REAL,
+            top10_pct       REAL,
+            PRIMARY KEY (symbol, snapshot_date)
         );
         """)
     log.info(f"Crypto tables initialized in {DB_PATH}")
