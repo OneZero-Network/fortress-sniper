@@ -1,42 +1,58 @@
-# Three real bugs fixed — 4 files, all REPLACE (not append)
+# v1.1 — "diving skill" upgrade
 
-## Bug 1: Pearls never carried over to the daily Sniper run
-Root cause: `outputs/fortress_unified.db` (SQLite) never persisted between
-GitHub Actions runs — every workflow run starts on a fresh runner with an
-empty database, so PASS A always saw "0 active pearls" no matter what the
-Incubator found. FIX: both workflow YAMLs now use `actions/cache` to save/
-restore the DB file across runs, so pearls written this week are actually
-there when the daily scan checks for ignition.
+## Files: what to do with each
+- `core_crypto/config.py` → REPLACE your existing `core/crypto/config.py`
+  entirely (adds daily-swing tier + news/trend constants, keeps
+  everything from before intact).
+- `core_crypto/news_sentiment.py` → NEW FILE. Add to `core/crypto/`
+  (same folder as data.py, bridge_crypto.py etc.)
+- `sniper_daily_crypto.py` → REPLACE your existing
+  `workflows/sniper_daily_crypto.py` entirely.
+- `incubator_weekly_crypto.py` → REPLACE your existing
+  `workflows/incubator_weekly_crypto.py` entirely.
+- `crypto_daily.yml` → REPLACE your existing
+  `.github/workflows/crypto_daily.yml` (adds the new optional
+  CRYPTOPANIC_API_KEY secret pass-through).
 
-## Bug 2: No Telegram notification on the daily Sniper run
-Not actually a bug in the alerting code — 0 candidates cleared the
-LANE_FUSED_MIN threshold that day, so (correctly, per the old logic)
-nothing was sent. But paired with Bug 1, silence was indistinguishable
-from failure. FIX: both workflows now ALWAYS send a status message —
-either the alert list, or an explicit "ran fine, 0 candidates today"
-heartbeat — so you always know the job executed.
+## What actually changed and why
 
-## Bug 3: Incubator alerts showed only grade/score, no buy/sell info
-This was a genuine missing feature, not a display issue — entry/stop-
-loss/target were never computed anywhere in the Sniper. FIX: added
-ATR-based stop-loss and two profit targets (1.5R / 3R) to every Sniper
-candidate, and the Telegram message now shows BUY price / SL / T1 / T2
-for anything that clears the alert threshold. The Incubator's weekly
-pearl message is now explicitly labeled as a WATCHLIST, not a trade
-signal — buy/sell levels only ever come from the daily Sniper scan when
-a real ignition/setup is detected, same separation of concerns as your
-original equity system (Incubator finds candidates, Sniper times entries).
+### 1. Fixed daily always returning 0
+`LANE_FUSED_MIN=60` was calibrated for "fortress-grade" setups — the
+SAME bar as the weekly Incubator's best pearls. A daily 10-20%-target
+swing trade is a genuinely different, lower-conviction, shorter-horizon
+category. It now has its own bar (`DAILY_SWING_MIN=42`) instead of a
+globally-lowered threshold that would've blurred fortress-grade and
+swing-grade signals together. Alerts are now split into two clearly
+labeled tiers.
 
-## Files to replace in your repo
-- `workflows/sniper_daily_crypto.py` → replace entirely
-- `workflows/incubator_weekly_crypto.py` → replace entirely
-- `.github/workflows/crypto_daily.yml` → replace entirely
-- `.github/workflows/crypto_weekly.yml` → replace entirely
+### 2. Trend context (the first "diving skill" layer)
+Free — uses data already fetched (7d/30d % change), no new API calls.
+A setup fighting its own downtrend gets penalized; a setup WITH the
+trend gets a bonus, even at equal raw technical score. Shown in every
+alert as "Trend: UPTREND/DOWNTREND/SIDEWAYS".
 
-## What to expect next run
-- Incubator Telegram message will say "watchlist, not a trade signal"
-- Sniper will either show BUY/SL/T1/T2 levels for real candidates, or
-  send an explicit "ran fine, 0 candidates" message — never silence
-- Give it ONE full incubator run + ONE full sniper run before judging
-  whether pearls persist — the cache only has something to restore from
-  after the first run following this fix
+### 3. News sentiment (the second "diving skill" layer)
+New optional integration with CryptoPanic (free tier, needs a free
+signup for an auth_token at cryptopanic.com/developers/api — add it as
+secret `CRYPTOPANIC_API_KEY`). Applied ONLY to the shortlist that
+already cleared the technical bar, not the whole 150-coin scan — same
+"read the news on your shortlist, not on everything" logic a human
+analyst would use, and it keeps free-tier call volume sane. Without the
+key, alerts just say "News: n/a" rather than fabricating a sentiment.
+
+### 4. Entry/exit timing
+Every alert now shows:
+  - Exact UTC timestamp of this scan run as the entry reference time
+  - An ESTIMATED days-to-target for both T1 and T2, derived from the
+    coin's own ATR (volatility) — explicitly an estimate, not a promise
+  - Target range labeled per tier: Fortress/Pearl = 25-50%, Swing = 10-20%
+
+## Honest caveats (same discipline as before)
+- Trend/news are simple, auditable signals (7d/30d % change; CryptoPanic
+  community vote balance) — not a proprietary edge or a trained model.
+  They're meaningfully better than nothing, not a guarantee.
+- Hold-day estimates are a coarse heuristic (ATR-implied), not backtested
+  against actual crypto price-path data yet.
+- None of the new target percentages (10-20% swing, 25-50% pearl) are
+  validated against historical outcomes — they're reasoned defaults you
+  should track against real results before trusting them.
