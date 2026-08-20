@@ -190,34 +190,58 @@ def fetch_platforms(coin_id: str) -> Dict[str, str]:
     return fetch_coin_details(coin_id)["platforms"]
 
 
-def fetch_daily_ohlc(coin_id: str, days: int = 90) -> pd.DataFrame:
-    """Daily OHLC history for indicators/factor model. CoinGecko's OHLC
-    endpoint returns coarser candles for longer windows automatically;
-    volume is pulled separately from market_chart since /ohlc omits it."""
-    ohlc = _cg_get(f"/coins/{coin_id}/ohlc", {"vs_currency": "usd", "days": days})
-    if not ohlc:
-        return pd.DataFrame()
-    df = pd.DataFrame(ohlc, columns=["ts", "open", "high", "low", "close"])
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["ts"], unit="ms")
+def fetch_daily_ohlc(coin_id: str, days: int = 95) -> pd.DataFrame:
+    """TRUE daily OHLCV series. This REPLACES a broken earlier approach
+    that used CoinGecko's /ohlc endpoint directly — that endpoint
+    auto-buckets into coarser candles as the requested window grows
+    (roughly 4-day candles once days > 30 on the free tier), so a
+    days=90 request was silently returning ~22 rows, just under this
+    system's 25-row minimum. Production logs showed this failing on
+    nearly every symbol, every run. Worse: on the rare coin that DID
+    clear 25 rows, those were actually 4-day candles mislabeled as
+    daily, meaning every ATR/RSI/ignition threshold tuned for daily
+    bars was silently being computed on the wrong timeframe.
 
+    FIX: build the daily series from /market_chart instead, which
+    returns genuinely one data point per day once the requested window
+    exceeds 90 days (documented CoinGecko free-tier behavior) — hence
+    days=95 default, safely past that boundary.
+
+    HONEST LIMITATION: /market_chart gives price + volume, not true
+    intraday OHLC. Each day's open is approximated as the PRIOR day's
+    close (so a day's candle reflects real direction: green if it
+    closed above where it opened), and high/low are approximated as
+    max/min(open, close) for that day — this loses true intraday
+    wick/range information. It is a real trade-off, not free — anything
+    depending on precise intraday high/low (box_high_20 in particular)
+    is now an approximation of daily closes, not true daily ranges.
+    Flagged here rather than silently presented as equivalent to real
+    OHLC.
+    """
     chart = _cg_get(f"/coins/{coin_id}/market_chart", {
         "vs_currency": "usd", "days": days, "interval": "daily",
     })
-    if chart and chart.get("total_volumes"):
+    if not chart or not chart.get("prices"):
+        return pd.DataFrame()
+
+    price_df = pd.DataFrame(chart["prices"], columns=["ts", "close"])
+    price_df["date"] = pd.to_datetime(price_df["ts"], unit="ms").dt.floor("D")
+    price_df = price_df.drop_duplicates(subset="date", keep="last").sort_values("date").reset_index(drop=True)
+
+    if chart.get("total_volumes"):
         vol_df = pd.DataFrame(chart["total_volumes"], columns=["ts", "volume"])
         vol_df["date"] = pd.to_datetime(vol_df["ts"], unit="ms").dt.floor("D")
-        df["date_floor"] = df["date"].dt.floor("D")
-        df = df.merge(vol_df[["date", "volume"]], left_on="date_floor",
-                       right_on="date", how="left", suffixes=("", "_v"))
-        df["volume"] = df["volume"].fillna(0)
+        vol_df = vol_df.drop_duplicates(subset="date", keep="last")
+        price_df = price_df.merge(vol_df[["date", "volume"]], on="date", how="left")
+        price_df["volume"] = price_df["volume"].fillna(0)
     else:
-        df["volume"] = 0.0
+        price_df["volume"] = 0.0
 
-    df = df[["date", "open", "high", "low", "close", "volume"]].sort_values("date")
-    df = df.reset_index(drop=True)
-    return df
+    price_df["open"] = price_df["close"].shift(1).fillna(price_df["close"])
+    price_df["high"] = price_df[["open", "close"]].max(axis=1)
+    price_df["low"] = price_df[["open", "close"]].min(axis=1)
+
+    return price_df[["date", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
