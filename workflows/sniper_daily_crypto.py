@@ -36,7 +36,7 @@ from typing import List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.db import init_crypto_tables
+from core.db import init_crypto_tables, save_pearl_observation
 from core.telegram import send as send_telegram
 from core.sheets_client import push_sheet
 from core.crypto import config as ccfg
@@ -48,6 +48,7 @@ from core.crypto import risk_engine
 from core.crypto import regime as regime_module
 from core.crypto import evidence
 from core.crypto import pearl_score
+from core.crypto import pearl_flywheel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -131,6 +132,13 @@ def run() -> None:
     log.info(f"=== {ccfg.VERSION} — PEARL DETECTION MACHINE ===")
     init_crypto_tables()
 
+    # ── PEARL FLYWHEEL — resolve yesterday's (and older) observations
+    # FIRST, before scoring anything new. Same discipline as the old
+    # outcome_tracker: every prior Pearl gets checked against real price
+    # action and specific invalidation triggers before today's scan runs.
+    flywheel_summary = pearl_flywheel.resolve_matured_pearls()
+    log.info(f"Pearl flywheel: {flywheel_summary}")
+
     ev = evidence.overall_evidence_level()
     log.info(f"Overall evidence level: {ev['label']}")
 
@@ -152,6 +160,8 @@ def run() -> None:
 
     universe = cdata.fetch_universe(top_n=COLD_SCAN_TOP_N)
     watchlist_symbols = {p["symbol"] for p in watchlist}
+    coin_id_by_symbol = {p["symbol"]: p["coin_id"] for p in watchlist}
+    coin_id_by_symbol.update({c["symbol"]: c["id"] for c in universe})
     log.info(f"Cold scan: {len(universe)} coins (excluding {len(watchlist_symbols)} already on watchlist)")
 
     for coin in universe:
@@ -167,8 +177,41 @@ def run() -> None:
     watch_candidates = [c for c in candidates if c["status"] == "👀 WATCH"]
     avoid_candidates = [c for c in candidates if "AVOID" in (c["status"] or "")]
 
+    # ── LOG immutable snapshots for every PEARL CANDIDATE and WATCH (not
+    # AVOID — a rejected candidate has nothing to track forward). This
+    # feeds the flywheel that answers "was the machine right."
+    for c in pearl_candidates + watch_candidates:
+        try:
+            coin_id = coin_id_by_symbol.get(c["symbol"])
+            live_price = cdata.fetch_live_price_binance(c["symbol"])
+            if coin_id and live_price:
+                save_pearl_observation({
+                    "symbol": c["symbol"], "coin_id": coin_id, "price_at_observation": live_price,
+                    "discovery_score": c["discovery_score"], "evidence_level": ev["level"],
+                    "evidence_label": ev["label"],
+                    "whale_score": c["components"].get("whale"),
+                    "whale_label_at_discovery": (c.get("whale_accum") or {}).get("label"),
+                    "news_score": c["components"].get("news"),
+                    "news_label_at_discovery": (c.get("news") or {}).get("label"),
+                    "liquidity_score": c["components"].get("liquidity"),
+                    "structure_score": c["components"].get("structure"),
+                    "onchain_score": c["components"].get("onchain"),
+                    "false_pearl_risk_pct": c["false_pearl_risk_pct"],
+                    "risk_severity_at_discovery": (c.get("risk") or {}).get("severity", "UNCHECKED"),
+                    "status_at_discovery": c["status"],
+                    "why_it_surfaced": "; ".join(c["reasons_why"]),
+                    "invalidation_conditions": "; ".join(c["invalidation_conditions"]),
+                })
+        except Exception as e:
+            log.warning(f"Failed to log pearl observation for {c['symbol']}: {e}")
+
     log.info(f"{len(pearl_candidates)} PEARL CANDIDATE(s), {len(watch_candidates)} WATCH, "
              f"{len(avoid_candidates)} AVOID")
+
+    from core.db import get_pearl_flywheel_stats
+    fw_stats = get_pearl_flywheel_stats()
+    fw_line = ("📊 Track record so far: " + ", ".join(f"{k}={v}" for k, v in sorted(fw_stats.items()))
+               if fw_stats else "📊 Track record: no resolved observations yet — flywheel just started")
 
     header = (
         f"🔎 <b>FORTRESS_CRYPTO — Pearl Detection Machine</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n\n"
@@ -178,6 +221,7 @@ def run() -> None:
         f"'deserves attention,' NOT 'will make money.' No layer here has been proven predictive yet — "
         f"research continues in parallel (see the Research Tools workflow).</i>\n\n"
         f"🌐 Market regime (context only — this layer is REJECTED, not used in scoring): {regime['label']}\n"
+        f"{fw_line}\n"
     )
 
     if pearl_candidates or watch_candidates or avoid_candidates:
