@@ -1,0 +1,41 @@
+name: Fortress Crypto V5 Falsification Test (manual only)
+
+on:
+  workflow_dispatch: {}
+  # DELIBERATELY no schedule — this is a research experiment, not a
+  # continuous job. Fetches 480 days of history per coin (discovery +
+  # validation split) and runs V5, V5-Control, and leave-one-coin-out.
+
+concurrency:
+  group: fortress-crypto-v5
+  cancel-in-progress: true
+
+jobs:
+  crypto-v5-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run V5 falsification test (frozen rules)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: python scripts/backtest_v5.py
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-v5-run-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30
