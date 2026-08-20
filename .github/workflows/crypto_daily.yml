@@ -44,6 +44,7 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          CRYPTOPANIC_API_KEY: ${{ secrets.CRYPTOPANIC_API_KEY }}
           ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
           BSCSCAN_API_KEY: ${{ secrets.BSCSCAN_API_KEY }}
           POLYGONSCAN_API_KEY: ${{ secrets.POLYGONSCAN_API_KEY }}
