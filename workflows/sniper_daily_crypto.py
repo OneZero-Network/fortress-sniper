@@ -110,7 +110,8 @@ def _format_candidate(c: dict) -> str:
         return f"   {emoji} {label}: {tier} ({v:.0f}/100)"
 
     lines = [
-        f"<b>{c['symbol']}</b> — Discovery Score {c['discovery_score']}/100" if c["discovery_score"] is not None
+        (f"<b>{c['symbol']}</b> — Discovery Score {c['discovery_score']}/100 "
+         f"(Evidence Completeness: {c['evidence_completeness_pct']}%)") if c["discovery_score"] is not None
         else f"<b>{c['symbol']}</b> — Discovery Score n/a",
         _fmt_comp("whale", "🐋", "Whale activity"),
         _fmt_comp("news", "📰", "News/catalyst"),
@@ -126,6 +127,48 @@ def _format_candidate(c: dict) -> str:
         lines.append(f"   Incubator thesis: {c['pearl_thesis']}")
     lines.append(f"   Status: <b>{c['status']}</b>")
     return "\n".join(lines)
+
+
+def _tally_diagnostic(c: Optional[dict], diag: dict) -> None:
+    """Updates the pipeline diagnostic counters for one candidate,
+    whatever happened to it — this is what makes the bottleneck visible
+    instead of candidates silently vanishing."""
+    if c is None:
+        diag["rejected_missing_data"] += 1
+        return
+    diag["usable"] += 1
+    n_avail = len(c.get("components_available", []))
+    if n_avail == 0:
+        diag["rejected_missing_data"] += 1
+        return
+    diag["entered_scorer"] += 1
+
+    score = c.get("discovery_score")
+    if score is not None:
+        if score >= 90:
+            diag["score_90plus"] += 1
+        elif score >= 80:
+            diag["score_80_89"] += 1
+        elif score >= 70:
+            diag["score_70_79"] += 1
+        elif score >= 60:
+            diag["score_60_69"] += 1
+
+    tier = c.get("tier")
+    reject = c.get("reject_reason")
+    if tier == "PEARL":
+        diag["final_pearl"] += 1
+    elif tier == "CANDIDATE":
+        diag["final_candidate"] += 1
+    elif tier == "WATCH":
+        diag["final_watch"] += 1
+    elif tier == "FALSE_PEARL":
+        diag["final_false_pearl"] += 1
+        diag["rejected_false_pearl"] += 1
+    elif reject == "INSUFFICIENT_EVIDENCE":
+        diag["rejected_insufficient_evidence"] += 1
+    elif reject == "MISSING_DATA":
+        diag["rejected_missing_data"] += 1
 
 
 def run() -> None:
@@ -150,32 +193,56 @@ def run() -> None:
     watchlist = bridge_crypto.load_active_watchlist()
     log.info(f"Watchlist: {len(watchlist)} pearl(s) from Incubator")
 
-    candidates: List[dict] = []
-
-    for pearl in watchlist:
-        c = _score_candidate(pearl["symbol"], pearl["coin_id"], coin_snapshot=None,
-                              is_watchlist_pearl=True, pearl_thesis=pearl.get("thesis"))
-        if c and c["status"] is not None:
-            candidates.append(c)
-
     universe = cdata.fetch_universe(top_n=COLD_SCAN_TOP_N)
     watchlist_symbols = {p["symbol"] for p in watchlist}
     coin_id_by_symbol = {p["symbol"]: p["coin_id"] for p in watchlist}
     coin_id_by_symbol.update({c["symbol"]: c["id"] for c in universe})
     log.info(f"Cold scan: {len(universe)} coins (excluding {len(watchlist_symbols)} already on watchlist)")
 
+    # ── v2.9 PIPELINE DIAGNOSTIC — tracks every candidate through every
+    # stage, including ones the old code silently dropped. Per explicit
+    # instruction: this instruments the pipeline to find where it's
+    # bottlenecking, WITHOUT changing the underlying discovery_score math
+    # or any threshold.
+    universe_size = len(watchlist) + len(universe) - len(watchlist_symbols & {c["symbol"] for c in universe})
+    diag = {"universe": universe_size, "scanned": 0, "usable": 0, "entered_scorer": 0,
+            "rejected_missing_data": 0, "rejected_false_pearl": 0, "rejected_insufficient_evidence": 0,
+            "score_90plus": 0, "score_80_89": 0, "score_70_79": 0, "score_60_69": 0,
+            "final_pearl": 0, "final_candidate": 0, "final_watch": 0, "final_false_pearl": 0}
+
+    all_scored: List[dict] = []  # every candidate that got a discovery_score, regardless of tier
+
+    for pearl in watchlist:
+        diag["scanned"] += 1
+        c = _score_candidate(pearl["symbol"], pearl["coin_id"], coin_snapshot=None,
+                              is_watchlist_pearl=True, pearl_thesis=pearl.get("thesis"))
+        _tally_diagnostic(c, diag)
+        if c:
+            all_scored.append(c)
+
     for coin in universe:
         if coin["symbol"] in watchlist_symbols:
             continue
+        diag["scanned"] += 1
         c = _score_candidate(coin["symbol"], coin["id"], coin_snapshot=coin, is_watchlist_pearl=False)
-        if c and c["status"] is not None:
-            candidates.append(c)
+        _tally_diagnostic(c, diag)
+        if c:
+            all_scored.append(c)
 
-    candidates.sort(key=lambda c: c["discovery_score"] or 0, reverse=True)
+    all_scored.sort(key=lambda c: c["discovery_score"] or 0, reverse=True)
 
-    pearl_candidates = [c for c in candidates if "INVESTIGATE" in (c["status"] or "")]
-    watch_candidates = [c for c in candidates if c["status"] == "👀 WATCH"]
-    avoid_candidates = [c for c in candidates if "AVOID" in (c["status"] or "")]
+    pearl_tier = [c for c in all_scored if c.get("tier") == "PEARL"]
+    candidate_tier = [c for c in all_scored if c.get("tier") == "CANDIDATE"]
+    watch_tier = [c for c in all_scored if c.get("tier") == "WATCH"]
+    false_pearl_tier = [c for c in all_scored if c.get("tier") == "FALSE_PEARL"]
+
+    # keep the old grouping names for the rest of the message-building
+    # code below — pearl+candidate tiers both surface as "investigate"
+    pearl_candidates = pearl_tier + candidate_tier
+    watch_candidates = watch_tier
+    avoid_candidates = false_pearl_tier
+
+    log.info(f"Pipeline diagnostic: {diag}")
 
     # ── LOG immutable snapshots for every PEARL CANDIDATE and WATCH (not
     # AVOID — a rejected candidate has nothing to track forward). This
@@ -213,6 +280,19 @@ def run() -> None:
     fw_line = ("📊 Track record so far: " + ", ".join(f"{k}={v}" for k, v in sorted(fw_stats.items()))
                if fw_stats else "📊 Track record: no resolved observations yet — flywheel just started")
 
+    diagnostic_block = (
+        f"🔬 <b>PEARL PIPELINE DIAGNOSTIC</b> — {datetime.now(timezone.utc).strftime('%d %b')}\n"
+        f"Universe: {diag['universe']} | Scanned: {diag['scanned']} | Usable: {diag['usable']} | "
+        f"Entered scorer: {diag['entered_scorer']}\n"
+        f"Rejected — missing data: {diag['rejected_missing_data']} | "
+        f"false pearl: {diag['rejected_false_pearl']} | "
+        f"insufficient evidence: {diag['rejected_insufficient_evidence']}\n"
+        f"Score distribution — 90+: {diag['score_90plus']} | 80-89: {diag['score_80_89']} | "
+        f"70-79: {diag['score_70_79']} | 60-69: {diag['score_60_69']}\n"
+        f"Final — ⭐ Pearls: {diag['final_pearl']} | 🔎 Candidates: {diag['final_candidate']} | "
+        f"👀 Watch: {diag['final_watch']} | 🚫 False Pearls: {diag['final_false_pearl']}\n"
+    )
+
     header = (
         f"🔎 <b>FORTRESS_CRYPTO — Pearl Detection Machine</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n\n"
         f"📊 <b>Evidence Level: {ev['label']}</b>\n"
@@ -221,22 +301,28 @@ def run() -> None:
         f"'deserves attention,' NOT 'will make money.' No layer here has been proven predictive yet — "
         f"research continues in parallel (see the Research Tools workflow).</i>\n\n"
         f"🌐 Market regime (context only — this layer is REJECTED, not used in scoring): {regime['label']}\n"
-        f"{fw_line}\n"
+        f"{fw_line}\n\n"
+        f"{diagnostic_block}"
     )
 
-    if pearl_candidates or watch_candidates or avoid_candidates:
+    if pearl_tier or candidate_tier or watch_candidates or avoid_candidates:
         lines = [header]
-        if pearl_candidates:
-            lines.append(f"\n━━━ 🔎 PEARL CANDIDATES ({len(pearl_candidates)}) ━━━\n")
-            for c in pearl_candidates[:10]:
+        if pearl_tier:
+            lines.append(f"\n━━━ ⭐ PEARLS ({len(pearl_tier)}) ━━━\n")
+            for c in pearl_tier[:10]:
+                lines.append(_format_candidate(c))
+                lines.append("")
+        if candidate_tier:
+            lines.append(f"\n━━━ 🔎 CANDIDATES ({len(candidate_tier)}) — interesting but incomplete evidence ━━━\n")
+            for c in candidate_tier[:10]:
                 lines.append(_format_candidate(c))
                 lines.append("")
         if watch_candidates:
             lines.append(f"\n━━━ 👀 WATCH ({len(watch_candidates)}) ━━━")
             for c in watch_candidates[:8]:
-                lines.append(f"   {c['symbol']}: {c['discovery_score']}/100, false-pearl risk {c['false_pearl_risk_pct']}%")
+                lines.append(f"   {c['symbol']}: {c['discovery_score']}/100, evidence completeness {c['evidence_completeness_pct']}%, false-pearl risk {c['false_pearl_risk_pct']}%")
         if avoid_candidates:
-            lines.append(f"\n━━━ 🚫 AVOID — false-pearl risk ({len(avoid_candidates)}) ━━━")
+            lines.append(f"\n━━━ 🚫 FALSE PEARLS ({len(avoid_candidates)}) ━━━")
             for c in avoid_candidates[:8]:
                 lines.append(f"   {c['symbol']}: {c['false_pearl_risk_pct']}% false-pearl risk (score would've been {c['discovery_score']})")
         message = "\n".join(lines)
