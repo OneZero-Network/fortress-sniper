@@ -52,6 +52,58 @@ _MIN_INTERVAL = float(_os.getenv(
 ))
 _last_call_ts = [0.0]
 
+# ══════════════════════════════════════════════════════════════════════════
+# v3.3 — API BUDGET + PER-RUN CACHE
+# ══════════════════════════════════════════════════════════════════════════
+# API BUDGET: a hard ceiling on total CoinGecko calls per run. Expanding
+# from ~60 to ~110 candidates roughly doubles call volume — this makes
+# that cost VISIBLE and BOUNDED rather than hoping the throttle alone
+# keeps things sane. When the budget is hit mid-run, the caller (see
+# workflows/sniper_daily_crypto.py) stops scoring further candidates
+# gracefully and reports exactly how many were skipped — never a crash,
+# never fabricated data for the ones that didn't get checked.
+API_CALL_BUDGET = int(_os.getenv("CRYPTO_API_CALL_BUDGET", "500"))
+_call_count = [0]
+_rate_limited_this_run = [False]
+
+
+def get_api_call_count() -> int:
+    return _call_count[0]
+
+
+def budget_remaining() -> int:
+    return max(0, API_CALL_BUDGET - _call_count[0])
+
+
+def budget_exhausted() -> bool:
+    return _call_count[0] >= API_CALL_BUDGET
+
+
+def was_rate_limited_this_run() -> bool:
+    """True if any call hit a 429 this run — surfaced in the diagnostic
+    report so 'fewer results than expected' can be attributed correctly
+    to provider throttling rather than silently blamed on the scoring
+    model."""
+    return _rate_limited_this_run[0]
+
+
+def reset_run_state() -> None:
+    """Call once at the start of a run if you need a clean slate
+    (mainly useful for tests) — normal production runs are one-shot
+    processes so this rarely needs calling."""
+    _call_count[0] = 0
+    _rate_limited_this_run[0] = False
+    _platform_cache.clear()
+    _ohlc_cache.clear()
+
+
+# Per-run in-memory cache — keyed by coin_id, cleared naturally each
+# fresh process run. If platform data for HYPE was already fetched once
+# (by the whale check), the risk check, velocity engine, and anything
+# else needing it reuse the SAME result instead of calling again.
+_platform_cache: Dict[str, dict] = {}
+_ohlc_cache: Dict[str, "pd.DataFrame"] = {}
+
 
 def _throttle() -> None:
     elapsed = time.monotonic() - _last_call_ts[0]
@@ -68,11 +120,13 @@ def _cg_get(path: str, params: Optional[dict] = None, retries: int = 3) -> Optio
     url = f"{ccfg.COINGECKO_BASE}{path}"
     for attempt in range(retries):
         _throttle()
+        _call_count[0] += 1
         try:
             resp = _session.get(url, params=params, headers=headers, timeout=20)
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 429:
+                _rate_limited_this_run[0] = True
                 wait = 2 ** (attempt + 2)
                 log.warning(f"CoinGecko 429, backing off {wait}s ({path})")
                 time.sleep(wait)
@@ -82,6 +136,7 @@ def _cg_get(path: str, params: Optional[dict] = None, retries: int = 3) -> Optio
         except Exception as e:
             log.warning(f"CoinGecko request error ({path}): {e}")
             time.sleep(1.5)
+    _rate_limited_this_run[0] = True  # exhausted all retries — likely still rate-limited
     return None
 
 
@@ -194,10 +249,33 @@ def fetch_coin_categories(coin_id: str) -> List[str]:
 
 
 def fetch_platforms(coin_id: str) -> Dict[str, str]:
-    return fetch_coin_details(coin_id)["platforms"]
+    """CACHED per run — this is called independently by the whale check,
+    risk engine, and velocity engine, all for the same coin_id within a
+    single scoring pass. Without this cache, that's 3 identical API
+    calls for one coin instead of 1 — exactly the duplication your
+    mentor flagged."""
+    if coin_id in _platform_cache:
+        return _platform_cache[coin_id]
+    result = fetch_coin_details(coin_id)["platforms"]
+    _platform_cache[coin_id] = result
+    return result
 
 
 def fetch_daily_ohlc(coin_id: str, days: int = 95) -> pd.DataFrame:
+    """CACHED per run, keyed by (coin_id, days). Multiple lenses (V5
+    backtest, velocity engine, regime detection) can request the same
+    coin's OHLC in the same run — this avoids re-fetching identical
+    data. See _fetch_daily_ohlc_uncached for the actual fetch logic and
+    its full documentation."""
+    cache_key = f"{coin_id}:{days}"
+    if cache_key in _ohlc_cache:
+        return _ohlc_cache[cache_key]
+    result = _fetch_daily_ohlc_uncached(coin_id, days)
+    _ohlc_cache[cache_key] = result
+    return result
+
+
+def _fetch_daily_ohlc_uncached(coin_id: str, days: int = 95) -> pd.DataFrame:
     """TRUE daily OHLCV series. This REPLACES a broken earlier approach
     that used CoinGecko's /ohlc endpoint directly — that endpoint
     auto-buckets into coarser candles as the requested window grows

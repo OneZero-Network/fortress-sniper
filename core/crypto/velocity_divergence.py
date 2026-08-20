@@ -124,6 +124,51 @@ def compute_divergence(recent_price_return_pct: Optional[float], whale_accum: Op
     return {"available": True, "label": "ALIGNED", "detail": "whale behavior stable, no divergence signal"}
 
 
+def compute_relative_anomaly(candidate_velocity: Optional[dict], peer_velocities: list) -> dict:
+    """v3.3 — Relative/Peer Anomaly lens. Zero extra API calls: uses
+    velocity data ALREADY gathered for every candidate in the same
+    universe_tier this run. Answers 'is this coin's volume/momentum
+    change unusual relative to its own peer group,' not against the
+    whole market — a 3x volume day means something different for a
+    Large-cap peer group (rarely happens) than an Emerging-tier one
+    (happens more often, noisier baseline).
+
+    Returns {"available": bool, "volume_percentile": float|None,
+    "acceleration_percentile": float|None, "label": str}. Requires at
+    least 5 peers with valid velocity data to compute a percentile —
+    below that, returns unavailable rather than a meaningless rank
+    among 2-3 coins."""
+    if not candidate_velocity or candidate_velocity.get("volume_ratio") is None:
+        return {"available": False, "volume_percentile": None,
+                "acceleration_percentile": None, "label": "insufficient own data"}
+
+    peer_vol_ratios = [p["volume_ratio"] for p in peer_velocities
+                        if p and p.get("volume_ratio") is not None]
+    if len(peer_vol_ratios) < 5:
+        return {"available": False, "volume_percentile": None,
+                "acceleration_percentile": None, "label": "insufficient peer sample"}
+
+    own_vol = candidate_velocity["volume_ratio"]
+    vol_percentile = round(100.0 * sum(1 for v in peer_vol_ratios if v < own_vol) / len(peer_vol_ratios), 1)
+
+    accel_percentile = None
+    own_accel = candidate_velocity.get("price_acceleration_pct")
+    peer_accels = [p["price_acceleration_pct"] for p in peer_velocities
+                   if p and p.get("price_acceleration_pct") is not None]
+    if own_accel is not None and len(peer_accels) >= 5:
+        accel_percentile = round(100.0 * sum(1 for a in peer_accels if a < own_accel) / len(peer_accels), 1)
+
+    if vol_percentile >= 95:
+        label = f"top {100-vol_percentile:.0f}% of peer group by volume change — genuinely unusual"
+    elif vol_percentile >= 80:
+        label = f"top {100-vol_percentile:.0f}% of peer group by volume change — notable"
+    else:
+        label = "within normal range for its peer group"
+
+    return {"available": True, "volume_percentile": vol_percentile,
+            "acceleration_percentile": accel_percentile, "label": label}
+
+
 def get_velocity_and_divergence(coin_id: str, recent_price_return_pct: Optional[float],
                                  whale_accum: Optional[dict]) -> dict:
     """Convenience wrapper: fetches OHLC once, computes both velocity and
