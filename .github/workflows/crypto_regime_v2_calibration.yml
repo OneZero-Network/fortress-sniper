@@ -1,0 +1,36 @@
+name: Fortress Crypto Phase B - Regime v2 Calibration (manual only)
+
+on:
+  workflow_dispatch: {}
+  # Manual — this is a calibration test, not a trading experiment, run
+  # it when you want a fresh accuracy read, not on a schedule.
+
+concurrency:
+  group: fortress-crypto-regime-v2-calibration
+  cancel-in-progress: true
+
+jobs:
+  calibrate-regime-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Regime v2 calibration test (descriptive accuracy only)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: python scripts/calibrate_regime_v2.py
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regime-v2-calibration-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30
