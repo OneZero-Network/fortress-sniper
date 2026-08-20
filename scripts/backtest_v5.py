@@ -56,7 +56,20 @@ log = logging.getLogger("fortress.crypto.backtest_v5")
 
 TARGET_REGIME_LABEL = "BULL/NORMAL_VOL"   # FROZEN — the discovered hypothesis, not re-derived
 BACKTEST_UNIVERSE_N = int(os.getenv("CRYPTO_BACKTEST_UNIVERSE_N", "30"))
-TOTAL_DAYS = int(os.getenv("CRYPTO_V5_TOTAL_DAYS", "480"))   # discovery + validation combined
+# CoinGecko's free public API caps historical /market_chart lookback at
+# 365 days (confirmed via production error: "Your request exceeds the
+# allowed time range... Public API users are limited to querying
+# historical dat[a within 365 days]"). 480 was too aggressive and
+# aborted the entire run before any testing happened. 360 total (180+180
+# split) stays safely under that cap with margin for date-boundary edge
+# cases, while still giving a genuinely separate discovery/validation
+# split rather than a token-sized one.
+TOTAL_DAYS = int(os.getenv("CRYPTO_V5_TOTAL_DAYS", "360"))
+if TOTAL_DAYS > 364:
+    log_startup_warning = TOTAL_DAYS
+    TOTAL_DAYS = 364  # hard clamp — never silently exceed CoinGecko's 365-day free-tier cap
+else:
+    log_startup_warning = None
 DISCOVERY_DAYS = TOTAL_DAYS // 2
 
 
@@ -117,6 +130,9 @@ def _run_period(coin_histories: dict, btc_hist_full, start_idx: int, end_idx: in
 
 def run() -> None:
     log.info(f"=== V5 Falsification Test — Regime-Gated ({TARGET_REGIME_LABEL}) — FROZEN RULES ===")
+    if log_startup_warning:
+        log.warning(f"CRYPTO_V5_TOTAL_DAYS={log_startup_warning} exceeds CoinGecko's 365-day free-tier "
+                    f"cap — clamped to {TOTAL_DAYS} to avoid an immediate abort.")
     log.info(f"Universe: top {BACKTEST_UNIVERSE_N} coins, {TOTAL_DAYS} total days "
              f"({DISCOVERY_DAYS} discovery + {TOTAL_DAYS - DISCOVERY_DAYS} validation)")
 
