@@ -254,3 +254,218 @@ def summarize_by_regime(all_trades: List[dict]) -> dict:
     for label, trades in by_regime.items():
         out[label] = summarize_backtest(trades)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# V5 — REGIME-GATED TECHNICAL CORE (frozen, per explicit mandate)
+# ══════════════════════════════════════════════════════════════════════════
+# GATE, not weight. V2 asked "does regime improve the score." V5 asks
+# "should the strategy be ALLOWED TO TRADE AT ALL outside its favorable
+# regime." These are different hypotheses and must not be conflated.
+#
+# FROZEN RULES (do not alter without re-declaring a new experiment):
+#   ENTRY: existing technical trigger (min_conviction on include_regime=
+#          False scoring, i.e. the V1 baseline signal) AND regime label
+#          == the target regime (e.g. "BULL/NORMAL_VOL")
+#   EXIT:  same as V1 — 1.5R/3R, TIMEOUT_DAYS=21
+#   COSTS: same ROUND_TRIP_COST_PCT as every other variant
+# NO threshold optimization, no exit changes, no coin-specific rules —
+# any of those would mean V5 is no longer testing the frozen hypothesis,
+# it would be curve-fitting to this exact dataset.
+
+def backtest_coin_regime_gated(symbol: str, hist: pd.DataFrame, btc_hist: Optional[pd.DataFrame],
+                                 target_regime_label: str, min_conviction: float,
+                                 r1_mult: float = 1.5, r2_mult: float = 3.0) -> List[dict]:
+    """V5: entry requires BOTH the V1 technical trigger AND the regime
+    gate. Regime score contribution is disabled (include_regime=False)
+    during trigger evaluation — the regime's only role here is the GATE,
+    not an additive score component, to keep this a genuinely different
+    test from V2."""
+    if len(hist) < 60:
+        return []
+
+    trades = []
+    next_eligible_idx = 30
+
+    for t in range(30, len(hist) - 1):
+        if t < next_eligible_idx:
+            continue
+        slice_ = hist.iloc[:t + 1]
+        btc_slice = btc_hist.iloc[:t + 1] if btc_hist is not None and len(btc_hist) > t else None
+
+        sig = _simulate_trigger_score(slice_, btc_slice, include_regime=False)
+        if not sig["valid"] or sig["conviction"] < min_conviction:
+            continue
+        if sig["regime_label"] != target_regime_label:
+            continue
+
+        outcome = _resolve_simulated_signal(hist, t, sig["stop_loss"], r1_mult, r2_mult)
+        trades.append({
+            "symbol": symbol, "entry_date": str(hist["date"].iloc[t].date()),
+            "entry_idx": t, "entry_price": sig["close"], "conviction": sig["conviction"],
+            "regime_label": sig["regime_label"], **outcome,
+        })
+        next_eligible_idx = t + outcome["days_held"] + 1
+
+    return trades
+
+
+def sample_regime_matched_control(symbol: str, hist: pd.DataFrame, btc_hist: Optional[pd.DataFrame],
+                                   target_regime_label: str, r1_mult: float = 1.5, r2_mult: float = 3.0,
+                                   rng: Optional[np.random.Generator] = None) -> List[dict]:
+    """V5-Control: EVERY eligible day in the target regime (no technical
+    trigger required) becomes a candidate entry — random selection down
+    to a matched sample size happens at the aggregation layer (see
+    scripts/backtest_v5.py), not here, so this function stays a pure
+    'what are all the possible regime-matched entries' enumerator.
+    HONEST SIMPLIFICATION: unlike V5, control entries are allowed to
+    overlap (no next_eligible_idx skip) since this is a statistical
+    benchmark, not a capital-constrained portfolio simulation — flagged
+    here rather than silently matching V5's non-overlap behavior and
+    implying more rigor than exists."""
+    if len(hist) < 60:
+        return []
+
+    candidates = []
+    for t in range(30, len(hist) - 1):
+        slice_ = hist.iloc[:t + 1]
+        btc_slice = btc_hist.iloc[:t + 1] if btc_hist is not None and len(btc_hist) > t else None
+        if btc_slice is None or len(btc_slice) < 30:
+            continue
+        btc_ind = compute_indicators(btc_slice)
+        t_state = _trend_state(btc_slice, btc_ind)
+        v_state = _volatility_state(btc_slice, btc_ind)
+        label = f"{t_state['state']}/{v_state['state']}"
+        if label != target_regime_label:
+            continue
+
+        close = float(hist["close"].iloc[t])
+        ind = compute_indicators(slice_)
+        atr14 = ind.get("atr14", 0.0) or close * 0.02
+        stop_loss = round(max(close - atr14 * ccfg.ATR_MULT_TREND, close * 0.75), 6)
+        outcome = _resolve_simulated_signal(hist, t, stop_loss, r1_mult, r2_mult)
+        candidates.append({
+            "symbol": symbol, "entry_date": str(hist["date"].iloc[t].date()),
+            "entry_idx": t, "entry_price": close, "regime_label": label, **outcome,
+        })
+
+    return candidates
+
+
+def matched_btc_return(btc_hist: Optional[pd.DataFrame], entry_idx: int, days_held: int) -> Optional[float]:
+    """BTC's own buy-and-hold return over the SAME entry index and
+    holding period as a given trade — the benchmark your mentor
+    specifically asked for: 'is this strategy beating the market it's
+    priced in, or just riding a bull market up.'"""
+    if btc_hist is None or entry_idx >= len(btc_hist):
+        return None
+    exit_idx = min(entry_idx + days_held, len(btc_hist) - 1)
+    if exit_idx <= entry_idx:
+        return None
+    entry_price = float(btc_hist["close"].iloc[entry_idx])
+    exit_price = float(btc_hist["close"].iloc[exit_idx])
+    if entry_price <= 0:
+        return None
+    return round(100.0 * (exit_price - entry_price) / entry_price, 2)
+
+
+def compute_extended_stats(trades: List[dict], btc_hist: Optional[pd.DataFrame] = None) -> dict:
+    """The full metrics list your mentor demanded — hit rate alone is
+    not sufficient. Median return specifically matters because an
+    average can hide '33 mediocre trades + 1 lucky +50%' behind a
+    number that looks like broad success."""
+    if not trades:
+        return {"n": 0, "available": False}
+
+    trades_sorted = sorted(trades, key=lambda t: t["entry_date"])
+    net_returns = [t["pnl_pct_net"] for t in trades_sorted]
+    n = len(net_returns)
+
+    wins = [r for r in net_returns if r > 0]
+    losses = [r for r in net_returns if r <= 0]
+    hit_rate = round(100.0 * len(wins) / n, 1)
+
+    gross_returns = [t["pnl_pct_raw"] for t in trades_sorted]
+    gross_avg = round(float(np.mean(gross_returns)), 3)
+    net_avg = round(float(np.mean(net_returns)), 3)
+    net_median = round(float(np.median(net_returns)), 3)
+    avg_winner = round(float(np.mean(wins)), 3) if wins else None
+    avg_loser = round(float(np.mean(losses)), 3) if losses else None
+
+    gross_win_sum = sum(r for r in net_returns if r > 0)
+    gross_loss_sum = abs(sum(r for r in net_returns if r <= 0))
+    profit_factor = round(gross_win_sum / gross_loss_sum, 2) if gross_loss_sum > 0 else None
+
+    # Equity curve: equal-weighted, un-compounded cumulative sum of net
+    # returns in entry-date order — a simplification (real position
+    # sizing/compounding not modeled), stated plainly.
+    cum = np.cumsum(net_returns)
+    running_max = np.maximum.accumulate(cum)
+    drawdown = cum - running_max
+    max_drawdown = round(float(drawdown.min()), 2) if len(drawdown) else 0.0
+
+    # Longest losing streak (consecutive net-negative trades, entry-date order)
+    longest_losing_streak = 0
+    current_streak = 0
+    for r in net_returns:
+        if r <= 0:
+            current_streak += 1
+            longest_losing_streak = max(longest_losing_streak, current_streak)
+        else:
+            current_streak = 0
+
+    # Dispersion ratios — PER-TRADE, NOT time-annualized (trades aren't
+    # evenly spaced in crypto backtests), flagged explicitly so this is
+    # never mistaken for a conventional annualized Sharpe.
+    std = float(np.std(net_returns)) if n > 1 else 0.0
+    sharpe_per_trade = round(net_avg / std, 3) if std > 0 else None
+    downside = [r for r in net_returns if r < 0]
+    downside_std = float(np.std(downside)) if len(downside) > 1 else 0.0
+    sortino_per_trade = round(net_avg / downside_std, 3) if downside_std > 0 else None
+
+    avg_exposure_days = round(float(np.mean([t["days_held"] for t in trades_sorted])), 1)
+
+    btc_relative = None
+    if btc_hist is not None:
+        btc_rets = []
+        for t in trades_sorted:
+            if "entry_idx" in t:
+                br = matched_btc_return(btc_hist, t["entry_idx"], t["days_held"])
+                if br is not None:
+                    btc_rets.append(t["pnl_pct_net"] - br)
+        if btc_rets:
+            btc_relative = round(float(np.mean(btc_rets)), 3)
+
+    by_coin = {}
+    for t in trades_sorted:
+        by_coin.setdefault(t["symbol"], []).append(t["pnl_pct_net"])
+    per_coin_avg = {sym: round(float(np.mean(rets)), 2) for sym, rets in by_coin.items()}
+
+    return {
+        "n": n, "available": True,
+        "hit_rate_pct": hit_rate,
+        "gross_avg_pct": gross_avg, "net_avg_pct": net_avg, "net_median_pct": net_median,
+        "avg_winner_pct": avg_winner, "avg_loser_pct": avg_loser,
+        "profit_factor": profit_factor,
+        "max_drawdown_pct": max_drawdown,
+        "longest_losing_streak": longest_losing_streak,
+        "sharpe_per_trade": sharpe_per_trade, "sortino_per_trade": sortino_per_trade,
+        "avg_exposure_days": avg_exposure_days,
+        "btc_relative_avg_pct": btc_relative,
+        "per_coin_avg_pct": per_coin_avg,
+        "low_sample_warning": n < 30,
+    }
+
+
+def leave_one_coin_out(trades: List[dict], btc_hist: Optional[pd.DataFrame] = None) -> dict:
+    """For each coin present in the trade set, recompute stats with that
+    coin excluded. If removing ONE coin swings net_avg_pct dramatically,
+    the 'edge' is that coin's idiosyncratic performance, not a general
+    regime effect — exactly the check your mentor demanded before
+    trusting any conditional result with n<50."""
+    symbols = sorted({t["symbol"] for t in trades})
+    out = {}
+    for sym in symbols:
+        remaining = [t for t in trades if t["symbol"] != sym]
+        out[sym] = compute_extended_stats(remaining, btc_hist)
+    return out
