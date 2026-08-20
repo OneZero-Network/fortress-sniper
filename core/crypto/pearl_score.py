@@ -131,6 +131,14 @@ def classify_tier(discovery_score: Optional[float], components_available: list,
 
     if discovery_score >= 80 and evidence_completeness_pct >= 60:
         tier = "PEARL"
+    elif discovery_score >= 80:
+        # HIGH-POTENTIAL: the score genuinely clears the Pearl bar, but
+        # not enough of the evidence universe was available to call it a
+        # Pearl outright. This is NOT a lowered threshold — the 80-point
+        # bar is unchanged. It's a separate, explicit category for "would
+        # be a Pearl if we had more data," so a strong candidate isn't
+        # silently demoted to the same bucket as a merely-decent one.
+        tier = "HIGH_POTENTIAL"
     elif discovery_score >= 60:
         tier = "CANDIDATE"
     elif discovery_score >= 45:
