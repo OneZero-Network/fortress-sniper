@@ -141,6 +141,10 @@ def _format_candidate(c: dict) -> str:
     if div and div.get("available") and div.get("label") != "ALIGNED":
         emoji = "🧩" if div["label"] == "BULLISH_DIVERGENCE" else "⚠️"
         lines.append(f"   {emoji} Divergence (Level 0, observation only): {div['detail']}")
+
+    ra = c.get("relative_anomaly")
+    if ra and ra.get("available"):
+        lines.append(f"   🧭 Relative to peers (Level 0, observation only): {ra['label']}")
     if c.get("pearl_thesis"):
         lines.append(f"   Incubator thesis: {c['pearl_thesis']}")
     lines.append(f"   Status: <b>{c['status']}</b>")
@@ -247,8 +251,15 @@ def run() -> None:
         if c:
             all_scored.append(c)
 
+    skipped_budget = []
     for coin in shortlist:
         if coin["symbol"] in watchlist_symbols:
+            continue
+        # ── v3.3 API BUDGET — graceful stop, never a crash, never
+        # fabricated data for candidates that don't get checked. Reports
+        # exactly how many were skipped and why, in the coverage summary.
+        if cdata.budget_exhausted():
+            skipped_budget.append(coin["symbol"])
             continue
         diag["scanned"] += 1
         c = _score_candidate(coin["symbol"], coin["id"], coin_snapshot=coin, is_watchlist_pearl=False)
@@ -256,6 +267,10 @@ def run() -> None:
         if c:
             c["universe_tier"] = coin["universe_tier"]
             all_scored.append(c)
+
+    if skipped_budget:
+        log.warning(f"API budget exhausted — skipped {len(skipped_budget)} candidate(s): {skipped_budget[:10]}"
+                    f"{'...' if len(skipped_budget) > 10 else ''}")
 
     for c in all_scored:
         if "universe_tier" not in c:
@@ -288,6 +303,19 @@ def run() -> None:
             log.debug(f"velocity/divergence check failed for {c['symbol']}: {e}")
             c["velocity"] = None
             c["divergence"] = {"available": False, "label": "NONE", "detail": "check failed"}
+
+    # ── v3.3 Relative/Peer Anomaly — zero extra API calls, reuses
+    # velocity data already gathered above. Compares each shortlisted
+    # candidate's volume/momentum change against ITS OWN universe_tier
+    # peers, not the whole market.
+    shortlisted = pearl_tier + high_potential_tier + candidate_tier
+    velocities_by_tier: dict = {}
+    for c in shortlisted:
+        velocities_by_tier.setdefault(c.get("universe_tier", "UNKNOWN"), []).append(c.get("velocity"))
+    for c in shortlisted:
+        tier = c.get("universe_tier", "UNKNOWN")
+        peers = [v for v in velocities_by_tier.get(tier, []) if v is not None]
+        c["relative_anomaly"] = velocity_divergence.compute_relative_anomaly(c.get("velocity"), peers)
 
     # keep the old grouping names for the rest of the message-building
     # code below — pearl+high-potential+candidate tiers all surface as
@@ -372,10 +400,13 @@ def run() -> None:
     fw_line = ("📊 Track record so far: " + ", ".join(f"{k}={v}" for k, v in sorted(fw_stats.items()))
                if fw_stats else "📊 Track record: no resolved observations yet — flywheel just started")
 
+    coverage_note = (f" | ⚠️ {len(skipped_budget)} skipped (API budget)" if skipped_budget else "")
+    rate_limit_note = " | ⚠️ provider rate-limited during this run" if cdata.was_rate_limited_this_run() else ""
     diagnostic_block = (
         f"🔬 <b>PEARL PIPELINE DIAGNOSTIC</b> — {datetime.now(timezone.utc).strftime('%d %b')}\n"
         f"Universe: {diag['universe']} | Scanned: {diag['scanned']} | Usable: {diag['usable']} | "
-        f"Entered scorer: {diag['entered_scorer']}\n"
+        f"Entered scorer: {diag['entered_scorer']}{coverage_note}\n"
+        f"API calls this run: {cdata.get_api_call_count()}/{cdata.API_CALL_BUDGET}{rate_limit_note}\n"
         f"Rejected — missing data: {diag['rejected_missing_data']} | "
         f"false pearl: {diag['rejected_false_pearl']} | "
         f"insufficient evidence: {diag['rejected_insufficient_evidence']}\n"
