@@ -194,20 +194,24 @@ def _format_alert_line(r: dict, tag: str, target_low: float, target_high: float,
 
 
 def _decision_label(r: dict, risk: dict) -> str:
-    """BUY / WATCH / AVOID — per your mentor's requested output format.
-    This is a LABEL summarizing the combined signal, not a new decision
-    engine: HIGH_RISK false-pearl flags override everything else (even a
-    high-conviction technical setup is not a 'buy' if the contract can
-    rug), CAUTION downgrades a clean BUY to WATCH, and anything below
-    conviction floor stays WATCH regardless of risk status."""
+    """QUARANTINED per Regime Audit v1 findings (backtest_v5.py /
+    regime_audit_v1.py): FORTRESS Technical Core v1 is REJECTED for
+    deployment — regime-gated validation showed a -74.19% compounded
+    return at realistic position sizing, the apparent +0.93% average was
+    carried by 5 outlier trades (removing them flips it negative), and
+    the regime classifier itself was wrong 63.6%-100% of the time
+    (BULL/NORMAL_VOL calls not followed by BTC actually rising).
+
+    This function NO LONGER RETURNS 'BUY' under any circumstances. It
+    still surfaces the false-pearl risk flag (that layer is independently
+    built, just not yet statistically validated — different status from
+    'rejected') for research visibility, but nothing from this pipeline
+    should be read as a trade instruction until a validated signal layer
+    replaces the technical core."""
     severity = risk.get("severity", "UNCHECKED")
     if severity == "HIGH_RISK":
         return "🚫 AVOID (false-pearl risk)"
-    if r["conviction"] < 50:
-        return "👀 WATCH"
-    if severity == "CAUTION":
-        return "👀 WATCH (minor risk flags)"
-    return "✅ BUY"
+    return "🔬 RESEARCH ONLY — technical core rejected, not a trade signal"
 
 
 def _log_alert_signal(r: dict, tier: str, target_low: float, target_high: float) -> None:
@@ -250,8 +254,19 @@ def run() -> None:
     # anchor, replacing the hardcoded neutral 50.0 every score used
     # before. See core/crypto/regime.py for the honest scope note (BTC-
     # anchored, not a full macro model).
+    # ── QUARANTINE (per Regime Audit v1 findings — see backtest_v5.py /
+    # regime_audit_v1.py results): the regime classifier's BULL/NORMAL_VOL
+    # calls were followed by BTC actually rising only 0% (discovery) and
+    # 36.4% (validation) of the time — the label does not reliably
+    # describe the market state it claims to. REGIME_STATUS=RESEARCH_ONLY
+    # means regime is still COMPUTED and LOGGED every run (so calibration
+    # work can continue), but its score is FORCED NEUTRAL — it does not
+    # gate entries, does not move conviction, does not influence any
+    # BUY/WATCH/AVOID label. This stays in place until a rebuilt regime
+    # engine passes independent calibration (Phase B, not yet built).
+    REGIME_STATUS = "RESEARCH_ONLY"
     regime = regime_module.detect_market_regime()
-    log.info(f"Regime: {regime['label']} (macro_score={regime['macro_score']})")
+    log.info(f"Regime (RESEARCH_ONLY — NOT used for scoring): {regime['label']} (raw macro_score would have been {regime['macro_score']}, forced neutral 50.0 instead)")
 
     watchlist = bridge_crypto.load_active_watchlist()
     log.info(f"PASS A: {len(watchlist)} active pearl(s) on crypto watchlist")
@@ -259,7 +274,7 @@ def run() -> None:
     for pearl in watchlist:
         try:
             r = score_symbol(pearl["symbol"], pearl["coin_id"], is_pearl=True, pearl_row=pearl,
-                              macro_score=regime["macro_score"])
+                              macro_score=50.0)  # QUARANTINED — see note above run()
             if r.get("skip"):
                 skip_count += 1
                 log.info(f"PASS A SKIP {pearl['symbol']}: {r.get('reason')}")
@@ -282,7 +297,7 @@ def run() -> None:
             continue
         try:
             r = score_symbol(coin["symbol"], coin["id"], is_pearl=False, coin_snapshot=coin,
-                              macro_score=regime["macro_score"])
+                              macro_score=50.0)  # QUARANTINED — see note above run()
             if r.get("skip"):
                 skip_count_b += 1
                 continue
@@ -327,11 +342,11 @@ def run() -> None:
 
     if fortress_alerts or swing_alerts:
         lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})",
-                 f"🔬 <b>STATUS: RESEARCH / PAPER TRADING</b> — backtest has not yet demonstrated positive expectancy. Not for real-money execution.",
-                 f"🌐 Market regime: <b>{regime['label']}</b>" + (f" ({regime.get('trend_detail','')}; {regime.get('vol_detail','')})" if regime.get("available") else ""),
+                 f"🔴 <b>STATUS: TECHNICAL CORE REJECTED FOR DEPLOYMENT</b> — Regime Audit v1 found a -74% compounded validation return, an outlier-dependent apparent edge, and a miscalibrated regime classifier (BTC rose after only 0-36% of 'BULL' calls). Everything below is research/observation ONLY.",
+                 f"🌐 Market regime (RESEARCH_ONLY — miscalibrated, NOT used for scoring): <b>{regime['label']}</b>" + (f" ({regime.get('trend_detail','')}; {regime.get('vol_detail','')})" if regime.get("available") else ""),
                  ""]
         if fortress_alerts:
-            lines.append(f"🏰 <b>FORTRESS-tier (unproven — see backtest; target {ccfg.PEARL_TARGET_LOW_PCT:.0f}-{ccfg.PEARL_TARGET_HIGH_PCT:.0f}%)</b>")
+            lines.append(f"🏰 <b>[REJECTED] Technical-Core tier (observation only, target {ccfg.PEARL_TARGET_LOW_PCT:.0f}-{ccfg.PEARL_TARGET_HIGH_PCT:.0f}% was the original thesis)</b>")
             for r in fortress_alerts[:10]:
                 tag = "🦪🔥PEARL+IGNITED" if (r["is_pearl"] and r["ignited"]) else ("🦪PEARL" if r["is_pearl"] else "COLD-SCAN")
                 lines.append(_format_alert_line(r, tag, ccfg.PEARL_TARGET_LOW_PCT, ccfg.PEARL_TARGET_HIGH_PCT, entry_ts))
@@ -349,9 +364,9 @@ def run() -> None:
         send_telegram(
             f"ℹ️ FORTRESS_CRYPTO Daily Scan ({datetime.now(timezone.utc).strftime('%Y-%m-%d')}): "
             f"ran successfully, {len(results)} candidate(s) scored, "
-            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}). No trade alert today.\n"
-            f"🔬 STATUS: RESEARCH / PAPER TRADING\n"
-            f"🌐 Market regime: {regime['label']}\n\n"
+            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}).\n"
+            f"🔴 STATUS: TECHNICAL CORE REJECTED FOR DEPLOYMENT — see Regime Audit v1\n"
+            f"🌐 Market regime (RESEARCH_ONLY, not used for scoring): {regime['label']}\n\n"
             f"{outcome_tracker.format_stats_summary()}"
         )
 

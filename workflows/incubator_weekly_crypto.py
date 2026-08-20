@@ -214,7 +214,7 @@ def run() -> None:
 
     if pearls_written:
         lines = [f"🦪 <b>FORTRESS_CRYPTO — Weekly Pearls</b> ({datetime.today().strftime('%Y-%m-%d')})",
-                 f"🔬 <b>STATUS: RESEARCH / PAPER TRADING</b> — backtest has not yet demonstrated positive expectancy. Not for real-money execution.",
+                 f"🔴 <b>STATUS: TECHNICAL CORE REJECTED FOR DEPLOYMENT</b> — see Regime Audit v1 (miscalibrated regime classifier, -74% compounded validation return, outlier-dependent apparent edge). These pearls feed a rejected downstream pipeline — observation only.",
                  f"<i>Watchlist candidates only — NOT buy signals. Target 25-50% via the deeper thesis; "
                  f"the daily Sniper checks these for an actual entry/stop/target when a technical ignition fires.</i>", ""]
         for sym, score, grade in pearls_written:
