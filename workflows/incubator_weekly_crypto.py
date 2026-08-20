@@ -80,8 +80,8 @@ def check_ath_discount_gate(coin: dict) -> tuple[bool, dict]:
     return True, details
 
 
-def check_shariah(coin: dict, halal_override: set) -> dict:
-    cats = cdata.fetch_coin_categories(coin["id"])
+def check_shariah(details: dict, coin: dict, halal_override: set) -> dict:
+    cats = details.get("categories")
     return shariah_crypto.screen_token(coin["symbol"], cats if cats else None, halal_override)
 
 
@@ -112,17 +112,27 @@ def run() -> None:
     for coin in universe:
         sym = coin["symbol"]
         try:
-            audit = check_shariah(coin, halal_override)
+            # ATH-discount gate FIRST — it's free (uses data already in
+            # the universe payload from fetch_universe(), zero extra API
+            # calls). Running the expensive Shariah categories lookup
+            # only for coins that already pass this cuts CoinGecko call
+            # volume substantially versus checking Shariah first.
+            passed, gate_details = check_ath_discount_gate(coin)
+            if not passed:
+                rejects_log.append([datetime.today().strftime("%Y-%m-%d"), sym, "ATH_DISCOUNT", gate_details["reason"]])
+                continue
+
+            # ONE combined API call for categories + platform addresses,
+            # not two separate calls (see fetch_coin_details docstring —
+            # this was the main source of the 429 storm in production).
+            coin_details = cdata.fetch_coin_details(coin["id"])
+
+            audit = check_shariah(coin_details, coin, halal_override)
             if not audit["compliant"]:
                 rejects_log.append([datetime.today().strftime("%Y-%m-%d"), sym, "SHARIAH", audit["reason"]])
                 continue
 
-            passed, details = check_ath_discount_gate(coin)
-            if not passed:
-                rejects_log.append([datetime.today().strftime("%Y-%m-%d"), sym, "ATH_DISCOUNT", details["reason"]])
-                continue
-
-            platforms = cdata.fetch_platforms(coin["id"])
+            platforms = coin_details.get("platforms") or {}
             onchain_signal = None
             if onchain.is_onchain_supported(platforms):
                 onchain_signal = onchain.whale_concentration_signal(platforms)
