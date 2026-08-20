@@ -327,10 +327,11 @@ def run() -> None:
 
     if fortress_alerts or swing_alerts:
         lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})",
+                 f"🔬 <b>STATUS: RESEARCH / PAPER TRADING</b> — backtest has not yet demonstrated positive expectancy. Not for real-money execution.",
                  f"🌐 Market regime: <b>{regime['label']}</b>" + (f" ({regime.get('trend_detail','')}; {regime.get('vol_detail','')})" if regime.get("available") else ""),
                  ""]
         if fortress_alerts:
-            lines.append(f"🏰 <b>FORTRESS-tier (higher conviction, target {ccfg.PEARL_TARGET_LOW_PCT:.0f}-{ccfg.PEARL_TARGET_HIGH_PCT:.0f}%)</b>")
+            lines.append(f"🏰 <b>FORTRESS-tier (unproven — see backtest; target {ccfg.PEARL_TARGET_LOW_PCT:.0f}-{ccfg.PEARL_TARGET_HIGH_PCT:.0f}%)</b>")
             for r in fortress_alerts[:10]:
                 tag = "🦪🔥PEARL+IGNITED" if (r["is_pearl"] and r["ignited"]) else ("🦪PEARL" if r["is_pearl"] else "COLD-SCAN")
                 lines.append(_format_alert_line(r, tag, ccfg.PEARL_TARGET_LOW_PCT, ccfg.PEARL_TARGET_HIGH_PCT, entry_ts))
@@ -349,6 +350,7 @@ def run() -> None:
             f"ℹ️ FORTRESS_CRYPTO Daily Scan ({datetime.now(timezone.utc).strftime('%Y-%m-%d')}): "
             f"ran successfully, {len(results)} candidate(s) scored, "
             f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}). No trade alert today.\n"
+            f"🔬 STATUS: RESEARCH / PAPER TRADING\n"
             f"🌐 Market regime: {regime['label']}\n\n"
             f"{outcome_tracker.format_stats_summary()}"
         )
