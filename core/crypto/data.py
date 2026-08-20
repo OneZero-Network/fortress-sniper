@@ -34,6 +34,31 @@ log = logging.getLogger("fortress.crypto.data")
 _session = requests.Session()
 _session.headers.update({"User-Agent": "fortress-crypto/1.0"})
 
+# ══════════════════════════════════════════════════════════════════════════
+# GLOBAL RATE LIMITER — this is the actual fix for the 429-storm seen in
+# production logs. The free CoinGecko public tier allows roughly 10-30
+# calls/min; without a key, retry-on-429 backoff alone still means every
+# call queues behind a growing backlog once you're scanning ~200 coins.
+# A single enforced minimum gap between ANY two CoinGecko calls (regardless
+# of success/failure) keeps the run under the limit proactively instead of
+# discovering it reactively coin-by-coin. With a free Demo key this gap can
+# be much shorter (COINGECKO_MIN_INTERVAL_SEC env var), since the key tier
+# has a materially higher ceiling.
+# ══════════════════════════════════════════════════════════════════════════
+import os as _os
+_MIN_INTERVAL = float(_os.getenv(
+    "COINGECKO_MIN_INTERVAL_SEC",
+    "2.5" if not ccfg.COINGECKO_API_KEY else "1.0",
+))
+_last_call_ts = [0.0]
+
+
+def _throttle() -> None:
+    elapsed = time.monotonic() - _last_call_ts[0]
+    if elapsed < _MIN_INTERVAL:
+        time.sleep(_MIN_INTERVAL - elapsed)
+    _last_call_ts[0] = time.monotonic()
+
 
 def _cg_get(path: str, params: Optional[dict] = None, retries: int = 3) -> Optional[dict]:
     params = dict(params or {})
@@ -42,6 +67,7 @@ def _cg_get(path: str, params: Optional[dict] = None, retries: int = 3) -> Optio
         headers["x-cg-demo-api-key"] = ccfg.COINGECKO_API_KEY
     url = f"{ccfg.COINGECKO_BASE}{path}"
     for attempt in range(retries):
+        _throttle()
         try:
             resp = _session.get(url, params=params, headers=headers, timeout=20)
             if resp.status_code == 200:
@@ -133,30 +159,35 @@ def fetch_universe(top_n: int = None) -> List[dict]:
     return filtered
 
 
-def fetch_coin_categories(coin_id: str) -> List[str]:
-    """Category tags — used by shariah_crypto.py to detect gambling/
-    staking/lending/privacy categories. Returns [] on failure (fail-safe
-    reject happens at the shariah layer, not here)."""
+def fetch_coin_details(coin_id: str) -> dict:
+    """SINGLE /coins/{id} call returning BOTH categories and platform
+    contract addresses. This replaces what used to be two separate
+    functions (fetch_coin_categories + fetch_platforms) each hitting the
+    same endpoint independently — that duplication was a real bug: it
+    doubled CoinGecko call volume for zero benefit and was a direct
+    contributor to the 429-throttling seen in production runs. Always
+    call this ONCE per coin and reuse both fields from the result."""
     data = _cg_get(f"/coins/{coin_id}", {
         "localization": "false", "tickers": "false", "market_data": "false",
         "community_data": "false", "developer_data": "false",
     })
     if not data:
-        return []
-    return [c.lower() for c in (data.get("categories") or []) if c]
+        return {"categories": None, "platforms": {}}
+    return {
+        "categories": [c.lower() for c in (data.get("categories") or []) if c],
+        "platforms": {k: v for k, v in (data.get("platforms") or {}).items() if v},
+    }
+
+
+# Kept as thin wrappers for any external caller still using the old names —
+# but internal workflow code now calls fetch_coin_details() once instead.
+def fetch_coin_categories(coin_id: str) -> List[str]:
+    d = fetch_coin_details(coin_id)
+    return d["categories"] or []
 
 
 def fetch_platforms(coin_id: str) -> Dict[str, str]:
-    """Contract addresses per chain, e.g. {'ethereum': '0x...'} — feeds
-    on-chain whale lookup. Empty dict if not an EVM-issued token or on
-    failure (on-chain leg is skipped, not faked, downstream)."""
-    data = _cg_get(f"/coins/{coin_id}", {
-        "localization": "false", "tickers": "false", "market_data": "false",
-        "community_data": "false", "developer_data": "false",
-    })
-    if not data:
-        return {}
-    return {k: v for k, v in (data.get("platforms") or {}).items() if v}
+    return fetch_coin_details(coin_id)["platforms"]
 
 
 def fetch_daily_ohlc(coin_id: str, days: int = 90) -> pd.DataFrame:
