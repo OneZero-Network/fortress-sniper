@@ -141,3 +141,63 @@ def onchain_quality_score_0_100(signal: Optional[dict]) -> Optional[float]:
     # 0% concentration -> 100; 100% concentration -> 0; linear, clipped.
     score = max(0.0, min(100.0, 100.0 - top10))
     return round(score, 1)
+
+
+def whale_accumulation_delta(symbol: str, current_signal: Optional[dict]) -> dict:
+    """
+    'Big wallets buying' as an actual TREND, not a single snapshot — this
+    is the honest version of that request: compares this run's top-holder
+    concentration against the most recent PRIOR stored snapshot for the
+    same symbol (see core/db.py save_whale_snapshot /
+    get_previous_whale_snapshot). Only meaningful once at least two
+    snapshots exist for a symbol, which for the weekly Incubator means
+    the SECOND week it sees that coin.
+
+    Returns:
+      {"available": bool, "label": str, "top1_delta_pct": float|None,
+       "top10_delta_pct": float|None, "days_since_prior": int|None}
+
+    label: "NO_SIGNAL" (no current signal or no prior snapshot to compare
+    against — fail-safe, not "no accumulation"), "ACCUMULATING" (top10
+    concentration rose meaningfully — big wallets net adding),
+    "DISTRIBUTING" (top10 concentration fell — big wallets net reducing),
+    "STABLE" (change within noise band).
+    """
+    from ..db import get_previous_whale_snapshot, save_whale_snapshot
+    from datetime import datetime
+
+    result = {"available": False, "label": "NO_SIGNAL", "top1_delta_pct": None,
+              "top10_delta_pct": None, "days_since_prior": None}
+
+    if current_signal is None:
+        return result
+
+    prior = get_previous_whale_snapshot(symbol)
+    # Always save this run's snapshot for NEXT time's comparison,
+    # regardless of whether a prior one existed.
+    save_whale_snapshot(symbol, current_signal.get("chain", ""),
+                         current_signal.get("top1_holder_pct", 0.0),
+                         current_signal.get("top10_concentration_pct", 0.0))
+
+    if not prior:
+        return result  # first time seeing this symbol — no trend yet
+
+    top1_delta = round(current_signal.get("top1_holder_pct", 0.0) - prior["top1_pct"], 2)
+    top10_delta = round(current_signal.get("top10_concentration_pct", 0.0) - prior["top10_pct"], 2)
+
+    try:
+        days_since = (datetime.today() - datetime.strptime(prior["snapshot_date"], "%Y-%m-%d")).days
+    except Exception:
+        days_since = None
+
+    NOISE_BAND_PCT = 1.5  # concentration changes smaller than this are noise, not signal
+    if top10_delta > NOISE_BAND_PCT:
+        label = "ACCUMULATING"
+    elif top10_delta < -NOISE_BAND_PCT:
+        label = "DISTRIBUTING"
+    else:
+        label = "STABLE"
+
+    result.update({"available": True, "label": label, "top1_delta_pct": top1_delta,
+                    "top10_delta_pct": top10_delta, "days_since_prior": days_since})
+    return result

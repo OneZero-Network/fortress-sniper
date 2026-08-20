@@ -74,24 +74,61 @@ def fetch_recent_news(symbol: str, lookback_hours: int = None) -> Optional[List[
         return None
 
 
+_FORWARD_CATALYST_KEYWORDS = (
+    "mainnet", "listing", "listed on", "upgrade", "hard fork", "airdrop",
+    "unlock", "token unlock", "partnership", "integration", "launch",
+    "etf", "approval", "halving", "acquisition", "roadmap", "testnet",
+    "burn", "buyback",
+)
+
+
+def _detect_forward_catalyst(posts: List[dict]) -> Optional[str]:
+    """Simple keyword scan over headlines for forward-looking catalyst
+    language — 'future news strong chances' as an honest, auditable
+    signal rather than a predictive model. Returns the FIRST matching
+    headline's catalyst keyword, or None if nothing matched. This is
+    pattern-matching on wording, not a claim about actual event
+    probability — the Telegram alert labels it as such."""
+    for p in posts:
+        title = (p.get("title") or "").lower()
+        for kw in _FORWARD_CATALYST_KEYWORDS:
+            if kw in title:
+                return kw
+    return None
+
+
 def sentiment_summary(symbol: str) -> dict:
     """
     Returns:
       {"available": bool, "label": str, "score": float|None,
-       "headline_count": int, "top_headline": str|None}
+       "headline_count": int, "top_headline": str|None,
+       "forward_catalyst": str|None, "social_buzz_count": int|None}
 
     label is one of: "NO_SIGNAL" (module disabled/no key/fetch failed),
     "SILENT" (fetched fine, zero relevant news — informative on its own:
     a pure technical breakout with no catalyst is a weaker signal),
     "BULLISH", "BEARISH", "MIXED", "NEUTRAL".
+
+    forward_catalyst: a matched keyword (e.g. "listing", "mainnet") if
+    any recent headline used forward-looking catalyst language, else
+    None. NOT a probability estimate — just flags that the language
+    exists, so a human can go verify.
+
+    social_buzz_count: total post volume across ALL CryptoPanic sources
+    (news + media + social) in the lookback window — the honest
+    substitute for raw Twitter/X mention counts (that API is no longer
+    free). This is a volume proxy, not a genuine tweet count, and is
+    labeled as such wherever it's surfaced.
     """
     posts = fetch_recent_news(symbol)
     if posts is None:
         return {"available": False, "label": "NO_SIGNAL", "score": None,
-                "headline_count": 0, "top_headline": None}
+                "headline_count": 0, "top_headline": None,
+                "forward_catalyst": None, "social_buzz_count": None}
     if len(posts) == 0:
         return {"available": True, "label": "SILENT", "score": 0.0,
-                "headline_count": 0, "top_headline": None}
+                "headline_count": 0, "top_headline": None,
+                "forward_catalyst": None, "social_buzz_count": 0}
 
     pos, neg = 0, 0
     for p in posts:
@@ -112,5 +149,35 @@ def sentiment_summary(symbol: str) -> dict:
         label = "MIXED"
 
     top_headline = posts[0].get("title") if posts else None
+    forward_catalyst = _detect_forward_catalyst(posts)
+    social_buzz = fetch_social_buzz_count(symbol)
+
     return {"available": True, "label": label, "score": score,
-            "headline_count": len(posts), "top_headline": top_headline}
+            "headline_count": len(posts), "top_headline": top_headline,
+            "forward_catalyst": forward_catalyst, "social_buzz_count": social_buzz}
+
+
+def fetch_social_buzz_count(symbol: str, lookback_hours: int = None) -> Optional[int]:
+    """Honest substitute for 'mostly tweeted' — CryptoPanic aggregates
+    Twitter/Reddit-sourced posts alongside news under kind='media' and
+    the unfiltered 'all' kind. This is a POST-VOLUME PROXY, not a raw
+    tweet count (true tweet counting needs the paid X API, which this
+    system does not use). Returns None on failure/no key, never a
+    fabricated number."""
+    if not ccfg.NEWS_SENTIMENT_ENABLED or not ccfg.CRYPTOPANIC_API_KEY:
+        return None
+    _throttle()
+    try:
+        resp = _session.get(f"{ccfg.CRYPTOPANIC_BASE}/posts/", params={
+            "auth_token": ccfg.CRYPTOPANIC_API_KEY,
+            "currencies": symbol.upper(),
+            "public": "true",
+            "kind": "media",  # social/community-sourced posts, distinct from 'news'
+        }, timeout=15)
+        if resp.status_code != 200:
+            return None
+        return len(resp.json().get("results", []))
+    except Exception as e:
+        log.debug(f"CryptoPanic social buzz error for {symbol}: {e}")
+        return None
+
