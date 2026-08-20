@@ -111,51 +111,58 @@ def fetch_universe(top_n: int = None) -> List[dict]:
     """Top-N coins by market cap with price/volume/category snapshot.
     Analogue of nse_data.py's bhavcopy fetch. Filters stablecoins/wrapped
     assets and applies the liquidity floor before returning."""
-    top_n = top_n or ccfg.UNIVERSE_TOP_N
+    return fetch_universe_tier(1, top_n or ccfg.UNIVERSE_TOP_N,
+                                min_volume_usd=ccfg.MIN_24H_VOLUME_USD,
+                                min_market_cap_usd=ccfg.MIN_MARKET_CAP_USD)
+
+
+def fetch_universe_tier(min_rank: int, max_rank: int, min_volume_usd: float,
+                         min_market_cap_usd: float) -> List[dict]:
+    """v3.2 — generalized rank-window fetch, powering the multi-universe
+    scanner. min_rank/max_rank are 1-indexed market-cap rank bounds
+    (e.g. 1-100 for Large cap, 500-2000 for Emerging). Liquidity floors
+    are passed in per-tier rather than hardcoded — a Large-cap floor
+    applied to an Emerging-tier coin would filter out the entire tier,
+    so each tier needs its own honest threshold (see
+    core/crypto/config.py's UNIVERSE_TIERS for the actual values used)."""
     out: List[dict] = []
-    per_page = 250  # CoinGecko max per page
-    pages_needed = (top_n // per_page) + 1
-    for page in range(1, pages_needed + 1):
+    per_page = 250
+    start_page = ((min_rank - 1) // per_page) + 1
+    end_page = ((max_rank - 1) // per_page) + 1
+    for page in range(start_page, end_page + 1):
         data = _cg_get("/coins/markets", {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": per_page,
-            "page": page,
-            "sparkline": "false",
+            "vs_currency": "usd", "order": "market_cap_desc",
+            "per_page": per_page, "page": page, "sparkline": "false",
             "price_change_percentage": "24h,7d,30d",
         })
         if not data:
-            log.warning(f"fetch_universe: page {page} failed, stopping cascade here")
+            log.warning(f"fetch_universe_tier: page {page} failed, stopping cascade here")
             break
         out.extend(data)
         if len(data) < per_page:
             break
-    out = out[:top_n]
 
     filtered = []
     for c in out:
+        rank = c.get("market_cap_rank")
+        if rank is None or rank < min_rank or rank > max_rank:
+            continue
         sym = (c.get("symbol") or "").upper()
         if ccfg.is_stable_or_wrapped(sym):
             continue
         vol = c.get("total_volume") or 0
         mcap = c.get("market_cap") or 0
-        if vol < ccfg.MIN_24H_VOLUME_USD or mcap < ccfg.MIN_MARKET_CAP_USD:
+        if vol < min_volume_usd or mcap < min_market_cap_usd:
             continue
         filtered.append({
-            "id": c.get("id"),
-            "symbol": sym,
-            "name": c.get("name"),
-            "market_cap": mcap,
-            "market_cap_rank": c.get("market_cap_rank"),
-            "volume_24h": vol,
+            "id": c.get("id"), "symbol": sym, "name": c.get("name"),
+            "market_cap": mcap, "market_cap_rank": rank, "volume_24h": vol,
             "price": c.get("current_price"),
             "pct_24h": c.get("price_change_percentage_24h_in_currency"),
             "pct_7d": c.get("price_change_percentage_7d_in_currency"),
             "pct_30d": c.get("price_change_percentage_30d_in_currency"),
-            "ath": c.get("ath"),
-            "ath_change_pct": c.get("ath_change_percentage"),
+            "ath": c.get("ath"), "ath_change_pct": c.get("ath_change_percentage"),
         })
-    log.info(f"fetch_universe: {len(filtered)}/{len(out)} coins pass liquidity+non-stable filters")
     return filtered
 
 

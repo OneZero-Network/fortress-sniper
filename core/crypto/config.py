@@ -239,3 +239,43 @@ NEWS_SENTIMENT_LOOKBACK_HOURS = _int("CRYPTO_NEWS_LOOKBACK_HOURS", "48")
 # ══════════════════════════════════════════════════════════════════════════
 TREND_ALIGNED_BONUS = _float("CRYPTO_TREND_ALIGNED_BONUS", "6.0")
 TREND_AGAINST_PENALTY = _float("CRYPTO_TREND_AGAINST_PENALTY", "8.0")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v3.2 — MULTI-UNIVERSE SCANNER
+# ══════════════════════════════════════════════════════════════════════════
+# Three tiers, each with its OWN liquidity floor — applying the Large-cap
+# floor to Emerging-tier coins would filter out the entire tier (a rank
+# 1500 coin legitimately has far less volume than a rank 20 coin, that's
+# not a red flag at that rank). New-listings and DEX/new-token universes
+# are explicitly OUT OF SCOPE here — they need a different data source
+# (CoinGecko doesn't cleanly serve "new listings" free; DEX-native data
+# needs something like DexScreener), flagged as a real follow-up, not
+# silently dropped.
+UNIVERSE_TIERS = {
+    "LARGE_CAP": {
+        "min_rank": 1, "max_rank": 100,
+        "min_volume_usd": float(os.getenv("CRYPTO_LARGE_MIN_VOL", "3000000")),
+        "min_market_cap_usd": float(os.getenv("CRYPTO_LARGE_MIN_MCAP", "500000000")),
+        "max_deep_scored": int(os.getenv("CRYPTO_LARGE_MAX_DEEP", "40")),
+    },
+    "MID_CAP": {
+        "min_rank": 101, "max_rank": 500,
+        "min_volume_usd": float(os.getenv("CRYPTO_MID_MIN_VOL", "500000")),
+        "min_market_cap_usd": float(os.getenv("CRYPTO_MID_MIN_MCAP", "20000000")),
+        "max_deep_scored": int(os.getenv("CRYPTO_MID_MAX_DEEP", "40")),
+    },
+    "EMERGING": {
+        "min_rank": 501, "max_rank": 2000,
+        "min_volume_usd": float(os.getenv("CRYPTO_EMERGING_MIN_VOL", "100000")),
+        "min_market_cap_usd": float(os.getenv("CRYPTO_EMERGING_MIN_MCAP", "2000000")),
+        "max_deep_scored": int(os.getenv("CRYPTO_EMERGING_MAX_DEEP", "30")),
+    },
+}
+# max_deep_scored caps how many candidates per tier proceed to the
+# EXPENSIVE full scoring pass (whale/news/risk checks) — this is the
+# funnel your mentor's own diagram described (2000 assets -> cheap
+# filter -> hundreds -> expensive checks on the survivors only). Without
+# this cap, scanning 2000 Emerging-tier coins with per-coin API calls
+# would take hours, not minutes.
+PREFILTER_TOP_N_MULTIPLIER = 3  # pre-filter keeps 3x max_deep_scored candidates by cheap score, before dedup
