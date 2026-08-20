@@ -135,23 +135,65 @@ def run() -> None:
     log.info(f"False-Pearl ablation: excluded {excluded_count} HIGH_RISK-flagged coin(s), "
              f"remaining stats: {stats_v2_clean}")
 
-    regime_lines = "\n".join(_fmt_stats(s, label) for label, s in sorted(regime_breakdown.items()))
+    # ── PLAIN-ENGLISH SUMMARY — built FIRST, from the actual numbers,
+    # not hardcoded. This is what makes the message shareable: a human
+    # (or a friend with zero context) gets the verdict in one glance,
+    # with the full technical matrix still available underneath for
+    # anyone who wants to check the work.
+    overall_verdict = ("loses money after real-world costs" if stats_v2["avg_pnl_pct_net"] < 0
+                        else "is roughly breakeven after costs" if stats_v2["avg_pnl_pct_net"] < 0.3
+                        else "shows a small edge after costs")
+
+    trustworthy_regimes = {label: s for label, s in regime_breakdown.items()
+                            if not s.get("low_sample_warning") and s.get("avg_pnl_pct_net") is not None}
+    best_regime = max(trustworthy_regimes.items(), key=lambda kv: kv[1]["avg_pnl_pct_net"], default=None)
+
+    if best_regime and best_regime[1]["avg_pnl_pct_net"] > 0.5:
+        regime_hint = (f"There's a real hint it works better in <b>{best_regime[0]}</b> conditions "
+                        f"({best_regime[1]['avg_pnl_pct_net']:+.2f}% net, based on {best_regime[1]['sample_size']} examples) "
+                        f"— worth investigating further, not yet proven.")
+    else:
+        regime_hint = "No market condition tested so far shows a clearly reliable edge."
+
+    summary = (
+        f"📌 <b>BOTTOM LINE</b>\n"
+        f"This is a SIMULATION testing whether our crypto strategy would have made money on past data "
+        f"— it is NOT a real trade result, and nothing here says buy or sell anything today.\n\n"
+        f"Overall, the strategy as currently built <b>{overall_verdict}</b> "
+        f"(avg {stats_v2['avg_pnl_pct_net']:+.2f}% per trade after fees, winning {stats_v2['hit_rate_pct']}% of the time, "
+        f"across {stats_v2['sample_size']} simulated trades).\n"
+        f"{regime_hint}\n\n"
+        f"Full numbers below for anyone who wants to check the details."
+    )
+
+    quick_table = (
+        f"<b>Quick comparison</b> (same strategy, different exit rules):\n"
+        f"   Baseline: {stats_v1['avg_pnl_pct_net']:+.2f}% avg | "
+        f"Current setup: {stats_v2['avg_pnl_pct_net']:+.2f}% avg | "
+        f"Tighter exits: {stats_v3['avg_pnl_pct_net']:+.2f}% avg | "
+        f"Wider exits: {stats_v4['avg_pnl_pct_net']:+.2f}% avg"
+    )
+
+    solid_rows = [f"   {label}: n={s['sample_size']}, {s['avg_pnl_pct_net']:+.2f}% avg, {s['hit_rate_pct']}% win rate"
+                  for label, s in sorted(regime_breakdown.items()) if not s.get("low_sample_warning")]
+    thin_labels = [label for label, s in regime_breakdown.items() if s.get("low_sample_warning")]
+    regime_detail = "\n".join(solid_rows) if solid_rows else "   (no regime had a large enough sample to trust)"
+    if thin_labels:
+        regime_detail += f"\n   (+ {len(thin_labels)} other condition(s) with too few examples to trust: {', '.join(sorted(thin_labels))})"
 
     message = (
-        f"🧪 <b>FORTRESS_CRYPTO Backtest Experiment Matrix — SIMULATED, NOT LIVE DATA</b>\n"
-        f"<i>Technical core only can be replayed — news/whale timing/live risk-state cannot. "
-        f"All returns shown RAW and NET of estimated {backtest.ROUND_TRIP_COST_PCT:.2f}% round-trip costs.</i>\n\n"
-        f"<b>Entry/Exit Matrix</b> (isolating signal vs. regime vs. exit structure):\n"
-        f"{_fmt_stats(stats_v1, 'V1 Technical-only, 1.5R/3R')}\n"
-        f"{_fmt_stats(stats_v2, 'V2 Technical+Regime, 1.5R/3R (current live config)')}\n"
-        f"{_fmt_stats(stats_v3, 'V3 Technical+Regime, 1R/2R (tighter)')}\n"
-        f"{_fmt_stats(stats_v4, 'V4 Technical+Regime, 2R/4R (wider)')}\n\n"
-        f"<b>Regime-conditioned breakdown (V2 config)</b> — does this only work in certain regimes?\n"
-        f"{regime_lines}\n\n"
-        f"<b>False-Pearl ablation (V2 config)</b> — approximate, current risk snapshot used as a "
-        f"whole-coin filter, not true historical per-signal risk:\n"
-        f"   Excluded {excluded_count}/{len(coin_histories)} coin(s) currently flagged HIGH_RISK\n"
-        f"{_fmt_stats(stats_v2_clean, 'V2 minus HIGH_RISK coins')}"
+        f"{summary}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>THE DETAILS</b> (for anyone who wants to verify the claim above)\n\n"
+        f"{quick_table}\n\n"
+        f"<b>By market condition</b> (only showing conditions with enough data to trust):\n"
+        f"{regime_detail}\n\n"
+        f"<i>False-Pearl risk check: {excluded_count}/{len(coin_histories)} coins in this test are "
+        f"currently flagged risky — "
+        f"{'excluding them changed nothing (0 were flagged)' if excluded_count == 0 else 'excluding them barely changed the result'}.</i>\n\n"
+        f"<i>Technical note: this only tests price/volume patterns — it can't replay news or whale "
+        f"activity, since we don't have historical data for those. Costs assume "
+        f"{backtest.ROUND_TRIP_COST_PCT:.2f}% round-trip fees+slippage.</i>"
     )
     plain = message.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
     log.info(plain)
