@@ -282,6 +282,43 @@ def run() -> None:
 
     log.info(f"Pipeline diagnostic: {diag}")
 
+    # ── v3.1 MEASUREMENT SCAFFOLD — save today's row BEFORE anything
+    # else, so a crash later in the run doesn't lose the day's baseline
+    # data. Tag with CRYPTO_DATA_PERIOD_LABEL so you can mark which days
+    # are 'FREE_BASELINE' vs a later paid-data experiment period.
+    from core.db import save_daily_metrics
+    completeness_values = [c["evidence_completeness_pct"] for c in all_scored
+                            if c.get("evidence_completeness_pct") is not None and c.get("discovery_score") is not None]
+    discovery_scores = [c["discovery_score"] for c in all_scored if c.get("discovery_score") is not None]
+    top_pearl_score = max((c["discovery_score"] for c in pearl_tier), default=None)
+    top_hp_score = max((c["discovery_score"] for c in high_potential_tier), default=None)
+
+    def _median(vals):
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+        mid = n // 2
+        return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+
+    try:
+        save_daily_metrics({
+            "data_period_label": os.getenv("CRYPTO_DATA_PERIOD_LABEL", "FREE_BASELINE"),
+            "assets_scanned": diag["scanned"], "entered_scorer": diag["entered_scorer"],
+            "avg_completeness_pct": round(sum(completeness_values) / len(completeness_values), 1) if completeness_values else None,
+            "median_completeness_pct": _median(completeness_values),
+            "high_potential_count": diag["final_high_potential"], "pearl_count": diag["final_pearl"],
+            "candidate_count": diag["final_candidate"], "watch_count": diag["final_watch"],
+            "false_pearl_count": diag["final_false_pearl"],
+            "missing_data_rejection_count": diag["rejected_missing_data"],
+            "insufficient_evidence_count": diag["rejected_insufficient_evidence"],
+            "top_pearl_score": top_pearl_score, "top_high_potential_score": top_hp_score,
+            "avg_discovery_score": round(sum(discovery_scores) / len(discovery_scores), 1) if discovery_scores else None,
+        })
+        log.info("Daily metrics saved to crypto_daily_metrics")
+    except Exception as e:
+        log.warning(f"Failed to save daily metrics: {e}")
+
     # ── LOG immutable snapshots for every PEARL CANDIDATE and WATCH (not
     # AVOID — a rejected candidate has nothing to track forward). This
     # feeds the flywheel that answers "was the machine right."
@@ -304,6 +341,7 @@ def run() -> None:
                     "false_pearl_risk_pct": c["false_pearl_risk_pct"],
                     "risk_severity_at_discovery": (c.get("risk") or {}).get("severity", "UNCHECKED"),
                     "status_at_discovery": c["status"],
+                    "tier_at_discovery": c.get("tier"),
                     "why_it_surfaced": "; ".join(c["reasons_why"]),
                     "invalidation_conditions": "; ".join(c["invalidation_conditions"]),
                 })
