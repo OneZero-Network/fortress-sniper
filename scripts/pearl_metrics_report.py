@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import get_daily_metrics_by_period, get_pearl_quality_by_tier
+from core.db import init_crypto_tables, get_daily_metrics_by_period, get_pearl_quality_by_tier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -64,6 +64,11 @@ def _fmt_row(label: str, baseline_val, comparison_val=None) -> str:
 def run() -> None:
     log.info(f"=== Pearl Metrics Weekly Rollup: {BASELINE_LABEL}" +
              (f" vs {COMPARISON_LABEL}" if COMPARISON_LABEL else " (baseline only)") + " ===")
+
+    # Always ensure tables exist before querying — this script must not
+    # depend on another workflow (the daily sniper) having already run
+    # and created them first, or run order becomes a hidden dependency.
+    init_crypto_tables()
 
     baseline_rows = get_daily_metrics_by_period(BASELINE_LABEL)
     baseline = _rollup(baseline_rows)
