@@ -1,0 +1,40 @@
+name: Fortress Crypto Regime Audit v1 (manual only)
+
+on:
+  workflow_dispatch: {}
+  # No schedule — this audits V5's mechanics/regime calibration, it does
+  # not run a new strategy test. Run after V5, not on a cadence.
+
+concurrency:
+  group: fortress-crypto-regime-audit
+  cancel-in-progress: true
+
+jobs:
+  regime-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Regime Audit v1 (mechanics + classifier + distribution)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+        run: python scripts/regime_audit_v1.py
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regime-audit-run-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30
