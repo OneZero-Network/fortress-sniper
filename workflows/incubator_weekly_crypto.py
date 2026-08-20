@@ -214,7 +214,8 @@ def run() -> None:
 
     if pearls_written:
         lines = [f"🦪 <b>FORTRESS_CRYPTO — Weekly Pearls</b> ({datetime.today().strftime('%Y-%m-%d')})",
-                 "<i>Watchlist candidates only — NOT buy signals. The daily Sniper scan checks these for an actual entry/stop/target when a technical ignition fires.</i>", ""]
+                 f"<i>Watchlist candidates only — NOT buy signals. Target 25-50% via the deeper thesis; "
+                 f"the daily Sniper checks these for an actual entry/stop/target when a technical ignition fires.</i>", ""]
         for sym, score, grade in pearls_written:
             lines.append(f"• {sym} — grade {grade}, score {score}")
         send_telegram("\n".join(lines))
