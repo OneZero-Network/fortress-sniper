@@ -162,7 +162,7 @@ def _format_alert_line(r: dict, tag: str, target_low: float, target_high: float,
     else:
         news_line = "   📰 News: n/a (CRYPTOPANIC_API_KEY not set)"
 
-    whale = r.get("whale_accum", {})
+    whale = r.get("whale_accum") or {}
     if whale.get("available"):
         arrow = {"ACCUMULATING": "📈 whales adding", "DISTRIBUTING": "📉 whales reducing",
                   "STABLE": "➡️ whales stable"}.get(whale["label"], whale["label"])
