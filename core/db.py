@@ -182,6 +182,67 @@ def init_crypto_tables() -> None:
             resolved_at         TEXT,
             failure_reason      TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS crypto_layer_observations (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol                TEXT,
+            coin_id               TEXT,
+            observed_date         TEXT,
+            price_at_observation  REAL,
+            whale_label           TEXT,
+            whale_top10_delta_pct REAL,
+            news_label            TEXT,
+            news_score            REAL,
+            forward_return_7d_pct  REAL,
+            forward_return_14d_pct REAL,
+            forward_return_21d_pct REAL,
+            resolved_7d           INTEGER DEFAULT 0,
+            resolved_14d          INTEGER DEFAULT 0,
+            resolved_21d          INTEGER DEFAULT 0,
+            UNIQUE(symbol, observed_date)
+        );
+
+        -- ═══ PEARL FLYWHEEL (v2.8) ═══ The discovery snapshot columns
+        -- (everything through invalidation_conditions) are IMMUTABLE —
+        -- written once at INSERT, never UPDATEd. Only the resolution
+        -- columns (price_Nd/return_Nd/resolved_Nd) and lifecycle_state/
+        -- failure_reason are ever touched after creation. This is
+        -- deliberate: overwriting a discovery score with hindsight would
+        -- silently corrupt the very dataset this table exists to build.
+        CREATE TABLE IF NOT EXISTS crypto_pearl_observations (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol                  TEXT,
+            coin_id                 TEXT,
+            observed_at             TEXT,
+            price_at_observation    REAL,
+            discovery_score         REAL,
+            evidence_level          INTEGER,
+            evidence_label          TEXT,
+            whale_score             REAL,
+            whale_label_at_discovery TEXT,
+            news_score              REAL,
+            news_label_at_discovery TEXT,
+            liquidity_score         REAL,
+            structure_score         REAL,
+            onchain_score           REAL,
+            false_pearl_risk_pct    INTEGER,
+            risk_severity_at_discovery TEXT,
+            status_at_discovery     TEXT,
+            why_it_surfaced         TEXT,
+            invalidation_conditions TEXT,
+            -- resolution columns — appended over time, never backfilled early
+            price_24h               REAL, return_24h_pct  REAL, resolved_24h INTEGER DEFAULT 0,
+            price_3d                REAL, return_3d_pct   REAL, resolved_3d  INTEGER DEFAULT 0,
+            price_7d                REAL, return_7d_pct   REAL, resolved_7d  INTEGER DEFAULT 0,
+            price_14d               REAL, return_14d_pct  REAL, resolved_14d INTEGER DEFAULT 0,
+            price_30d               REAL, return_30d_pct  REAL, resolved_30d INTEGER DEFAULT 0,
+            -- lifecycle — the only mutable narrative fields
+            lifecycle_state         TEXT DEFAULT 'UNDER_OBSERVATION',
+            -- DISCOVERED -> CANDIDATE -> UNDER_OBSERVATION -> (THESIS_HOLDS|INVALIDATED) -> (CONFIRMED|FAILED)
+            invalidated_at          TEXT,
+            failure_reason          TEXT,
+            terminal_return_pct     REAL
+        );
         """)
     log.info(f"Crypto tables initialized in {DB_PATH}")
 
@@ -312,3 +373,161 @@ def signal_stats(lookback_days: int = 30) -> dict:
             "low_sample_warning": n < 20,
         }
     return out
+
+
+def save_layer_observation(symbol: str, coin_id: str, price: float,
+                            whale_label: str = None, whale_top10_delta_pct: float = None,
+                            news_label: str = None, news_score: float = None) -> None:
+    """W1/N1 forward-observation logger — one row per (symbol, date),
+    recording whale/news signal state independent of whether the
+    technical trigger fired. This is how the predictive-value question
+    ('does whale accumulation forecast forward returns') gets answered
+    honestly: no historical whale/news data exists to backtest against
+    (CryptoPanic doesn't serve history free, whale snapshots only exist
+    forward from when this system started storing them), so the dataset
+    has to be built going forward from today, one day at a time."""
+    from datetime import datetime as _dt
+    today = _dt.today().strftime("%Y-%m-%d")
+    with get_conn(write=True) as con:
+        con.execute("""
+            INSERT INTO crypto_layer_observations
+                (symbol, coin_id, observed_date, price_at_observation,
+                 whale_label, whale_top10_delta_pct, news_label, news_score)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, observed_date) DO UPDATE SET
+                price_at_observation=excluded.price_at_observation,
+                whale_label=excluded.whale_label, whale_top10_delta_pct=excluded.whale_top10_delta_pct,
+                news_label=excluded.news_label, news_score=excluded.news_score
+        """, (symbol.upper(), coin_id, today, price, whale_label, whale_top10_delta_pct,
+              news_label, news_score))
+
+
+def get_unresolved_observations(horizon: str) -> list:
+    """horizon: '7d' | '14d' | '21d'. Returns observations old enough for
+    that horizon to have elapsed but not yet resolved."""
+    from datetime import datetime as _dt, timedelta as _td
+    days = {"7d": 7, "14d": 14, "21d": 21}[horizon]
+    cutoff = (_dt.today() - _td(days=days)).strftime("%Y-%m-%d")
+    col = f"resolved_{horizon}"
+    cols = ["id", "symbol", "coin_id", "observed_date", "price_at_observation",
+            "whale_label", "news_label"]
+    with get_conn() as con:
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM crypto_layer_observations "
+            f"WHERE observed_date <= ? AND {col} = 0",
+            (cutoff,)
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def resolve_layer_observation(obs_id: int, horizon: str, forward_return_pct: float) -> None:
+    col_val = f"forward_return_{horizon}_pct"
+    col_flag = f"resolved_{horizon}"
+    with get_conn(write=True) as con:
+        con.execute(f"UPDATE crypto_layer_observations SET {col_val}=?, {col_flag}=1 WHERE id=?",
+                     (forward_return_pct, obs_id))
+
+
+def get_resolved_observations(horizon: str) -> list:
+    col_val = f"forward_return_{horizon}_pct"
+    col_flag = f"resolved_{horizon}"
+    with get_conn() as con:
+        rows = con.execute(
+            f"SELECT symbol, whale_label, news_label, {col_val} FROM crypto_layer_observations "
+            f"WHERE {col_flag} = 1 AND {col_val} IS NOT NULL"
+        ).fetchall()
+    return [{"symbol": r[0], "whale_label": r[1], "news_label": r[2], "forward_return_pct": r[3]} for r in rows]
+
+
+def save_pearl_observation(snapshot: dict) -> int:
+    """The immutable discovery snapshot. Written ONCE. Every field here
+    (discovery_score, whale_score, news_score, etc.) is a fact about what
+    the machine believed AT THE MOMENT OF DISCOVERY — it must never be
+    updated later, or the dataset silently becomes hindsight-biased.
+    Returns the new row's id, used to attach resolutions later."""
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn(write=True) as con:
+        cur = con.execute("""
+            INSERT INTO crypto_pearl_observations
+                (symbol, coin_id, observed_at, price_at_observation, discovery_score,
+                 evidence_level, evidence_label, whale_score, whale_label_at_discovery,
+                 news_score, news_label_at_discovery, liquidity_score, structure_score,
+                 onchain_score, false_pearl_risk_pct, risk_severity_at_discovery,
+                 status_at_discovery, why_it_surfaced, invalidation_conditions)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            snapshot["symbol"], snapshot["coin_id"], now, snapshot["price_at_observation"],
+            snapshot["discovery_score"], snapshot["evidence_level"], snapshot["evidence_label"],
+            snapshot.get("whale_score"), snapshot.get("whale_label_at_discovery"),
+            snapshot.get("news_score"), snapshot.get("news_label_at_discovery"),
+            snapshot.get("liquidity_score"), snapshot.get("structure_score"),
+            snapshot.get("onchain_score"), snapshot["false_pearl_risk_pct"],
+            snapshot["risk_severity_at_discovery"], snapshot["status_at_discovery"],
+            snapshot["why_it_surfaced"], snapshot["invalidation_conditions"],
+        ))
+        return cur.lastrowid
+
+
+def get_pearl_observations_due(horizon: str) -> list:
+    """horizon: '24h'|'3d'|'7d'|'14d'|'30d'. Returns snapshots old enough
+    for this horizon but not yet resolved AND not already terminally
+    INVALIDATED (once invalidated, we stop re-checking — the thesis
+    already failed, further price wobbling doesn't un-invalidate it)."""
+    from datetime import datetime as _dt, timedelta as _td
+    hours = {"24h": 1, "3d": 3, "7d": 7, "14d": 14, "30d": 30}
+    days = hours[horizon] if horizon != "24h" else 1
+    cutoff = (_dt.today() - _td(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    col = f"resolved_{horizon}"
+    cols = ["id", "symbol", "coin_id", "observed_at", "price_at_observation",
+            "whale_label_at_discovery", "risk_severity_at_discovery", "lifecycle_state"]
+    with get_conn() as con:
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM crypto_pearl_observations "
+            f"WHERE observed_at <= ? AND {col} = 0 AND lifecycle_state != 'INVALIDATED'",
+            (cutoff,)
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def resolve_pearl_observation(obs_id: int, horizon: str, price: float, return_pct: float,
+                               new_lifecycle_state: str = None, failure_reason: str = None,
+                               terminal_return_pct: float = None) -> None:
+    """Appends a resolution — never touches the immutable discovery
+    columns. lifecycle_state/failure_reason/invalidated_at are the ONLY
+    narrative fields allowed to change after creation, and only forward
+    (see core/crypto/pearl_flywheel.py for the state-transition rules)."""
+    from datetime import datetime as _dt
+    price_col, return_col, resolved_col = f"price_{horizon}", f"return_{horizon}_pct", f"resolved_{horizon}"
+    with get_conn(write=True) as con:
+        if new_lifecycle_state == "INVALIDATED":
+            con.execute(f"""
+                UPDATE crypto_pearl_observations
+                SET {price_col}=?, {return_col}=?, {resolved_col}=1,
+                    lifecycle_state=?, failure_reason=?, invalidated_at=?
+                WHERE id=?
+            """, (price, return_pct, new_lifecycle_state, failure_reason,
+                  _dt.today().strftime("%Y-%m-%d %H:%M:%S"), obs_id))
+        elif new_lifecycle_state:
+            con.execute(f"""
+                UPDATE crypto_pearl_observations
+                SET {price_col}=?, {return_col}=?, {resolved_col}=1,
+                    lifecycle_state=?, terminal_return_pct=?
+                WHERE id=?
+            """, (price, return_pct, new_lifecycle_state, terminal_return_pct, obs_id))
+        else:
+            con.execute(f"""
+                UPDATE crypto_pearl_observations
+                SET {price_col}=?, {return_col}=?, {resolved_col}=1
+                WHERE id=?
+            """, (price, return_pct, obs_id))
+
+
+def get_pearl_flywheel_stats() -> dict:
+    """Aggregate lifecycle outcomes — the honest answer to 'was the
+    machine right,' built from real resolved history, not assumption."""
+    with get_conn() as con:
+        rows = con.execute(
+            "SELECT lifecycle_state, COUNT(*) FROM crypto_pearl_observations GROUP BY lifecycle_state"
+        ).fetchall()
+    return {state: count for state, count in rows}
