@@ -188,4 +188,54 @@ _GAMBLING_PREDICTION_CATEGORY_TERMS = ("gambling", "casino", "prediction-market"
 _STAKING_CATEGORY_TERMS = ("liquid-staking", "staking", "lsd", "liquid-staking-tokens")
 _LENDING_CATEGORY_TERMS = ("lending-borrowing", "yield-farming", "yield-aggregator")
 
+CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
+CRYPTOPANIC_BASE = "https://cryptopanic.com/api/v1"
+NEWS_SENTIMENT_ENABLED = _bool("CRYPTO_NEWS_SENTIMENT_ENABLED", "true")
+NEWS_SENTIMENT_LOOKBACK_HOURS = _int("CRYPTO_NEWS_LOOKBACK_HOURS", "48")
+# News sentiment is only fetched for candidates that ALREADY cleared the
+# technical trigger threshold — not the whole universe. This is the
+# "diving" layer applied selectively to what the "metal detector" already
+# flagged, not a second blanket scan (keeps API call volume sane on free
+# tiers and matches how a human analyst would actually work: scan broad,
+# then read the news on the shortlist, not on all 200 coins).
+
 CRYPTO_HALAL_LIST_SHEET_TAB = "CRYPTO_HALAL_LIST"  # seed manually, same pattern as HALAL_LIST tab
+
+# ══════════════════════════════════════════════════════════════════════════
+# DAILY SWING TIER — fix for daily consistently returning 0 candidates.
+# LANE_FUSED_MIN=60 is calibrated for high-conviction "fortress" setups —
+# the same bar as the weekly Incubator's best pearls. A daily 10-20%
+# swing candidate is a genuinely different, lower-conviction, shorter-
+# horizon category. Giving it its own lower bar is the correct fix, not
+# lowering LANE_FUSED_MIN globally (which would blur the two tiers and
+# let low-conviction noise through as if it were a "fortress" pick).
+# ══════════════════════════════════════════════════════════════════════════
+DAILY_SWING_MIN = _float("CRYPTO_DAILY_SWING_MIN", "42.0")
+DAILY_SWING_TARGET_LOW_PCT = _float("CRYPTO_DAILY_SWING_TARGET_LOW_PCT", "10.0")
+DAILY_SWING_TARGET_HIGH_PCT = _float("CRYPTO_DAILY_SWING_TARGET_HIGH_PCT", "20.0")
+PEARL_TARGET_LOW_PCT = _float("CRYPTO_PEARL_TARGET_LOW_PCT", "25.0")
+PEARL_TARGET_HIGH_PCT = _float("CRYPTO_PEARL_TARGET_HIGH_PCT", "50.0")
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEWS SENTIMENT — the first "diving skill" layer, applied SELECTIVELY to
+# candidates that already cleared the technical trigger threshold, not to
+# the whole universe (matches how a human analyst actually works: scan
+# broad first, then read the news on the shortlist). CryptoPanic free
+# tier needs a free signup for an auth_token — without one this degrades
+# to neutral (sentiment=None, never fabricated), same fail-safe-neutral
+# philosophy as onchain.py and factors_crypto.py.
+# ══════════════════════════════════════════════════════════════════════════
+CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
+CRYPTOPANIC_BASE = "https://cryptopanic.com/api/v1"
+NEWS_SENTIMENT_ENABLED = _bool("CRYPTO_NEWS_SENTIMENT_ENABLED", "true")
+NEWS_SENTIMENT_LOOKBACK_HOURS = _int("CRYPTO_NEWS_LOOKBACK_HOURS", "48")
+
+# ══════════════════════════════════════════════════════════════════════════
+# TREND CONTEXT — second "diving skill" layer: higher-timeframe trend
+# confirmation using data already fetched (pct_7d/pct_30d from CoinGecko
+# markets payload), no extra API calls. A coin ticking every technical
+# box but fighting a hard downtrend on the 30d chart is a lower-quality
+# signal than the same setup WITH the trend, even at equal trigger score.
+# ══════════════════════════════════════════════════════════════════════════
+TREND_ALIGNED_BONUS = _float("CRYPTO_TREND_ALIGNED_BONUS", "6.0")
+TREND_AGAINST_PENALTY = _float("CRYPTO_TREND_AGAINST_PENALTY", "8.0")
