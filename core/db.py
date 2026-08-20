@@ -182,25 +182,6 @@ def init_crypto_tables() -> None:
             resolved_at         TEXT,
             failure_reason      TEXT
         );
-
-        CREATE TABLE IF NOT EXISTS crypto_layer_observations (
-            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol                TEXT,
-            coin_id               TEXT,
-            observed_date         TEXT,
-            price_at_observation  REAL,
-            whale_label           TEXT,
-            whale_top10_delta_pct REAL,
-            news_label            TEXT,
-            news_score            REAL,
-            forward_return_7d_pct  REAL,
-            forward_return_14d_pct REAL,
-            forward_return_21d_pct REAL,
-            resolved_7d           INTEGER DEFAULT 0,
-            resolved_14d          INTEGER DEFAULT 0,
-            resolved_21d          INTEGER DEFAULT 0,
-            UNIQUE(symbol, observed_date)
-        );
         """)
     log.info(f"Crypto tables initialized in {DB_PATH}")
 
@@ -331,67 +312,3 @@ def signal_stats(lookback_days: int = 30) -> dict:
             "low_sample_warning": n < 20,
         }
     return out
-
-
-def save_layer_observation(symbol: str, coin_id: str, price: float,
-                            whale_label: str = None, whale_top10_delta_pct: float = None,
-                            news_label: str = None, news_score: float = None) -> None:
-    """W1/N1 forward-observation logger — one row per (symbol, date),
-    recording whale/news signal state independent of whether the
-    technical trigger fired. This is how the predictive-value question
-    ('does whale accumulation forecast forward returns') gets answered
-    honestly: no historical whale/news data exists to backtest against
-    (CryptoPanic doesn't serve history free, whale snapshots only exist
-    forward from when this system started storing them), so the dataset
-    has to be built going forward from today, one day at a time."""
-    from datetime import datetime as _dt
-    today = _dt.today().strftime("%Y-%m-%d")
-    with get_conn(write=True) as con:
-        con.execute("""
-            INSERT INTO crypto_layer_observations
-                (symbol, coin_id, observed_date, price_at_observation,
-                 whale_label, whale_top10_delta_pct, news_label, news_score)
-            VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(symbol, observed_date) DO UPDATE SET
-                price_at_observation=excluded.price_at_observation,
-                whale_label=excluded.whale_label, whale_top10_delta_pct=excluded.whale_top10_delta_pct,
-                news_label=excluded.news_label, news_score=excluded.news_score
-        """, (symbol.upper(), coin_id, today, price, whale_label, whale_top10_delta_pct,
-              news_label, news_score))
-
-
-def get_unresolved_observations(horizon: str) -> list:
-    """horizon: '7d' | '14d' | '21d'. Returns observations old enough for
-    that horizon to have elapsed but not yet resolved."""
-    from datetime import datetime as _dt, timedelta as _td
-    days = {"7d": 7, "14d": 14, "21d": 21}[horizon]
-    cutoff = (_dt.today() - _td(days=days)).strftime("%Y-%m-%d")
-    col = f"resolved_{horizon}"
-    cols = ["id", "symbol", "coin_id", "observed_date", "price_at_observation",
-            "whale_label", "news_label"]
-    with get_conn() as con:
-        rows = con.execute(
-            f"SELECT {', '.join(cols)} FROM crypto_layer_observations "
-            f"WHERE observed_date <= ? AND {col} = 0",
-            (cutoff,)
-        ).fetchall()
-    return [dict(zip(cols, r)) for r in rows]
-
-
-def resolve_layer_observation(obs_id: int, horizon: str, forward_return_pct: float) -> None:
-    col_val = f"forward_return_{horizon}_pct"
-    col_flag = f"resolved_{horizon}"
-    with get_conn(write=True) as con:
-        con.execute(f"UPDATE crypto_layer_observations SET {col_val}=?, {col_flag}=1 WHERE id=?",
-                     (forward_return_pct, obs_id))
-
-
-def get_resolved_observations(horizon: str) -> list:
-    col_val = f"forward_return_{horizon}_pct"
-    col_flag = f"resolved_{horizon}"
-    with get_conn() as con:
-        rows = con.execute(
-            f"SELECT symbol, whale_label, news_label, {col_val} FROM crypto_layer_observations "
-            f"WHERE {col_flag} = 1 AND {col_val} IS NOT NULL"
-        ).fetchall()
-    return [{"symbol": r[0], "whale_label": r[1], "news_label": r[2], "forward_return_pct": r[3]} for r in rows]
