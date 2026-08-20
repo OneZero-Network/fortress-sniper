@@ -213,10 +213,17 @@ def run() -> None:
     log.info(f"Wrote {len(pearls_written)} pearl(s) to crypto_pearl_watchlist")
 
     if pearls_written:
-        lines = [f"🦪 <b>FORTRESS_CRYPTO — Weekly Pearls</b> ({datetime.today().strftime('%Y-%m-%d')})", ""]
+        lines = [f"🦪 <b>FORTRESS_CRYPTO — Weekly Pearls</b> ({datetime.today().strftime('%Y-%m-%d')})",
+                 "<i>Watchlist candidates only — NOT buy signals. The daily Sniper scan checks these for an actual entry/stop/target when a technical ignition fires.</i>", ""]
         for sym, score, grade in pearls_written:
             lines.append(f"• {sym} — grade {grade}, score {score}")
         send_telegram("\n".join(lines))
+    else:
+        send_telegram(
+            f"ℹ️ FORTRESS_CRYPTO Weekly Incubator ({datetime.today().strftime('%Y-%m-%d')}): "
+            f"ran successfully, {len(survivors)} candidate(s) passed Shariah+ATH gates, "
+            f"none reached STONE_SCORE_MIN ({STONE_SCORE_MIN}). No new pearls this week."
+        )
 
     try:
         push_sheet("CRYPTO_INCUBATOR", [["symbol", "coin_id", "z_composite", "grade", "ath_change_pct"]] +

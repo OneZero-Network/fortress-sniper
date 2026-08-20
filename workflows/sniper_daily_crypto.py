@@ -68,6 +68,18 @@ def score_symbol(symbol: str, coin_id: str, is_pearl: bool, pearl_row: dict = No
 
     ignition = bridge_crypto.check_ignition(pearl_row or {"symbol": symbol}, hist)
 
+    # ── ENTRY / STOP / TARGET — this was previously missing entirely.
+    # ATR-based stop, same concept as equity's atr_dynamic_stop(), using
+    # crypto's wider ATR multiples from core/crypto/config.py (crypto
+    # whipsaws more than NSE mid-caps, see that module's docstring).
+    atr14 = ind.get("atr14", 0.0)
+    if atr14 <= 0:
+        atr14 = close * 0.02  # fallback: assume 2% daily range if ATR unavailable
+    stop_loss = round(max(close - atr14 * ccfg.ATR_MULT_TREND, close * 0.75), 6)
+    risk_per_unit = close - stop_loss
+    r1 = round(close + risk_per_unit * 1.5, 6)   # 1.5R first target
+    r2 = round(close + risk_per_unit * 3.0, 6)   # 3R second target
+
     # trigger_score: simple technical composite 0-100 from RSI/ADX/vol-ratio
     # (equity's fortress_score/apex_composite are far more elaborate;
     # legacy 14-node Bayesian engine and whale/order-flow scoring are NOT
@@ -95,6 +107,7 @@ def score_symbol(symbol: str, coin_id: str, is_pearl: bool, pearl_row: dict = No
         "drift_pct": drift_pct, "is_pearl": is_pearl, "ignited": ignition["ignited"],
         "ignition_reason": ignition["reason"], "trigger_score": round(trigger_raw, 1),
         "conviction": conviction, "rsi14": round(rsi, 1), "adx14": round(adx, 1),
+        "entry": close, "stop_loss": stop_loss, "r1": r1, "r2": r2,
     }
 
 
@@ -140,10 +153,24 @@ def run() -> None:
         lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Ignition Scan</b> ({datetime.today().strftime('%Y-%m-%d')})", ""]
         for r in alerts[:15]:
             tag = "🦪🔥PEARL+IGNITED" if (r["is_pearl"] and r["ignited"]) else ("🦪PEARL" if r["is_pearl"] else "COLD-SCAN")
-            thin = ""
-            lines.append(f"• {r['symbol']} [{tag}] conviction={r['conviction']} "
-                         f"price=${r['live_price']:.4f} drift={r['drift_pct']}% {thin}")
+            lines.append(
+                f"• <b>{r['symbol']}</b> [{tag}] conviction={r['conviction']}\n"
+                f"   BUY ~${r['entry']:.4f} | SL ${r['stop_loss']:.4f} | "
+                f"T1 ${r['r1']:.4f} | T2 ${r['r2']:.4f}\n"
+                f"   live=${r['live_price']:.4f} (drift {r['drift_pct']}%)"
+            )
         send_telegram("\n".join(lines))
+    else:
+        # ALWAYS send a status line even with zero candidates — silence is
+        # indistinguishable from a broken run otherwise. This was the
+        # second cause of "no notification received": the run succeeded,
+        # it just genuinely found nothing above threshold that day, and
+        # nothing told you that distinction.
+        send_telegram(
+            f"ℹ️ FORTRESS_CRYPTO Daily Scan ({datetime.today().strftime('%Y-%m-%d')}): "
+            f"ran successfully, {len(results)} candidate(s) scored, "
+            f"none reached LANE_FUSED_MIN ({ccfg.LANE_FUSED_MIN}). No trade alert today."
+        )
 
     try:
         header = ["symbol", "is_pearl", "ignited", "conviction", "trigger_score",
