@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       script:
-        description: 'Which research tool to run'
+        description: 'Which research tool to run (or "all" to run every tool sequentially in one go)'
         required: true
         type: choice
-        default: 'backtest_matrix'
+        default: 'all'
         options:
+          - all
           - backtest_matrix
           - v5_falsification_test
           - regime_audit_v1
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   run-research-tool:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -35,9 +36,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore crypto DB cache
-        # Some tools (V5, Regime Audit) don't strictly need this, but
-        # restoring is harmless and keeps this workflow simple to run any
-        # of the five tools without per-tool cache logic.
         uses: actions/cache@v4
         with:
           path: outputs/fortress_unified.db
@@ -45,7 +43,14 @@ jobs:
           restore-keys: |
             fortress-crypto-db-
 
-      - name: Run selected research tool
+      - name: Run selected research tool(s)
+        # When "all" is chosen, every tool runs sequentially in this ONE
+        # step, each reported to Telegram exactly as it would standalone.
+        # A failure in one tool does NOT stop the rest (set -e is
+        # deliberately NOT used) — you get every result that's possible
+        # to get in one pass, plus a clear PASS/FAIL summary at the end,
+        # rather than one crash silently cancelling four other tools'
+        # worth of results.
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -55,32 +60,51 @@ jobs:
           BSCSCAN_API_KEY: ${{ secrets.BSCSCAN_API_KEY }}
           POLYGONSCAN_API_KEY: ${{ secrets.POLYGONSCAN_API_KEY }}
         run: |
-          case "${{ inputs.script }}" in
-            backtest_matrix)
-              python scripts/backtest_crypto.py
-              ;;
-            v5_falsification_test)
-              python scripts/backtest_v5.py
-              ;;
-            regime_audit_v1)
-              python scripts/regime_audit_v1.py
-              ;;
-            f1_false_pearl)
-              python scripts/experiment_f1_false_pearl.py
-              ;;
-            regime_v2_calibration)
-              python scripts/calibrate_regime_v2.py
-              ;;
-            *)
-              echo "Unknown script selection: ${{ inputs.script }}"
-              exit 1
-              ;;
-          esac
+          declare -A SCRIPTS=(
+            [backtest_matrix]="scripts/backtest_crypto.py"
+            [v5_falsification_test]="scripts/backtest_v5.py"
+            [regime_audit_v1]="scripts/regime_audit_v1.py"
+            [f1_false_pearl]="scripts/experiment_f1_false_pearl.py"
+            [regime_v2_calibration]="scripts/calibrate_regime_v2.py"
+          )
+
+          run_one() {
+            local name="$1"
+            local path="${SCRIPTS[$name]}"
+            echo "::group::Running $name ($path)"
+            if python "$path"; then
+              echo "✅ $name completed"
+              RESULTS+=("✅ $name")
+            else
+              echo "❌ $name FAILED (see log above) — continuing to next tool"
+              RESULTS+=("❌ $name (FAILED)")
+            fi
+            echo "::endgroup::"
+          }
+
+          RESULTS=()
+          SELECTION="${{ inputs.script }}"
+
+          if [ "$SELECTION" = "all" ]; then
+            for name in backtest_matrix v5_falsification_test regime_audit_v1 f1_false_pearl regime_v2_calibration; do
+              run_one "$name"
+            done
+          elif [ -n "${SCRIPTS[$SELECTION]}" ]; then
+            run_one "$SELECTION"
+          else
+            echo "Unknown script selection: $SELECTION"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== SUMMARY ==="
+          printf '%s\n' "${RESULTS[@]}"
 
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: research-tool-${{ inputs.script }}-${{ github.run_id }}
+          name: research-tools-${{ inputs.script }}-${{ github.run_id }}
           path: outputs/
           retention-days: 30
+
