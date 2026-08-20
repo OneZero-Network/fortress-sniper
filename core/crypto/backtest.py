@@ -300,10 +300,13 @@ def backtest_coin_regime_gated(symbol: str, hist: pd.DataFrame, btc_hist: Option
             continue
 
         outcome = _resolve_simulated_signal(hist, t, sig["stop_loss"], r1_mult, r2_mult)
+        stop_distance_pct = round(100.0 * (sig["close"] - sig["stop_loss"]) / sig["close"], 4)
+        r_multiple_net = round(outcome["pnl_pct_net"] / stop_distance_pct, 3) if stop_distance_pct > 0 else None
         trades.append({
             "symbol": symbol, "entry_date": str(hist["date"].iloc[t].date()),
             "entry_idx": t, "entry_price": sig["close"], "conviction": sig["conviction"],
-            "regime_label": sig["regime_label"], **outcome,
+            "regime_label": sig["regime_label"], "stop_distance_pct": stop_distance_pct,
+            "r_multiple_net": r_multiple_net, **outcome,
         })
         next_eligible_idx = t + outcome["days_held"] + 1
 
@@ -469,3 +472,170 @@ def leave_one_coin_out(trades: List[dict], btc_hist: Optional[pd.DataFrame] = No
         remaining = [t for t in trades if t["symbol"] != sym]
         out[sym] = compute_extended_stats(remaining, btc_hist)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BACKTEST MECHANICS AUDIT — the -96%/-76% drawdowns needed inspection
+# before being trusted, per explicit instruction. This is a research
+# infrastructure check, not strategy optimization.
+# ══════════════════════════════════════════════════════════════════════════
+# ROOT CAUSE, confirmed: the original max_drawdown_pct in
+# compute_extended_stats() sums each trade's PERCENT RETURN ON ITS OWN
+# ENTRY PRICE arithmetically — i.e. it implicitly assumes every trade
+# risks a FULL, EQUAL-SIZED unit of capital, with no position sizing and
+# no compounding. 18 trades averaging -5% arithmetically sum to -90%,
+# which is exactly what produced the -96% figure. That is NOT a
+# portfolio simulation bug (no double-counting, no leverage error) — it
+# is a METHODOLOGY GAP: the original metric never modeled position
+# sizing at all. This function fixes that by converting each trade to an
+# R-multiple (return relative to its OWN stop distance, i.e. genuine risk
+# unit) and applying a fixed-fractional COMPOUNDED equity curve at
+# ACCOUNT_RISK_PCT per trade (0.75%, same value already used for live
+# position sizing — not a new number invented for this audit).
+
+def compute_risk_adjusted_drawdown(trades: List[dict], account_risk_pct: float = None) -> dict:
+    """Returns BOTH the naive arithmetic-sum drawdown (kept for
+    comparison, explicitly labeled as NOT representing real portfolio
+    risk) and a risk-adjusted compounded equity curve assuming a fixed
+    account_risk_pct per trade.
+
+    HONEST LIMITATION stated directly: this still does not cap
+    simultaneous open positions across different coins — if V5 fires on
+    5 coins at once, this treats them as sequential risk draws on the
+    same equity curve, not as concurrent exposure. That overstates
+    diversification benefit and understates real simultaneous-position
+    risk. A true portfolio simulation needs max-concurrent-exposure
+    limits, which is a further, larger build not done here."""
+    from . import config as ccfg
+    account_risk_pct = account_risk_pct or ccfg.ACCOUNT_RISK_PCT * 100  # config stores as fraction (0.0075), audit reports in %
+
+    valid_trades = [t for t in trades if t.get("r_multiple_net") is not None]
+    if not valid_trades:
+        return {"available": False, "reason": "no trades with stop_distance_pct recorded"}
+
+    trades_sorted = sorted(valid_trades, key=lambda t: t["entry_date"])
+    net_returns = [t["pnl_pct_net"] for t in trades_sorted]
+
+    # naive (original) method — kept for direct comparison
+    naive_cum = np.cumsum(net_returns)
+    naive_max_dd = round(float((naive_cum - np.maximum.accumulate(naive_cum)).min()), 2) if len(naive_cum) else 0.0
+
+    # risk-adjusted, compounded equity curve at fixed fractional risk
+    equity = 100.0
+    equity_curve = [equity]
+    for t in trades_sorted:
+        account_return_pct = account_risk_pct * t["r_multiple_net"]  # % of ACCOUNT, not of trade notional
+        equity *= (1 + account_return_pct / 100.0)
+        equity_curve.append(equity)
+    equity_arr = np.array(equity_curve)
+    running_max = np.maximum.accumulate(equity_arr)
+    dd_pct = (equity_arr - running_max) / running_max * 100.0
+    risk_adjusted_max_dd = round(float(dd_pct.min()), 2)
+    final_equity_return_pct = round(equity - 100.0, 2)
+
+    return {
+        "available": True,
+        "naive_arithmetic_max_dd_pct": naive_max_dd,
+        "naive_method_caveat": "sums trade returns as if each risks 100% of a full equal-sized unit — NOT a real portfolio metric",
+        "risk_adjusted_max_dd_pct": risk_adjusted_max_dd,
+        "risk_adjusted_final_return_pct": final_equity_return_pct,
+        "risk_adjusted_assumption": f"{account_risk_pct:.2f}% account risk per trade, compounded, sequential (no concurrent-position cap)",
+        "n_trades": len(trades_sorted),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# REGIME CLASSIFIER AUDIT — "don't ask the classifier if the market is
+# BULL, ask the market directly." For every gated entry, checks what
+# actually happened to BTC over the SAME forward window the trade was
+# held — this is safe to compute with future data for AUDIT purposes
+# (we are not trading on it, only evaluating the classifier's own past
+# calibration).
+# ══════════════════════════════════════════════════════════════════════════
+
+def regime_classifier_audit(trades: List[dict], btc_hist: Optional[pd.DataFrame]) -> dict:
+    """For every trade gated as target_regime (e.g. BULL/NORMAL_VOL),
+    checks whether BTC's OWN price actually rose over that trade's
+    holding window. Reports what fraction of 'favorable' classifications
+    were followed by BTC actually going up — a calibration check, not a
+    full confusion matrix (a true confusion matrix would need an
+    equal-effort audit of days the classifier called UNFAVORABLE too,
+    which is a larger scope not built here — flagged, not silently
+    skipped)."""
+    if btc_hist is None or not trades:
+        return {"available": False, "reason": "no BTC history or no trades to audit"}
+
+    rows = []
+    for t in trades:
+        if "entry_idx" not in t:
+            continue
+        entry_idx = t["entry_idx"]
+        days_held = t["days_held"]
+        if entry_idx >= len(btc_hist):
+            continue
+        exit_idx = min(entry_idx + days_held, len(btc_hist) - 1)
+        if exit_idx <= entry_idx:
+            continue
+        btc_entry = float(btc_hist["close"].iloc[entry_idx])
+        btc_exit = float(btc_hist["close"].iloc[exit_idx])
+        btc_fwd_return_pct = round(100.0 * (btc_exit - btc_entry) / btc_entry, 2) if btc_entry > 0 else None
+        if btc_fwd_return_pct is None:
+            continue
+        rows.append({
+            "symbol": t["symbol"], "entry_date": t["entry_date"],
+            "regime_label_at_entry": t.get("regime_label"),
+            "btc_fwd_return_pct": btc_fwd_return_pct,
+            "btc_actually_rose": btc_fwd_return_pct > 0,
+        })
+
+    if not rows:
+        return {"available": False, "reason": "no matchable BTC forward windows"}
+
+    n = len(rows)
+    btc_rose_count = sum(1 for r in rows if r["btc_actually_rose"])
+    avg_btc_fwd_return = round(float(np.mean([r["btc_fwd_return_pct"] for r in rows])), 2)
+    median_btc_fwd_return = round(float(np.median([r["btc_fwd_return_pct"] for r in rows])), 2)
+
+    return {
+        "available": True, "n": n,
+        "pct_where_btc_actually_rose": round(100.0 * btc_rose_count / n, 1),
+        "avg_btc_forward_return_pct": avg_btc_fwd_return,
+        "median_btc_forward_return_pct": median_btc_fwd_return,
+        "interpretation": ("classifier's BULL/NORMAL_VOL call was followed by BTC actually falling "
+                            "more often than not — the regime label itself may be miscalibrated"
+                            if btc_rose_count < n / 2 else
+                            "classifier's BULL/NORMAL_VOL call was followed by BTC rising more often "
+                            "than not — regime detection appears directionally reasonable, though this "
+                            "is a partial audit (favorable calls only, no confusion matrix vs unfavorable calls)"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# DISTRIBUTION / TOP-WINNER-REMOVAL ANALYSIS — "is the apparent edge a
+# few lucky big winners, or broad-based." Removes the top N winners and
+# recomputes the average each time; if the edge evaporates quickly, it
+# was concentrated in a handful of outlier trades, not real breadth.
+# ══════════════════════════════════════════════════════════════════════════
+
+def top_winner_removal_analysis(trades: List[dict], remove_ns: List[int] = None) -> dict:
+    remove_ns = remove_ns or [1, 2, 5]
+    valid = [t for t in trades if t.get("pnl_pct_net") is not None]
+    if not valid:
+        return {"available": False}
+
+    sorted_desc = sorted(valid, key=lambda t: t["pnl_pct_net"], reverse=True)
+    baseline_avg = round(float(np.mean([t["pnl_pct_net"] for t in valid])), 3)
+
+    results = {"baseline_avg_pct": baseline_avg, "baseline_n": len(valid), "after_removal": {}}
+    for k in remove_ns:
+        if k >= len(sorted_desc):
+            results["after_removal"][k] = None
+            continue
+        remaining = sorted_desc[k:]
+        avg_after = round(float(np.mean([t["pnl_pct_net"] for t in remaining])), 3) if remaining else None
+        results["after_removal"][k] = {
+            "n_remaining": len(remaining), "avg_pct": avg_after,
+            "top_removed_returns": [round(t["pnl_pct_net"], 2) for t in sorted_desc[:k]],
+        }
+    results["available"] = True
+    return results
