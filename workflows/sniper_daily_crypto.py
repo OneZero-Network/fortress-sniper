@@ -49,6 +49,7 @@ from core.crypto import data as cdata
 from core.crypto import bridge_crypto
 from core.crypto import news_sentiment
 from core.crypto import outcome_tracker
+from core.crypto import risk_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -94,9 +95,10 @@ def _estimated_hold_days(entry: float, target: float, atr14: float) -> float:
 
 def score_symbol(symbol: str, coin_id: str, is_pearl: bool, pearl_row: dict = None,
                   coin_snapshot: dict = None) -> dict:
-    hist = cdata.fetch_daily_ohlc(coin_id, days=90)
+    hist = cdata.fetch_daily_ohlc(coin_id, days=95)
     if hist.empty or len(hist) < 25:
-        return {"symbol": symbol, "skip": True, "reason": "insufficient OHLC history"}
+        return {"symbol": symbol, "skip": True,
+                "reason": f"insufficient OHLC history ({len(hist)} rows returned, need >=25)"}
 
     ind = compute_indicators(hist)
     close = float(hist["close"].iloc[-1])
@@ -170,14 +172,41 @@ def _format_alert_line(r: dict, tag: str, target_low: float, target_high: float,
     else:
         whale_line = ""
 
+    risk = r.get("risk", {})
+    if risk.get("available") and risk.get("flags"):
+        risk_line = f"\n   🔍 False-pearl check ({risk['severity']}): " + "; ".join(risk["flags"])
+    elif risk.get("available"):
+        risk_line = f"\n   🔍 False-pearl check: CLEAN — no red flags found"
+    else:
+        risk_line = f"\n   🔍 False-pearl check: unchecked (non-EVM token or check unavailable)"
+
+    decision = _decision_label(r, risk)
+
     return (
-        f"• <b>{r['symbol']}</b> [{tag}] conviction={r['conviction']} | target {target_low:.0f}-{target_high:.0f}%\n"
+        f"• <b>{r['symbol']}</b> [{tag}] conviction={r['conviction']} | target {target_low:.0f}-{target_high:.0f}% | <b>{decision}</b>\n"
         f"   ENTRY ${r['entry']:.4f} at {entry_ts} UTC | SL ${r['stop_loss']:.4f}\n"
         f"   T1 ${r['r1']:.4f} (~{r['hold_days_t1']}d) | T2 ${r['r2']:.4f} (~{r['hold_days_t2']}d)\n"
         f"   Trend: {r['trend_label']}\n"
-        f"{news_line}{whale_line}\n"
+        f"{news_line}{whale_line}{risk_line}\n"
         f"   live=${r['live_price']:.4f} (drift {r['drift_pct']}%)"
     )
+
+
+def _decision_label(r: dict, risk: dict) -> str:
+    """BUY / WATCH / AVOID — per your mentor's requested output format.
+    This is a LABEL summarizing the combined signal, not a new decision
+    engine: HIGH_RISK false-pearl flags override everything else (even a
+    high-conviction technical setup is not a 'buy' if the contract can
+    rug), CAUTION downgrades a clean BUY to WATCH, and anything below
+    conviction floor stays WATCH regardless of risk status."""
+    severity = risk.get("severity", "UNCHECKED")
+    if severity == "HIGH_RISK":
+        return "🚫 AVOID (false-pearl risk)"
+    if r["conviction"] < 50:
+        return "👀 WATCH"
+    if severity == "CAUTION":
+        return "👀 WATCH (minor risk flags)"
+    return "✅ BUY"
 
 
 def _log_alert_signal(r: dict, tier: str, target_low: float, target_high: float) -> None:
@@ -278,9 +307,13 @@ def run() -> None:
                 r["whale_accum"] = conchain.whale_accumulation_delta(r["symbol"], signal)
             else:
                 r["whale_accum"] = None
+            # False Pearl Detection — warning-only, never blocks the alert
+            r["risk"] = risk_engine.assess_false_pearl_risk(platforms)
         except Exception as e:
             log.debug(f"whale accumulation check failed for {r['symbol']}: {e}")
             r["whale_accum"] = None
+            r["risk"] = {"available": False, "flags": [], "severity": "UNCHECKED",
+                          "detail": "risk check errored"}
 
     if fortress_alerts or swing_alerts:
         lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})", ""]
