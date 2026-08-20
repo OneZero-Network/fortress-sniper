@@ -151,15 +151,30 @@ def _format_alert_line(r: dict, tag: str, target_low: float, target_high: float,
         else:
             headline = f' — "{news["top_headline"][:70]}"' if news.get("top_headline") else ""
             news_line = f"   📰 News: {news['label']} ({news['headline_count']} posts){headline}"
+        buzz = news.get("social_buzz_count")
+        if buzz is not None:
+            news_line += f"\n   🐦 Social buzz (Twitter/Reddit via CryptoPanic, proxy not exact count): {buzz} posts"
+        if news.get("forward_catalyst"):
+            news_line += f"\n   🔮 Forward catalyst language detected: \"{news['forward_catalyst']}\" (verify before acting — not a probability estimate)"
     else:
         news_line = "   📰 News: n/a (CRYPTOPANIC_API_KEY not set)"
+
+    whale = r.get("whale_accum", {})
+    if whale.get("available"):
+        arrow = {"ACCUMULATING": "📈 whales adding", "DISTRIBUTING": "📉 whales reducing",
+                  "STABLE": "➡️ whales stable"}.get(whale["label"], whale["label"])
+        whale_line = f"\n   🐋 Big wallets ({whale['days_since_prior']}d trend): {arrow} (top10 Δ{whale['top10_delta_pct']:+.1f}%)"
+    elif r.get("whale_accum") is not None:
+        whale_line = "\n   🐋 Big wallets: no trend yet (need 2+ weekly snapshots)"
+    else:
+        whale_line = ""
 
     return (
         f"• <b>{r['symbol']}</b> [{tag}] conviction={r['conviction']} | target {target_low:.0f}-{target_high:.0f}%\n"
         f"   ENTRY ${r['entry']:.4f} at {entry_ts} UTC | SL ${r['stop_loss']:.4f}\n"
         f"   T1 ${r['r1']:.4f} (~{r['hold_days_t1']}d) | T2 ${r['r2']:.4f} (~{r['hold_days_t2']}d)\n"
         f"   Trend: {r['trend_label']}\n"
-        f"{news_line}\n"
+        f"{news_line}{whale_line}\n"
         f"   live=${r['live_price']:.4f} (drift {r['drift_pct']}%)"
     )
 
@@ -173,28 +188,42 @@ def run() -> None:
 
     watchlist = bridge_crypto.load_active_watchlist()
     log.info(f"PASS A: {len(watchlist)} active pearl(s) on crypto watchlist")
+    skip_count = 0
     for pearl in watchlist:
         try:
             r = score_symbol(pearl["symbol"], pearl["coin_id"], is_pearl=True, pearl_row=pearl)
-            if not r.get("skip"):
-                results.append(r)
-                if r["ignited"]:
-                    bridge_crypto.mark_ignited(r["symbol"], r["live_price"])
+            if r.get("skip"):
+                skip_count += 1
+                log.info(f"PASS A SKIP {pearl['symbol']}: {r.get('reason')}")
+                continue
+            results.append(r)
+            log.info(f"PASS A scored {r['symbol']}: conviction={r['conviction']} trigger={r['trigger_score']}")
+            if r["ignited"]:
+                bridge_crypto.mark_ignited(r["symbol"], r["live_price"])
         except Exception as e:
             log.warning(f"PASS A exception on {pearl.get('symbol')}: {e}")
+    if skip_count:
+        log.info(f"PASS A: {skip_count} pearl(s) skipped (insufficient OHLC history)")
 
     universe = cdata.fetch_universe(top_n=COLD_SCAN_TOP_N)
     watchlist_symbols = {p["symbol"] for p in watchlist}
     log.info(f"PASS B: cold-scanning {len(universe)} coins (excluding {len(watchlist_symbols)} already on watchlist)")
+    below_bar, skip_count_b = 0, 0
     for coin in universe:
         if coin["symbol"] in watchlist_symbols:
             continue
         try:
             r = score_symbol(coin["symbol"], coin["id"], is_pearl=False, coin_snapshot=coin)
-            if not r.get("skip") and r["conviction"] >= ccfg.DAILY_SWING_MIN:
+            if r.get("skip"):
+                skip_count_b += 1
+                continue
+            if r["conviction"] >= ccfg.DAILY_SWING_MIN:
                 results.append(r)
+            else:
+                below_bar += 1
         except Exception as e:
             log.warning(f"PASS B exception on {coin['symbol']}: {e}")
+    log.info(f"PASS B: {skip_count_b} skipped (insufficient history), {below_bar} scored below DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN})")
 
     results.sort(key=lambda r: r["conviction"], reverse=True)
 
@@ -203,8 +232,25 @@ def run() -> None:
 
     log.info(f"{len(fortress_alerts)} FORTRESS-tier + {len(swing_alerts)} SWING-tier candidate(s)")
 
+    # News sentiment AND whale-accumulation trend fetched ONLY for the
+    # shortlist that will actually be alerted — same selective-cost
+    # pattern as before, now extended to on-chain data too.
+    from core.crypto import onchain as conchain
+    coin_id_by_symbol = {p["symbol"]: p["coin_id"] for p in watchlist}
+    coin_id_by_symbol.update({c["symbol"]: c["id"] for c in universe})
     for r in (fortress_alerts + swing_alerts):
         r["news"] = news_sentiment.sentiment_summary(r["symbol"])
+        try:
+            cid = coin_id_by_symbol.get(r["symbol"])
+            platforms = cdata.fetch_platforms(cid) if cid else {}
+            if conchain.is_onchain_supported(platforms):
+                signal = conchain.whale_concentration_signal(platforms)
+                r["whale_accum"] = conchain.whale_accumulation_delta(r["symbol"], signal)
+            else:
+                r["whale_accum"] = None
+        except Exception as e:
+            log.debug(f"whale accumulation check failed for {r['symbol']}: {e}")
+            r["whale_accum"] = None
 
     if fortress_alerts or swing_alerts:
         lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})", ""]
