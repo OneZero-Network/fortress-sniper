@@ -112,9 +112,11 @@ def _format_candidate(c: dict) -> str:
         return f"   {emoji} {label}: {tier} ({v:.0f}/100)"
 
     lines = [
-        (f"<b>{c['symbol']}</b> — Discovery Score {c['discovery_score']}/100 "
-         f"(Evidence Completeness: {c['evidence_completeness_pct']}%)") if c["discovery_score"] is not None
-        else f"<b>{c['symbol']}</b> — Discovery Score n/a",
+        (f"<b>{c['symbol']}</b> [{c.get('universe_tier', 'UNKNOWN')}] — Discovery Score {c['discovery_score']}/100 "
+         f"(Evidence Completeness: {c['evidence_completeness_pct']}%)"
+         + (f" — top {c['tier_percentile']}% of {c.get('universe_tier')}" if c.get("tier_percentile") else "")
+         ) if c["discovery_score"] is not None
+        else f"<b>{c['symbol']}</b> [{c.get('universe_tier', 'UNKNOWN')}] — Discovery Score n/a",
         _fmt_comp("whale", "🐋", "Whale activity"),
         _fmt_comp("news", "📰", "News/catalyst"),
         _fmt_comp("liquidity", "💧", "Liquidity"),
@@ -211,18 +213,25 @@ def run() -> None:
     watchlist = bridge_crypto.load_active_watchlist()
     log.info(f"Watchlist: {len(watchlist)} pearl(s) from Incubator")
 
-    universe = cdata.fetch_universe(top_n=COLD_SCAN_TOP_N)
+    # ── v3.2 MULTI-UNIVERSE SCANNER — replaces the single ~60-coin flat
+    # scan. Fetches Large/Mid/Emerging tiers, applies a cheap pre-filter
+    # funnel (no extra API calls), and only the bounded shortlist that
+    # survives proceeds to expensive per-coin scoring below.
+    from core.crypto import multi_universe
+    shortlist = multi_universe.fetch_multi_universe_shortlist()
     watchlist_symbols = {p["symbol"] for p in watchlist}
     coin_id_by_symbol = {p["symbol"]: p["coin_id"] for p in watchlist}
-    coin_id_by_symbol.update({c["symbol"]: c["id"] for c in universe})
-    log.info(f"Cold scan: {len(universe)} coins (excluding {len(watchlist_symbols)} already on watchlist)")
+    coin_id_by_symbol.update({c["symbol"]: c["id"] for c in shortlist})
+    tier_by_symbol = {c["symbol"]: c["universe_tier"] for c in shortlist}
+    log.info(f"Multi-universe shortlist: {len(shortlist)} coins across "
+             f"{len(set(tier_by_symbol.values()))} tiers (excluding {len(watchlist_symbols)} already on watchlist)")
 
     # ── v2.9 PIPELINE DIAGNOSTIC — tracks every candidate through every
     # stage, including ones the old code silently dropped. Per explicit
     # instruction: this instruments the pipeline to find where it's
     # bottlenecking, WITHOUT changing the underlying discovery_score math
     # or any threshold.
-    universe_size = len(watchlist) + len(universe) - len(watchlist_symbols & {c["symbol"] for c in universe})
+    universe_size = len(watchlist) + len(shortlist) - len(watchlist_symbols & {c["symbol"] for c in shortlist})
     diag = {"universe": universe_size, "scanned": 0, "usable": 0, "entered_scorer": 0,
             "rejected_missing_data": 0, "rejected_false_pearl": 0, "rejected_insufficient_evidence": 0,
             "score_90plus": 0, "score_80_89": 0, "score_70_79": 0, "score_60_69": 0,
@@ -238,14 +247,21 @@ def run() -> None:
         if c:
             all_scored.append(c)
 
-    for coin in universe:
+    for coin in shortlist:
         if coin["symbol"] in watchlist_symbols:
             continue
         diag["scanned"] += 1
         c = _score_candidate(coin["symbol"], coin["id"], coin_snapshot=coin, is_watchlist_pearl=False)
         _tally_diagnostic(c, diag)
         if c:
+            c["universe_tier"] = coin["universe_tier"]
             all_scored.append(c)
+
+    for c in all_scored:
+        if "universe_tier" not in c:
+            c["universe_tier"] = "WATCHLIST"  # incubator pearls aren't rank-tiered
+
+    multi_universe.compute_within_tier_ranking(all_scored)
 
     all_scored.sort(key=lambda c: c["discovery_score"] or 0, reverse=True)
 
