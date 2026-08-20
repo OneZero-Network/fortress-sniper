@@ -26,6 +26,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          # Keyed by day so ignitions/pearls persist across today's runs;
+          # falls back to the most recent available DB from any prior day
+          # if today's key doesn't exist yet (first run of the day).
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
       - name: Run Crypto Sniper daily ignition scan
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
