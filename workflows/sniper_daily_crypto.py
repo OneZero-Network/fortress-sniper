@@ -158,6 +158,8 @@ def _tally_diagnostic(c: Optional[dict], diag: dict) -> None:
     reject = c.get("reject_reason")
     if tier == "PEARL":
         diag["final_pearl"] += 1
+    elif tier == "HIGH_POTENTIAL":
+        diag["final_high_potential"] += 1
     elif tier == "CANDIDATE":
         diag["final_candidate"] += 1
     elif tier == "WATCH":
@@ -208,7 +210,7 @@ def run() -> None:
     diag = {"universe": universe_size, "scanned": 0, "usable": 0, "entered_scorer": 0,
             "rejected_missing_data": 0, "rejected_false_pearl": 0, "rejected_insufficient_evidence": 0,
             "score_90plus": 0, "score_80_89": 0, "score_70_79": 0, "score_60_69": 0,
-            "final_pearl": 0, "final_candidate": 0, "final_watch": 0, "final_false_pearl": 0}
+            "final_pearl": 0, "final_high_potential": 0, "final_candidate": 0, "final_watch": 0, "final_false_pearl": 0}
 
     all_scored: List[dict] = []  # every candidate that got a discovery_score, regardless of tier
 
@@ -232,13 +234,15 @@ def run() -> None:
     all_scored.sort(key=lambda c: c["discovery_score"] or 0, reverse=True)
 
     pearl_tier = [c for c in all_scored if c.get("tier") == "PEARL"]
+    high_potential_tier = [c for c in all_scored if c.get("tier") == "HIGH_POTENTIAL"]
     candidate_tier = [c for c in all_scored if c.get("tier") == "CANDIDATE"]
     watch_tier = [c for c in all_scored if c.get("tier") == "WATCH"]
     false_pearl_tier = [c for c in all_scored if c.get("tier") == "FALSE_PEARL"]
 
     # keep the old grouping names for the rest of the message-building
-    # code below — pearl+candidate tiers both surface as "investigate"
-    pearl_candidates = pearl_tier + candidate_tier
+    # code below — pearl+high-potential+candidate tiers all surface as
+    # "investigate", HIGH_POTENTIAL is displayed in its own section below
+    pearl_candidates = pearl_tier + high_potential_tier + candidate_tier
     watch_candidates = watch_tier
     avoid_candidates = false_pearl_tier
 
@@ -289,8 +293,8 @@ def run() -> None:
         f"insufficient evidence: {diag['rejected_insufficient_evidence']}\n"
         f"Score distribution — 90+: {diag['score_90plus']} | 80-89: {diag['score_80_89']} | "
         f"70-79: {diag['score_70_79']} | 60-69: {diag['score_60_69']}\n"
-        f"Final — ⭐ Pearls: {diag['final_pearl']} | 🔎 Candidates: {diag['final_candidate']} | "
-        f"👀 Watch: {diag['final_watch']} | 🚫 False Pearls: {diag['final_false_pearl']}\n"
+        f"Final — ⭐ Pearls: {diag['final_pearl']} | 🔎 High-Potential: {diag['final_high_potential']} | "
+        f"Candidates: {diag['final_candidate']} | 👀 Watch: {diag['final_watch']} | 🚫 False Pearls: {diag['final_false_pearl']}\n"
     )
 
     header = (
@@ -305,12 +309,22 @@ def run() -> None:
         f"{diagnostic_block}"
     )
 
-    if pearl_tier or candidate_tier or watch_candidates or avoid_candidates:
+    if pearl_tier or high_potential_tier or candidate_tier or watch_candidates or avoid_candidates:
         lines = [header]
         if pearl_tier:
             lines.append(f"\n━━━ ⭐ PEARLS ({len(pearl_tier)}) ━━━\n")
             for c in pearl_tier[:10]:
                 lines.append(_format_candidate(c))
+                lines.append("")
+        if high_potential_tier:
+            lines.append(f"\n━━━ 🔎 HIGH-POTENTIAL ({len(high_potential_tier)}) — score clears 80, but evidence coverage is incomplete ━━━\n")
+            for c in high_potential_tier[:10]:
+                missing = [n for n in ("whale", "news", "liquidity", "structure", "onchain")
+                           if n not in c.get("components_available", [])]
+                lines.append(f"<b>{c['symbol']}</b> — Score {c['discovery_score']}/100 "
+                             f"(Evidence completeness {c['evidence_completeness_pct']}%)\n"
+                             f"   Missing: {', '.join(missing) if missing else 'none'}\n"
+                             f"   Status: insufficient evidence for Pearl — worth a manual look")
                 lines.append("")
         if candidate_tier:
             lines.append(f"\n━━━ 🔎 CANDIDATES ({len(candidate_tier)}) — interesting but incomplete evidence ━━━\n")
@@ -334,13 +348,14 @@ def run() -> None:
     send_telegram(message)
 
     try:
-        header_row = ["symbol", "is_watchlist_pearl", "discovery_score", "whale", "news", "liquidity",
-                      "structure", "onchain", "false_pearl_risk_pct", "status", "reasons_why"]
-        rows = [[c["symbol"], c["is_watchlist_pearl"], c["discovery_score"],
+        header_row = ["symbol", "is_watchlist_pearl", "discovery_score", "evidence_completeness_pct", "tier",
+                      "whale", "news", "liquidity", "structure", "onchain",
+                      "false_pearl_risk_pct", "status", "reasons_why"]
+        rows = [[c["symbol"], c["is_watchlist_pearl"], c["discovery_score"], c["evidence_completeness_pct"], c["tier"],
                  c["components"].get("whale"), c["components"].get("news"), c["components"].get("liquidity"),
                  c["components"].get("structure"), c["components"].get("onchain"),
                  c["false_pearl_risk_pct"], c["status"], "; ".join(c["reasons_why"])]
-                for c in candidates]
+                for c in all_scored]
         push_sheet("CRYPTO_PEARL_CANDIDATES", [header_row] + rows)
     except Exception as e:
         log.warning(f"Sheet push CRYPTO_PEARL_CANDIDATES failed: {e}")
