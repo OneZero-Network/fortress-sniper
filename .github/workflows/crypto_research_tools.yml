@@ -1,0 +1,86 @@
+name: Fortress Crypto Research Tools (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: 'Which research tool to run'
+        required: true
+        type: choice
+        default: 'backtest_matrix'
+        options:
+          - backtest_matrix
+          - v5_falsification_test
+          - regime_audit_v1
+          - f1_false_pearl
+          - regime_v2_calibration
+
+concurrency:
+  group: fortress-crypto-research-tools
+  cancel-in-progress: true
+
+jobs:
+  run-research-tool:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        # Some tools (V5, Regime Audit) don't strictly need this, but
+        # restoring is harmless and keeps this workflow simple to run any
+        # of the five tools without per-tool cache logic.
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run selected research tool
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          CRYPTOPANIC_API_KEY: ${{ secrets.CRYPTOPANIC_API_KEY }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+          BSCSCAN_API_KEY: ${{ secrets.BSCSCAN_API_KEY }}
+          POLYGONSCAN_API_KEY: ${{ secrets.POLYGONSCAN_API_KEY }}
+        run: |
+          case "${{ inputs.script }}" in
+            backtest_matrix)
+              python scripts/backtest_crypto.py
+              ;;
+            v5_falsification_test)
+              python scripts/backtest_v5.py
+              ;;
+            regime_audit_v1)
+              python scripts/regime_audit_v1.py
+              ;;
+            f1_false_pearl)
+              python scripts/experiment_f1_false_pearl.py
+              ;;
+            regime_v2_calibration)
+              python scripts/calibrate_regime_v2.py
+              ;;
+            *)
+              echo "Unknown script selection: ${{ inputs.script }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-tool-${{ inputs.script }}-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30
