@@ -96,6 +96,52 @@ def _onchain_component(onchain_quality: Optional[float]) -> Optional[float]:
     return onchain_quality  # already 0-100 from onchain.onchain_quality_score_0_100
 
 
+MIN_COMPONENTS_FOR_TIERING = 2  # need at least 2/5 components to enter tiering; below this = "insufficient evidence"
+
+
+def classify_tier(discovery_score: Optional[float], components_available: list,
+                   false_pearl_risk_pct: int) -> dict:
+    """v2.9 — 4-tier classification, per explicit instruction: this does
+    NOT change the underlying discovery_score math, only how results get
+    bucketed and reported. The old binary INVESTIGATE/WATCH/AVOID status
+    stays available for backward compatibility; this adds the richer
+    diagnostic categories on top.
+
+    Returns {"tier": str, "reject_reason": str|None} where tier is one
+    of: PEARL, CANDIDATE, WATCH, FALSE_PEARL, or None (not surfaced —
+    reject_reason explains why: MISSING_DATA or INSUFFICIENT_EVIDENCE)."""
+    n_available = len(components_available)
+    evidence_completeness_pct = round(100.0 * n_available / 5, 1)
+
+    if false_pearl_risk_pct >= 70:
+        return {"tier": "FALSE_PEARL", "reject_reason": None,
+                "evidence_completeness_pct": evidence_completeness_pct}
+
+    if n_available == 0:
+        return {"tier": None, "reject_reason": "MISSING_DATA",
+                "evidence_completeness_pct": evidence_completeness_pct}
+
+    if n_available < MIN_COMPONENTS_FOR_TIERING:
+        return {"tier": None, "reject_reason": "INSUFFICIENT_EVIDENCE",
+                "evidence_completeness_pct": evidence_completeness_pct}
+
+    if discovery_score is None:
+        return {"tier": None, "reject_reason": "MISSING_DATA",
+                "evidence_completeness_pct": evidence_completeness_pct}
+
+    if discovery_score >= 80 and evidence_completeness_pct >= 60:
+        tier = "PEARL"
+    elif discovery_score >= 60:
+        tier = "CANDIDATE"
+    elif discovery_score >= 45:
+        tier = "WATCH"
+    else:
+        return {"tier": None, "reject_reason": "INSUFFICIENT_EVIDENCE",
+                "evidence_completeness_pct": evidence_completeness_pct}
+
+    return {"tier": tier, "reject_reason": None, "evidence_completeness_pct": evidence_completeness_pct}
+
+
 def compute_false_pearl_risk_pct(risk: dict) -> int:
     severity = risk.get("severity", "UNCHECKED") if risk else "UNCHECKED"
     return _FALSE_PEARL_RISK_PCT.get(severity, 50)
@@ -125,6 +171,7 @@ def compute_pearl_score(symbol: str, coin_snapshot: Optional[dict], whale_accum:
         discovery_score = None
 
     false_pearl_risk_pct = compute_false_pearl_risk_pct(risk)
+    tier_result = classify_tier(discovery_score, list(available.keys()), false_pearl_risk_pct)
 
     # ── STATUS — structurally cannot return BUY; only these three ──────
     if false_pearl_risk_pct >= 70:
@@ -159,6 +206,8 @@ def compute_pearl_score(symbol: str, coin_snapshot: Optional[dict], whale_accum:
     return {
         "symbol": symbol, "discovery_score": discovery_score, "components": components,
         "components_available": list(available.keys()),
+        "evidence_completeness_pct": tier_result["evidence_completeness_pct"],
+        "tier": tier_result["tier"], "reject_reason": tier_result["reject_reason"],
         "false_pearl_risk_pct": false_pearl_risk_pct, "status": status,
         "reasons_why": reasons, "invalidation_conditions": invalidators,
     }
