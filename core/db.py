@@ -228,6 +228,7 @@ def init_crypto_tables() -> None:
             false_pearl_risk_pct    INTEGER,
             risk_severity_at_discovery TEXT,
             status_at_discovery     TEXT,
+            tier_at_discovery       TEXT,
             why_it_surfaced         TEXT,
             invalidation_conditions TEXT,
             -- resolution columns — appended over time, never backfilled early
@@ -243,7 +244,39 @@ def init_crypto_tables() -> None:
             failure_reason          TEXT,
             terminal_return_pct     REAL
         );
+
+        -- ═══ v3.1 MEASUREMENT SCAFFOLD ═══ One row per calendar day.
+        -- data_period_label lets you tag which days belong to which
+        -- experiment ('FREE_BASELINE', 'PAID_WHALE', etc) — set via the
+        -- CRYPTO_DATA_PERIOD_LABEL env var, defaults to FREE_BASELINE.
+        CREATE TABLE IF NOT EXISTS crypto_daily_metrics (
+            date                        TEXT PRIMARY KEY,
+            data_period_label           TEXT DEFAULT 'FREE_BASELINE',
+            assets_scanned              INTEGER,
+            entered_scorer              INTEGER,
+            avg_completeness_pct        REAL,
+            median_completeness_pct     REAL,
+            high_potential_count        INTEGER,
+            pearl_count                 INTEGER,
+            candidate_count             INTEGER,
+            watch_count                 INTEGER,
+            false_pearl_count           INTEGER,
+            missing_data_rejection_count INTEGER,
+            insufficient_evidence_count INTEGER,
+            top_pearl_score             REAL,
+            top_high_potential_score    REAL,
+            avg_discovery_score         REAL
+        );
         """)
+        # Self-migrating column addition for databases created before this
+        # column existed — avoids another manual paste-into-GitHub step.
+        # Safe no-op if the column is already present.
+        try:
+            con.execute("ALTER TABLE crypto_pearl_observations ADD COLUMN tier_at_discovery TEXT")
+            con.commit()
+            log.info("Migrated: added tier_at_discovery column to crypto_pearl_observations")
+        except Exception:
+            pass  # column already exists — expected on every run after the first
     log.info(f"Crypto tables initialized in {DB_PATH}")
 
 
@@ -454,8 +487,8 @@ def save_pearl_observation(snapshot: dict) -> int:
                  evidence_level, evidence_label, whale_score, whale_label_at_discovery,
                  news_score, news_label_at_discovery, liquidity_score, structure_score,
                  onchain_score, false_pearl_risk_pct, risk_severity_at_discovery,
-                 status_at_discovery, why_it_surfaced, invalidation_conditions)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 status_at_discovery, tier_at_discovery, why_it_surfaced, invalidation_conditions)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             snapshot["symbol"], snapshot["coin_id"], now, snapshot["price_at_observation"],
             snapshot["discovery_score"], snapshot["evidence_level"], snapshot["evidence_label"],
@@ -464,6 +497,7 @@ def save_pearl_observation(snapshot: dict) -> int:
             snapshot.get("liquidity_score"), snapshot.get("structure_score"),
             snapshot.get("onchain_score"), snapshot["false_pearl_risk_pct"],
             snapshot["risk_severity_at_discovery"], snapshot["status_at_discovery"],
+            snapshot.get("tier_at_discovery"),
             snapshot["why_it_surfaced"], snapshot["invalidation_conditions"],
         ))
         return cur.lastrowid
@@ -531,3 +565,93 @@ def get_pearl_flywheel_stats() -> dict:
             "SELECT lifecycle_state, COUNT(*) FROM crypto_pearl_observations GROUP BY lifecycle_state"
         ).fetchall()
     return {state: count for state, count in rows}
+
+
+def save_daily_metrics(metrics: dict) -> None:
+    """One row per calendar day — INSERT OR REPLACE so a re-run on the
+    same day overwrites rather than duplicates. data_period_label is the
+    tag that lets the rollup compare 'FREE_BASELINE' days against
+    'PAID_WHALE' (or whichever) days later."""
+    from datetime import datetime as _dt
+    today = _dt.today().strftime("%Y-%m-%d")
+    with get_conn(write=True) as con:
+        con.execute("""
+            INSERT INTO crypto_daily_metrics
+                (date, data_period_label, assets_scanned, entered_scorer,
+                 avg_completeness_pct, median_completeness_pct, high_potential_count,
+                 pearl_count, candidate_count, watch_count, false_pearl_count,
+                 missing_data_rejection_count, insufficient_evidence_count,
+                 top_pearl_score, top_high_potential_score, avg_discovery_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(date) DO UPDATE SET
+                data_period_label=excluded.data_period_label,
+                assets_scanned=excluded.assets_scanned, entered_scorer=excluded.entered_scorer,
+                avg_completeness_pct=excluded.avg_completeness_pct,
+                median_completeness_pct=excluded.median_completeness_pct,
+                high_potential_count=excluded.high_potential_count, pearl_count=excluded.pearl_count,
+                candidate_count=excluded.candidate_count, watch_count=excluded.watch_count,
+                false_pearl_count=excluded.false_pearl_count,
+                missing_data_rejection_count=excluded.missing_data_rejection_count,
+                insufficient_evidence_count=excluded.insufficient_evidence_count,
+                top_pearl_score=excluded.top_pearl_score, top_high_potential_score=excluded.top_high_potential_score,
+                avg_discovery_score=excluded.avg_discovery_score
+        """, (today, metrics.get("data_period_label", "FREE_BASELINE"),
+              metrics["assets_scanned"], metrics["entered_scorer"],
+              metrics.get("avg_completeness_pct"), metrics.get("median_completeness_pct"),
+              metrics["high_potential_count"], metrics["pearl_count"], metrics["candidate_count"],
+              metrics["watch_count"], metrics["false_pearl_count"],
+              metrics["missing_data_rejection_count"], metrics["insufficient_evidence_count"],
+              metrics.get("top_pearl_score"), metrics.get("top_high_potential_score"),
+              metrics.get("avg_discovery_score")))
+
+
+def get_daily_metrics_by_period(period_label: str) -> list:
+    cols = ["date", "assets_scanned", "entered_scorer", "avg_completeness_pct",
+            "median_completeness_pct", "high_potential_count", "pearl_count", "candidate_count",
+            "watch_count", "false_pearl_count", "missing_data_rejection_count",
+            "insufficient_evidence_count", "top_pearl_score", "top_high_potential_score",
+            "avg_discovery_score"]
+    with get_conn() as con:
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM crypto_daily_metrics WHERE data_period_label=? ORDER BY date",
+            (period_label,)
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_pearl_quality_by_tier() -> dict:
+    """The metric your mentor specifically warned we'd be missing
+    without it: does a higher tier actually perform better forward, or
+    are we just relabeling? Groups resolved pearl observations by
+    tier_at_discovery and reports average return at each horizon."""
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT tier_at_discovery, return_24h_pct, return_3d_pct, return_7d_pct,
+                   resolved_24h, resolved_3d, resolved_7d, lifecycle_state
+            FROM crypto_pearl_observations
+            WHERE tier_at_discovery IS NOT NULL
+        """).fetchall()
+
+    by_tier: dict = {}
+    for tier, r24, r3d, r7d, res24, res3d, res7d, lifecycle in rows:
+        d = by_tier.setdefault(tier, {"n": 0, "r24": [], "r3d": [], "r7d": [], "invalidated": 0})
+        d["n"] += 1
+        if res24 and r24 is not None:
+            d["r24"].append(r24)
+        if res3d and r3d is not None:
+            d["r3d"].append(r3d)
+        if res7d and r7d is not None:
+            d["r7d"].append(r7d)
+        if lifecycle == "INVALIDATED":
+            d["invalidated"] += 1
+
+    out = {}
+    for tier, d in by_tier.items():
+        out[tier] = {
+            "n": d["n"], "invalidated_count": d["invalidated"],
+            "avg_return_24h": round(sum(d["r24"]) / len(d["r24"]), 2) if d["r24"] else None,
+            "avg_return_3d": round(sum(d["r3d"]) / len(d["r3d"]), 2) if d["r3d"] else None,
+            "avg_return_7d": round(sum(d["r7d"]) / len(d["r7d"]), 2) if d["r7d"] else None,
+            "n_resolved_24h": len(d["r24"]), "n_resolved_3d": len(d["r3d"]), "n_resolved_7d": len(d["r7d"]),
+        }
+    return out
