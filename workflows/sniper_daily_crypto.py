@@ -40,7 +40,7 @@ from typing import List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.db import init_crypto_tables
+from core.db import init_crypto_tables, log_signal
 from core.telegram import send as send_telegram
 from core.sheets_client import push_sheet
 from core.indicators import compute_indicators
@@ -48,6 +48,7 @@ from core.crypto import config as ccfg
 from core.crypto import data as cdata
 from core.crypto import bridge_crypto
 from core.crypto import news_sentiment
+from core.crypto import outcome_tracker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -179,9 +180,38 @@ def _format_alert_line(r: dict, tag: str, target_low: float, target_high: float,
     )
 
 
+def _log_alert_signal(r: dict, tier: str, target_low: float, target_high: float) -> None:
+    """Writes this alert into crypto_signal_log so outcome_tracker.py can
+    check it against real price action on future runs. This is the first
+    link in the flywheel — every alert that goes out gets tracked, no
+    exceptions, so hit-rate stats are never selectively computed only on
+    the signals that happened to do well."""
+    try:
+        log_signal({
+            "symbol": r["symbol"], "tier": tier, "entry_price": r["entry"],
+            "stop_loss": r["stop_loss"], "r1": r["r1"], "r2": r["r2"],
+            "conviction": r["conviction"], "trigger_score": r["trigger_score"],
+            "trend_label": r["trend_label"],
+            "news_label": r.get("news", {}).get("label"),
+            "forward_catalyst": r.get("news", {}).get("forward_catalyst"),
+            "whale_label": r.get("whale_accum", {}).get("label") if r.get("whale_accum") else None,
+            "is_pearl": r["is_pearl"], "ignited": r["ignited"],
+            "target_low_pct": target_low, "target_high_pct": target_high,
+        })
+    except Exception as e:
+        log.warning(f"Failed to log signal for {r['symbol']}: {e}")
+
+
 def run() -> None:
     log.info(f"=== {ccfg.VERSION} — SNIPER (daily ignition scan) ===")
     init_crypto_tables()
+
+    # ── OUTCOME TRACKER — check yesterday's open signals FIRST, before
+    # scoring anything new. This is the flywheel: every prior alert gets
+    # checked against real price action and resolved (WIN/LOSS/TIMEOUT)
+    # before today's new candidates are even scanned.
+    outcome_summary = outcome_tracker.check_and_resolve_open_signals()
+
     entry_ts = datetime.now(timezone.utc).strftime("%H:%M")
 
     results: List[dict] = []
@@ -259,17 +289,22 @@ def run() -> None:
             for r in fortress_alerts[:10]:
                 tag = "🦪🔥PEARL+IGNITED" if (r["is_pearl"] and r["ignited"]) else ("🦪PEARL" if r["is_pearl"] else "COLD-SCAN")
                 lines.append(_format_alert_line(r, tag, ccfg.PEARL_TARGET_LOW_PCT, ccfg.PEARL_TARGET_HIGH_PCT, entry_ts))
+                _log_alert_signal(r, "FORTRESS", ccfg.PEARL_TARGET_LOW_PCT, ccfg.PEARL_TARGET_HIGH_PCT)
             lines.append("")
         if swing_alerts:
             lines.append(f"⚡ <b>DAILY SWING-tier (shorter horizon, target {ccfg.DAILY_SWING_TARGET_LOW_PCT:.0f}-{ccfg.DAILY_SWING_TARGET_HIGH_PCT:.0f}%)</b>")
             for r in swing_alerts[:10]:
                 lines.append(_format_alert_line(r, "SWING", ccfg.DAILY_SWING_TARGET_LOW_PCT, ccfg.DAILY_SWING_TARGET_HIGH_PCT, entry_ts))
+                _log_alert_signal(r, "SWING", ccfg.DAILY_SWING_TARGET_LOW_PCT, ccfg.DAILY_SWING_TARGET_HIGH_PCT)
+        lines.append("")
+        lines.append(outcome_tracker.format_stats_summary())
         send_telegram("\n".join(lines))
     else:
         send_telegram(
             f"ℹ️ FORTRESS_CRYPTO Daily Scan ({datetime.now(timezone.utc).strftime('%Y-%m-%d')}): "
             f"ran successfully, {len(results)} candidate(s) scored, "
-            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}). No trade alert today."
+            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}). No trade alert today.\n\n"
+            f"{outcome_tracker.format_stats_summary()}"
         )
 
     try:
