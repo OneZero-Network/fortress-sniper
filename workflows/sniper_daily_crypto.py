@@ -1,389 +1,219 @@
 #!/usr/bin/env python3
 """
-FORTRESS_CRYPTO — workflows/sniper_daily_crypto.py  (v1.1 — diving-skill layers)
+FORTRESS_CRYPTO — workflows/sniper_daily_crypto.py  (v2.7 — Pearl Detection Machine)
 ══════════════════════════════════════════════════════════════════════════════
-v1.1 adds the layers that separate this from a generic screener (the
-"metal detector" everyone has) into something with an actual edge (the
-"diving skill" that finds what the detector alone can't):
+PRODUCT REDEFINITION, per explicit mandate: Fortress does not predict the
+market. It finds assets showing an unusual, evidence-backed combination
+of positive signals, filters out obvious contract-level traps, explains
+exactly why each candidate surfaced, and states what would invalidate
+the thesis. Research (regime v2, W1/N1, F1, backtesting) continues in
+parallel via scripts/*.py and can PROMOTE a layer into higher authority
+here later — see core/crypto/evidence.py for the promotion mechanism.
 
-  1. TREND CONTEXT (free — uses data already fetched): a setup fighting
-     its own 30-day trend gets penalized; a setup WITH the trend gets a
-     bonus, even at equal raw technical score.
-  2. NEWS SENTIMENT (CryptoPanic, optional key): applied SELECTIVELY to
-     candidates that already cleared the technical bar — reading the
-     news on a shortlist, not blanket-scanning 150 coins for headlines.
-     A breakout with a real catalyst behind it outranks a bare technical
-     wick at equal score.
-  3. TWO-TIER ALERTING — the v1.0 bug where daily consistently returned
-     0: LANE_FUSED_MIN (60) is a "fortress-grade" bar, the same one the
-     weekly Incubator's best pearls clear. A daily 10-20%-target swing
-     candidate is a genuinely different, shorter-horizon, lower-
-     conviction category and needed its OWN bar (DAILY_SWING_MIN=42),
-     not a globally-lowered threshold that would blur the two tiers.
-  4. ENTRY/EXIT TIMING — every alert now states the exact UTC entry
-     timestamp (this run's time) and an ESTIMATED holding window derived
-     from the position's own volatility (ATR-implied days-to-target),
-     not a fixed number pulled from nowhere.
+WHAT CHANGED FROM THE OLD SNIPER: the RSI/ADX/volume "trigger" and
+regime v1 are REJECTED (core/crypto/evidence.py) and have been REMOVED
+from this file entirely — not down-weighted, removed. Discovery now
+comes from core/crypto/pearl_score.py: whale accumulation, news
+sentiment, liquidity health, descriptive price structure, and on-chain
+concentration health. False-Pearl risk (contract security) can veto a
+candidate outright regardless of how good everything else looks.
 
-PASS A: watchlist priority scan (pearls, target 25-50% per Incubator's
-        deeper thesis — see PEARL_TARGET_LOW/HIGH_PCT).
-PASS B: broad cold scan (target 10-20% — DAILY_SWING_TARGET_LOW/HIGH_PCT),
-        split into FORTRESS tier (>=LANE_FUSED_MIN) and SWING tier
-        (>=DAILY_SWING_MIN, <LANE_FUSED_MIN).
+OUTPUT: every candidate is labeled "🔎 PEARL CANDIDATE — INVESTIGATE",
+"👀 WATCH", or "🚫 AVOID (false-pearl risk)" — never BUY. That's
+structurally enforced in pearl_score.py, not just a convention here.
+
+The Evidence Level banner (currently Level 0 across every contributing
+layer — see evidence.py) appears at the top of every message. This is
+not a footnote; it's the single most important piece of context for
+deciding how much to trust anything below it.
 """
 from __future__ import annotations
 import logging
 import os
 import sys
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.db import init_crypto_tables, log_signal
+from core.db import init_crypto_tables
 from core.telegram import send as send_telegram
 from core.sheets_client import push_sheet
-from core.indicators import compute_indicators
 from core.crypto import config as ccfg
 from core.crypto import data as cdata
 from core.crypto import bridge_crypto
 from core.crypto import news_sentiment
-from core.crypto import outcome_tracker
+from core.crypto import onchain
 from core.crypto import risk_engine
 from core.crypto import regime as regime_module
+from core.crypto import evidence
+from core.crypto import pearl_score
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
-log = logging.getLogger("fortress.crypto.sniper")
+log = logging.getLogger("fortress.crypto.pearl_finder")
 
 COLD_SCAN_TOP_N = int(os.getenv("CRYPTO_COLD_SCAN_TOP_N", "60"))
 
 
-def _macro_subscore() -> float:
-    """DEPRECATED — kept only so nothing else that imports this breaks.
-    The real regime read now lives in core/crypto/regime.py and is
-    computed ONCE per run (not per-coin, to avoid re-fetching BTC data
-    58+ times) and threaded through score_symbol() as a parameter."""
-    return 50.0
-
-
-def _trend_context(coin_snapshot: dict) -> dict:
-    """Free trend read using pct_7d/pct_30d already present in the
-    universe payload — no extra API call. Returns a bonus/penalty and a
-    human-readable label for the Telegram alert."""
-    pct_7d = coin_snapshot.get("pct_7d")
-    pct_30d = coin_snapshot.get("pct_30d")
-    if pct_7d is None and pct_30d is None:
-        return {"adjustment": 0.0, "label": "TREND_UNKNOWN"}
-    p7 = pct_7d or 0.0
-    p30 = pct_30d or 0.0
-    if p30 > 5 and p7 > 0:
-        return {"adjustment": ccfg.TREND_ALIGNED_BONUS, "label": f"UPTREND (30d {p30:+.1f}%, 7d {p7:+.1f}%)"}
-    if p30 < -15:
-        return {"adjustment": -ccfg.TREND_AGAINST_PENALTY, "label": f"DOWNTREND (30d {p30:+.1f}%) — fighting the trend"}
-    return {"adjustment": 0.0, "label": f"SIDEWAYS (30d {p30:+.1f}%, 7d {p7:+.1f}%)"}
-
-
-def _estimated_hold_days(entry: float, target: float, atr14: float) -> float:
-    """ATR-implied rough days-to-target: how many 'average daily ranges'
-    fit inside the distance to target. This is a coarse heuristic, not a
-    prediction — labeled as an ESTIMATE in the alert, not a promise."""
-    if atr14 <= 0 or target <= entry:
-        return 0.0
-    distance = target - entry
-    days = distance / (atr14 * 0.45)
-    return round(max(0.5, min(30.0, days)), 1)
-
-
-def score_symbol(symbol: str, coin_id: str, is_pearl: bool, pearl_row: dict = None,
-                  coin_snapshot: dict = None, macro_score: float = 50.0) -> dict:
-    hist = cdata.fetch_daily_ohlc(coin_id, days=95)
-    if hist.empty or len(hist) < 25:
-        return {"symbol": symbol, "skip": True,
-                "reason": f"insufficient OHLC history ({len(hist)} rows returned, need >=25)"}
-
-    ind = compute_indicators(hist)
-    close = float(hist["close"].iloc[-1])
-    atr14 = ind.get("atr14", 0.0)
-    if atr14 <= 0:
-        atr14 = close * 0.02
-
-    ignition = bridge_crypto.check_ignition(pearl_row or {"symbol": symbol}, hist)
-
-    stop_loss = round(max(close - atr14 * ccfg.ATR_MULT_TREND, close * 0.75), 6)
-    risk_per_unit = close - stop_loss
-    r1 = round(close + risk_per_unit * 1.5, 6)
-    r2 = round(close + risk_per_unit * 3.0, 6)
-
-    rsi = ind.get("rsi14", 50.0)
-    adx = ind.get("adx14", 0.0)
-    trigger_raw = min(100.0, max(0.0,
-        (min(rsi, 70) / 70 * 40) +
-        (min(adx, 40) / 40 * 30) +
-        (min(ignition["vol_ratio"], 3.0) / 3.0 * 30)
-    ))
-
-    trend = _trend_context(coin_snapshot or {})
-    trigger_adjusted = max(0.0, min(100.0, trigger_raw + trend["adjustment"]))
-
-    thesis_score = pearl_row.get("incubator_score", 50.0) if (is_pearl and pearl_row) else 50.0
-    entry_score = 100.0
-
-    fused = bridge_crypto.apply_pedigree_bonus(trigger_adjusted, is_pearl, ignition["ignited"])
-    conviction = bridge_crypto.unified_conviction(thesis_score, fused, macro_score, entry_score)
-
-    live_price = cdata.fetch_live_price_binance(symbol) or close
-    drift_pct = round(100.0 * (live_price - close) / close, 2) if close else 0.0
-
-    return {
-        "symbol": symbol, "skip": False, "close": close, "live_price": live_price,
-        "drift_pct": drift_pct, "is_pearl": is_pearl, "ignited": ignition["ignited"],
-        "ignition_reason": ignition["reason"], "trigger_score": round(trigger_adjusted, 1),
-        "conviction": conviction, "rsi14": round(rsi, 1), "adx14": round(adx, 1),
-        "entry": close, "stop_loss": stop_loss, "r1": r1, "r2": r2, "atr14": atr14,
-        "trend_label": trend["label"],
-        "hold_days_t1": _estimated_hold_days(close, r1, atr14),
-        "hold_days_t2": _estimated_hold_days(close, r2, atr14),
-    }
-
-
-def _format_alert_line(r: dict, tag: str, target_low: float, target_high: float, entry_ts: str) -> str:
-    news = r.get("news", {})
-    if news.get("available"):
-        if news["label"] == "SILENT":
-            news_line = "   📰 No recent news — pure technical setup, no catalyst confirmed"
-        else:
-            headline = f' — "{news["top_headline"][:70]}"' if news.get("top_headline") else ""
-            news_line = f"   📰 News: {news['label']} ({news['headline_count']} posts){headline}"
-        buzz = news.get("social_buzz_count")
-        if buzz is not None:
-            news_line += f"\n   🐦 Social buzz (Twitter/Reddit via CryptoPanic, proxy not exact count): {buzz} posts"
-        if news.get("forward_catalyst"):
-            news_line += f"\n   🔮 Forward catalyst language detected: \"{news['forward_catalyst']}\" (verify before acting — not a probability estimate)"
-    else:
-        news_line = "   📰 News: n/a (CRYPTOPANIC_API_KEY not set)"
-
-    whale = r.get("whale_accum") or {}
-    if whale.get("available"):
-        arrow = {"ACCUMULATING": "📈 whales adding", "DISTRIBUTING": "📉 whales reducing",
-                  "STABLE": "➡️ whales stable"}.get(whale["label"], whale["label"])
-        whale_line = f"\n   🐋 Big wallets ({whale['days_since_prior']}d trend): {arrow} (top10 Δ{whale['top10_delta_pct']:+.1f}%)"
-    elif r.get("whale_accum") is not None:
-        whale_line = "\n   🐋 Big wallets: no trend yet (need 2+ weekly snapshots)"
-    else:
-        whale_line = ""
-
-    risk = r.get("risk", {})
-    if risk.get("available") and risk.get("flags"):
-        risk_line = f"\n   🔍 False-pearl check ({risk['severity']}): " + "; ".join(risk["flags"])
-    elif risk.get("available"):
-        risk_line = f"\n   🔍 False-pearl check: CLEAN — no red flags found"
-    else:
-        risk_line = f"\n   🔍 False-pearl check: unchecked (non-EVM token or check unavailable)"
-
-    decision = _decision_label(r, risk)
-
-    return (
-        f"• <b>{r['symbol']}</b> [{tag}] conviction={r['conviction']} | target {target_low:.0f}-{target_high:.0f}% | <b>{decision}</b>\n"
-        f"   ENTRY ${r['entry']:.4f} at {entry_ts} UTC | SL ${r['stop_loss']:.4f}\n"
-        f"   T1 ${r['r1']:.4f} (~{r['hold_days_t1']}d) | T2 ${r['r2']:.4f} (~{r['hold_days_t2']}d)\n"
-        f"   Trend: {r['trend_label']}\n"
-        f"{news_line}{whale_line}{risk_line}\n"
-        f"   live=${r['live_price']:.4f} (drift {r['drift_pct']}%)"
-    )
-
-
-def _decision_label(r: dict, risk: dict) -> str:
-    """QUARANTINED per Regime Audit v1 findings (backtest_v5.py /
-    regime_audit_v1.py): FORTRESS Technical Core v1 is REJECTED for
-    deployment — regime-gated validation showed a -74.19% compounded
-    return at realistic position sizing, the apparent +0.93% average was
-    carried by 5 outlier trades (removing them flips it negative), and
-    the regime classifier itself was wrong 63.6%-100% of the time
-    (BULL/NORMAL_VOL calls not followed by BTC actually rising).
-
-    This function NO LONGER RETURNS 'BUY' under any circumstances. It
-    still surfaces the false-pearl risk flag (that layer is independently
-    built, just not yet statistically validated — different status from
-    'rejected') for research visibility, but nothing from this pipeline
-    should be read as a trade instruction until a validated signal layer
-    replaces the technical core."""
-    severity = risk.get("severity", "UNCHECKED")
-    if severity == "HIGH_RISK":
-        return "🚫 AVOID (false-pearl risk)"
-    return "🔬 RESEARCH ONLY — technical core rejected, not a trade signal"
-
-
-def _log_alert_signal(r: dict, tier: str, target_low: float, target_high: float) -> None:
-    """Writes this alert into crypto_signal_log so outcome_tracker.py can
-    check it against real price action on future runs. This is the first
-    link in the flywheel — every alert that goes out gets tracked, no
-    exceptions, so hit-rate stats are never selectively computed only on
-    the signals that happened to do well."""
+def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
+                      is_watchlist_pearl: bool, pearl_thesis: Optional[str] = None) -> Optional[dict]:
+    """Fetches whale/news/risk/on-chain signals for one candidate and
+    runs them through pearl_score.compute_pearl_score(). Returns None on
+    total failure (never a fabricated result)."""
     try:
-        log_signal({
-            "symbol": r["symbol"], "tier": tier, "entry_price": r["entry"],
-            "stop_loss": r["stop_loss"], "r1": r["r1"], "r2": r["r2"],
-            "conviction": r["conviction"], "trigger_score": r["trigger_score"],
-            "trend_label": r["trend_label"],
-            "news_label": r.get("news", {}).get("label"),
-            "forward_catalyst": r.get("news", {}).get("forward_catalyst"),
-            "whale_label": r.get("whale_accum", {}).get("label") if r.get("whale_accum") else None,
-            "is_pearl": r["is_pearl"], "ignited": r["ignited"],
-            "target_low_pct": target_low, "target_high_pct": target_high,
-        })
+        platforms = cdata.fetch_platforms(coin_id)
     except Exception as e:
-        log.warning(f"Failed to log signal for {r['symbol']}: {e}")
+        log.debug(f"platform fetch failed for {symbol}: {e}")
+        platforms = {}
+
+    whale_accum = None
+    onchain_quality = None
+    if onchain.is_onchain_supported(platforms):
+        try:
+            signal = onchain.whale_concentration_signal(platforms)
+            whale_accum = onchain.whale_accumulation_delta(symbol, signal)
+            onchain_quality = onchain.onchain_quality_score_0_100(signal)
+        except Exception as e:
+            log.debug(f"onchain check failed for {symbol}: {e}")
+
+    news = None
+    try:
+        news = news_sentiment.sentiment_summary(symbol)
+    except Exception as e:
+        log.debug(f"news check failed for {symbol}: {e}")
+
+    try:
+        risk = risk_engine.assess_false_pearl_risk(platforms)
+    except Exception as e:
+        log.debug(f"risk check failed for {symbol}: {e}")
+        risk = {"severity": "UNCHECKED"}
+
+    result = pearl_score.compute_pearl_score(symbol, coin_snapshot, whale_accum, news, risk, onchain_quality)
+    result["is_watchlist_pearl"] = is_watchlist_pearl
+    result["pearl_thesis"] = pearl_thesis
+    result["news"] = news
+    result["whale_accum"] = whale_accum
+    result["risk"] = risk
+    return result
+
+
+def _format_candidate(c: dict) -> str:
+    comps = c["components"]
+
+    def _fmt_comp(name, emoji, label):
+        v = comps.get(name)
+        if v is None:
+            return f"   {emoji} {label}: n/a"
+        tier = "STRONG" if v >= 70 else "MODERATE" if v >= 50 else "WEAK"
+        return f"   {emoji} {label}: {tier} ({v:.0f}/100)"
+
+    lines = [
+        f"<b>{c['symbol']}</b> — Discovery Score {c['discovery_score']}/100" if c["discovery_score"] is not None
+        else f"<b>{c['symbol']}</b> — Discovery Score n/a",
+        _fmt_comp("whale", "🐋", "Whale activity"),
+        _fmt_comp("news", "📰", "News/catalyst"),
+        _fmt_comp("liquidity", "💧", "Liquidity"),
+        _fmt_comp("structure", "📈", "Price structure"),
+        _fmt_comp("onchain", "🔗", "On-chain health"),
+        f"   🛡️ Contract risk: {c['false_pearl_risk_pct']}% false-pearl probability",
+    ]
+    if c["reasons_why"]:
+        lines.append(f"   Why it surfaced: {'; '.join(c['reasons_why'])}")
+    lines.append(f"   Would be invalidated by: {'; '.join(c['invalidation_conditions'])}")
+    if c.get("pearl_thesis"):
+        lines.append(f"   Incubator thesis: {c['pearl_thesis']}")
+    lines.append(f"   Status: <b>{c['status']}</b>")
+    return "\n".join(lines)
 
 
 def run() -> None:
-    log.info(f"=== {ccfg.VERSION} — SNIPER (daily ignition scan) ===")
+    log.info(f"=== {ccfg.VERSION} — PEARL DETECTION MACHINE ===")
     init_crypto_tables()
 
-    # ── OUTCOME TRACKER — check yesterday's open signals FIRST, before
-    # scoring anything new. This is the flywheel: every prior alert gets
-    # checked against real price action and resolved (WIN/LOSS/TIMEOUT)
-    # before today's new candidates are even scanned.
-    outcome_summary = outcome_tracker.check_and_resolve_open_signals()
+    ev = evidence.overall_evidence_level()
+    log.info(f"Overall evidence level: {ev['label']}")
 
-    entry_ts = datetime.now(timezone.utc).strftime("%H:%M")
-
-    results: List[dict] = []
-
-    # ── MARKET REGIME — computed ONCE per run using BTC as the market
-    # anchor, replacing the hardcoded neutral 50.0 every score used
-    # before. See core/crypto/regime.py for the honest scope note (BTC-
-    # anchored, not a full macro model).
-    # ── QUARANTINE (per Regime Audit v1 findings — see backtest_v5.py /
-    # regime_audit_v1.py results): the regime classifier's BULL/NORMAL_VOL
-    # calls were followed by BTC actually rising only 0% (discovery) and
-    # 36.4% (validation) of the time — the label does not reliably
-    # describe the market state it claims to. REGIME_STATUS=RESEARCH_ONLY
-    # means regime is still COMPUTED and LOGGED every run (so calibration
-    # work can continue), but its score is FORCED NEUTRAL — it does not
-    # gate entries, does not move conviction, does not influence any
-    # BUY/WATCH/AVOID label. This stays in place until a rebuilt regime
-    # engine passes independent calibration (Phase B, not yet built).
-    REGIME_STATUS = "RESEARCH_ONLY"
+    # Regime is computed and shown as CONTEXT ONLY — it is a REJECTED
+    # layer (v1) and does not contribute to any score. See evidence.py.
     regime = regime_module.detect_market_regime()
-    log.info(f"Regime (RESEARCH_ONLY — NOT used for scoring): {regime['label']} (raw macro_score would have been {regime['macro_score']}, forced neutral 50.0 instead)")
+    log.info(f"Market regime (context only, REJECTED layer, not scored): {regime['label']}")
 
     watchlist = bridge_crypto.load_active_watchlist()
-    log.info(f"PASS A: {len(watchlist)} active pearl(s) on crypto watchlist")
-    skip_count = 0
+    log.info(f"Watchlist: {len(watchlist)} pearl(s) from Incubator")
+
+    candidates: List[dict] = []
+
     for pearl in watchlist:
-        try:
-            r = score_symbol(pearl["symbol"], pearl["coin_id"], is_pearl=True, pearl_row=pearl,
-                              macro_score=50.0)  # QUARANTINED — see note above run()
-            if r.get("skip"):
-                skip_count += 1
-                log.info(f"PASS A SKIP {pearl['symbol']}: {r.get('reason')}")
-                continue
-            results.append(r)
-            log.info(f"PASS A scored {r['symbol']}: conviction={r['conviction']} trigger={r['trigger_score']}")
-            if r["ignited"]:
-                bridge_crypto.mark_ignited(r["symbol"], r["live_price"])
-        except Exception as e:
-            log.warning(f"PASS A exception on {pearl.get('symbol')}: {e}")
-    if skip_count:
-        log.info(f"PASS A: {skip_count} pearl(s) skipped (insufficient OHLC history)")
+        c = _score_candidate(pearl["symbol"], pearl["coin_id"], coin_snapshot=None,
+                              is_watchlist_pearl=True, pearl_thesis=pearl.get("thesis"))
+        if c and c["status"] is not None:
+            candidates.append(c)
 
     universe = cdata.fetch_universe(top_n=COLD_SCAN_TOP_N)
     watchlist_symbols = {p["symbol"] for p in watchlist}
-    log.info(f"PASS B: cold-scanning {len(universe)} coins (excluding {len(watchlist_symbols)} already on watchlist)")
-    below_bar, skip_count_b = 0, 0
+    log.info(f"Cold scan: {len(universe)} coins (excluding {len(watchlist_symbols)} already on watchlist)")
+
     for coin in universe:
         if coin["symbol"] in watchlist_symbols:
             continue
-        try:
-            r = score_symbol(coin["symbol"], coin["id"], is_pearl=False, coin_snapshot=coin,
-                              macro_score=50.0)  # QUARANTINED — see note above run()
-            if r.get("skip"):
-                skip_count_b += 1
-                continue
-            if r["conviction"] >= ccfg.DAILY_SWING_MIN:
-                results.append(r)
-            else:
-                below_bar += 1
-        except Exception as e:
-            log.warning(f"PASS B exception on {coin['symbol']}: {e}")
-    log.info(f"PASS B: {skip_count_b} skipped (insufficient history), {below_bar} scored below DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN})")
+        c = _score_candidate(coin["symbol"], coin["id"], coin_snapshot=coin, is_watchlist_pearl=False)
+        if c and c["status"] is not None:
+            candidates.append(c)
 
-    results.sort(key=lambda r: r["conviction"], reverse=True)
+    candidates.sort(key=lambda c: c["discovery_score"] or 0, reverse=True)
 
-    fortress_alerts = [r for r in results if r["conviction"] >= ccfg.LANE_FUSED_MIN]
-    swing_alerts = [r for r in results if ccfg.DAILY_SWING_MIN <= r["conviction"] < ccfg.LANE_FUSED_MIN]
+    pearl_candidates = [c for c in candidates if "INVESTIGATE" in (c["status"] or "")]
+    watch_candidates = [c for c in candidates if c["status"] == "👀 WATCH"]
+    avoid_candidates = [c for c in candidates if "AVOID" in (c["status"] or "")]
 
-    log.info(f"{len(fortress_alerts)} FORTRESS-tier + {len(swing_alerts)} SWING-tier candidate(s)")
+    log.info(f"{len(pearl_candidates)} PEARL CANDIDATE(s), {len(watch_candidates)} WATCH, "
+             f"{len(avoid_candidates)} AVOID")
 
-    # News sentiment AND whale-accumulation trend fetched ONLY for the
-    # shortlist that will actually be alerted — same selective-cost
-    # pattern as before, now extended to on-chain data too.
-    from core.crypto import onchain as conchain
-    coin_id_by_symbol = {p["symbol"]: p["coin_id"] for p in watchlist}
-    coin_id_by_symbol.update({c["symbol"]: c["id"] for c in universe})
-    for r in (fortress_alerts + swing_alerts):
-        r["news"] = news_sentiment.sentiment_summary(r["symbol"])
-        try:
-            cid = coin_id_by_symbol.get(r["symbol"])
-            platforms = cdata.fetch_platforms(cid) if cid else {}
-            if conchain.is_onchain_supported(platforms):
-                signal = conchain.whale_concentration_signal(platforms)
-                r["whale_accum"] = conchain.whale_accumulation_delta(r["symbol"], signal)
-            else:
-                r["whale_accum"] = None
-            # False Pearl Detection — warning-only, never blocks the alert
-            r["risk"] = risk_engine.assess_false_pearl_risk(platforms)
-        except Exception as e:
-            log.debug(f"whale accumulation check failed for {r['symbol']}: {e}")
-            r["whale_accum"] = None
-            r["risk"] = {"available": False, "flags": [], "severity": "UNCHECKED",
-                          "detail": "risk check errored"}
+    header = (
+        f"🔎 <b>FORTRESS_CRYPTO — Pearl Detection Machine</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n\n"
+        f"📊 <b>Evidence Level: {ev['label']}</b>\n"
+        f"<i>Every score below is built from unvalidated (Level 0) observation signals — "
+        f"whale activity, news, liquidity, price structure, on-chain health. This means: "
+        f"'deserves attention,' NOT 'will make money.' No layer here has been proven predictive yet — "
+        f"research continues in parallel (see the Research Tools workflow).</i>\n\n"
+        f"🌐 Market regime (context only — this layer is REJECTED, not used in scoring): {regime['label']}\n"
+    )
 
-    if fortress_alerts or swing_alerts:
-        lines = [f"🎯 <b>FORTRESS_CRYPTO — Daily Scan</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})",
-                 f"🔴 <b>STATUS: TECHNICAL CORE REJECTED FOR DEPLOYMENT</b> — Regime Audit v1 found a -74% compounded validation return, an outlier-dependent apparent edge, and a miscalibrated regime classifier (BTC rose after only 0-36% of 'BULL' calls). Everything below is research/observation ONLY.",
-                 f"🌐 Market regime (RESEARCH_ONLY — miscalibrated, NOT used for scoring): <b>{regime['label']}</b>" + (f" ({regime.get('trend_detail','')}; {regime.get('vol_detail','')})" if regime.get("available") else ""),
-                 ""]
-        if fortress_alerts:
-            lines.append(f"🏰 <b>[REJECTED] Technical-Core tier (observation only, target {ccfg.PEARL_TARGET_LOW_PCT:.0f}-{ccfg.PEARL_TARGET_HIGH_PCT:.0f}% was the original thesis)</b>")
-            for r in fortress_alerts[:10]:
-                tag = "🦪🔥PEARL+IGNITED" if (r["is_pearl"] and r["ignited"]) else ("🦪PEARL" if r["is_pearl"] else "COLD-SCAN")
-                lines.append(_format_alert_line(r, tag, ccfg.PEARL_TARGET_LOW_PCT, ccfg.PEARL_TARGET_HIGH_PCT, entry_ts))
-                _log_alert_signal(r, "FORTRESS", ccfg.PEARL_TARGET_LOW_PCT, ccfg.PEARL_TARGET_HIGH_PCT)
-            lines.append("")
-        if swing_alerts:
-            lines.append(f"⚡ <b>DAILY SWING-tier (shorter horizon, target {ccfg.DAILY_SWING_TARGET_LOW_PCT:.0f}-{ccfg.DAILY_SWING_TARGET_HIGH_PCT:.0f}%)</b>")
-            for r in swing_alerts[:10]:
-                lines.append(_format_alert_line(r, "SWING", ccfg.DAILY_SWING_TARGET_LOW_PCT, ccfg.DAILY_SWING_TARGET_HIGH_PCT, entry_ts))
-                _log_alert_signal(r, "SWING", ccfg.DAILY_SWING_TARGET_LOW_PCT, ccfg.DAILY_SWING_TARGET_HIGH_PCT)
-        lines.append("")
-        lines.append(outcome_tracker.format_stats_summary())
-        send_telegram("\n".join(lines))
+    if pearl_candidates or watch_candidates or avoid_candidates:
+        lines = [header]
+        if pearl_candidates:
+            lines.append(f"\n━━━ 🔎 PEARL CANDIDATES ({len(pearl_candidates)}) ━━━\n")
+            for c in pearl_candidates[:10]:
+                lines.append(_format_candidate(c))
+                lines.append("")
+        if watch_candidates:
+            lines.append(f"\n━━━ 👀 WATCH ({len(watch_candidates)}) ━━━")
+            for c in watch_candidates[:8]:
+                lines.append(f"   {c['symbol']}: {c['discovery_score']}/100, false-pearl risk {c['false_pearl_risk_pct']}%")
+        if avoid_candidates:
+            lines.append(f"\n━━━ 🚫 AVOID — false-pearl risk ({len(avoid_candidates)}) ━━━")
+            for c in avoid_candidates[:8]:
+                lines.append(f"   {c['symbol']}: {c['false_pearl_risk_pct']}% false-pearl risk (score would've been {c['discovery_score']})")
+        message = "\n".join(lines)
     else:
-        send_telegram(
-            f"ℹ️ FORTRESS_CRYPTO Daily Scan ({datetime.now(timezone.utc).strftime('%Y-%m-%d')}): "
-            f"ran successfully, {len(results)} candidate(s) scored, "
-            f"none reached DAILY_SWING_MIN ({ccfg.DAILY_SWING_MIN}).\n"
-            f"🔴 STATUS: TECHNICAL CORE REJECTED FOR DEPLOYMENT — see Regime Audit v1\n"
-            f"🌐 Market regime (RESEARCH_ONLY, not used for scoring): {regime['label']}\n\n"
-            f"{outcome_tracker.format_stats_summary()}"
-        )
+        message = header + "\nNo candidates surfaced enough evidence today. That's a legitimate outcome, not a failure — this ran successfully and found nothing worth your attention right now."
+
+    plain = message.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
+    log.info(plain)
+    send_telegram(message)
 
     try:
-        header = ["symbol", "is_pearl", "ignited", "conviction", "trigger_score", "trend_label",
-                  "news_label", "close", "live_price", "drift_pct", "entry", "stop_loss", "r1", "r2",
-                  "hold_days_t1", "hold_days_t2", "rsi14", "adx14", "ignition_reason"]
-        rows = []
-        for r in results:
-            news_label = r.get("news", {}).get("label", "NOT_CHECKED")
-            rows.append([r["symbol"], r["is_pearl"], r["ignited"], r["conviction"], r["trigger_score"],
-                         r["trend_label"], news_label, r["close"], r["live_price"], r["drift_pct"],
-                         r["entry"], r["stop_loss"], r["r1"], r["r2"], r["hold_days_t1"], r["hold_days_t2"],
-                         r["rsi14"], r["adx14"], r["ignition_reason"]])
-        push_sheet("CRYPTO_SCREENER", [header] + rows)
+        header_row = ["symbol", "is_watchlist_pearl", "discovery_score", "whale", "news", "liquidity",
+                      "structure", "onchain", "false_pearl_risk_pct", "status", "reasons_why"]
+        rows = [[c["symbol"], c["is_watchlist_pearl"], c["discovery_score"],
+                 c["components"].get("whale"), c["components"].get("news"), c["components"].get("liquidity"),
+                 c["components"].get("structure"), c["components"].get("onchain"),
+                 c["false_pearl_risk_pct"], c["status"], "; ".join(c["reasons_why"])]
+                for c in candidates]
+        push_sheet("CRYPTO_PEARL_CANDIDATES", [header_row] + rows)
     except Exception as e:
-        log.warning(f"Sheet push CRYPTO_SCREENER failed: {e}")
+        log.warning(f"Sheet push CRYPTO_PEARL_CANDIDATES failed: {e}")
 
 
 if __name__ == "__main__":
