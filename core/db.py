@@ -655,3 +655,40 @@ def get_pearl_quality_by_tier() -> dict:
             "n_resolved_24h": len(d["r24"]), "n_resolved_3d": len(d["r3d"]), "n_resolved_7d": len(d["r7d"]),
         }
     return out
+
+
+def get_symbol_persistence(symbol: str) -> dict:
+    """v3.9 — Persistence + Time-to-Discovery. Built entirely from data
+    already being logged by save_pearl_observation() — no new table.
+    Answers: has this symbol kept reappearing on the radar, and for how
+    long? A Pearl may not look like 'high score today, price up
+    tomorrow' — it may look like an asset that PERSISTS on the radar
+    across many days before a catalyst or the market catches up. This
+    is pure measurement, not a scoring input — nothing here feeds
+    discovery_score or Pearl Priority."""
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT observed_at, discovery_score, tier_at_discovery FROM crypto_pearl_observations
+            WHERE symbol = ? ORDER BY observed_at ASC
+        """, (symbol.upper(),)).fetchall()
+
+    if not rows:
+        return {"times_seen": 0, "first_seen": None, "days_in_radar": 0, "tier_trend": []}
+
+    from datetime import datetime as _dt
+    first_seen = rows[0][0]
+    last_seen = rows[-1][0]
+    try:
+        first_dt = _dt.strptime(first_seen.split(" ")[0], "%Y-%m-%d")
+        last_dt = _dt.strptime(last_seen.split(" ")[0], "%Y-%m-%d")
+        days_in_radar = (last_dt - first_dt).days
+    except Exception:
+        days_in_radar = None
+
+    return {
+        "times_seen": len(rows),
+        "first_seen": first_seen,
+        "days_in_radar": days_in_radar,
+        "tier_trend": [r[2] for r in rows[-5:]],  # last 5 tier classifications, oldest->newest
+        "score_trend": [r[1] for r in rows[-5:]],
+    }
