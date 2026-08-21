@@ -404,12 +404,17 @@ def run() -> None:
         primary_cat = category_by_symbol.get(c["symbol"])
         peer_pcts = [p for p in category_pct7d.get(primary_cat, [])] if primary_cat else []
         c["ecosystem_trend"] = trend_breakout.compute_ecosystem_trend(own_pct7d, peer_pcts)
-        priority_result = pearl_score.compute_pearl_priority_v2(
+        priority_result = pearl_score.compute_pearl_priority_v3(
             c["discovery_score"], c.get("emergence_score"), c["trend_change"], c["breakout"], c["ecosystem_trend"],
-            c.get("evidence_completeness_pct"), c.get("false_pearl_risk_pct"))
+            c.get("velocity"), c.get("evidence_completeness_pct"), c.get("false_pearl_risk_pct"))
         c["pearl_priority_score"] = priority_result["final"]
         c["priority_components"] = priority_result["components"]
+        c["breakout_strength"] = priority_result["breakout_strength"]
+        c["breakout_freshness"] = priority_result["breakout_freshness"]
         c["emergence_alert"] = pearl_score.classify_emergence_alert(c["discovery_score"], c.get("emergence_score"))
+        c["pearl_type"] = pearl_score.classify_pearl_type(
+            c["discovery_score"], c.get("evidence_completeness_pct"), c.get("emergence_score"),
+            c["breakout_freshness"], c["false_pearl_risk_pct"], c.get("tier"))
         c["why_now"] = pearl_score.build_why_now_summary(
             c["discovery_score"], c.get("velocity"), c["trend_change"], c["breakout"],
             c["ecosystem_trend"], c.get("evidence_completeness_pct"), c.get("invalidation_conditions", []))
@@ -547,8 +552,14 @@ def run() -> None:
                 else:
                     structure_str = "\n   📐 Structure: n/a (insufficient price history)"
 
-                lines.append(f"{i}. <b>{c['symbol']}</b> — Priority {c['pearl_priority_score']}/100{alert_tag}\n"
-                             f"   Discovery {ds} | Emergence {emg}{persist_str}\n"
+                pearl_type = c.get("pearl_type") or {}
+                type_tag = f" {pearl_type.get('label', '')}" if pearl_type.get("label") else ""
+                sf_line = ""
+                if c.get("breakout_strength") is not None:
+                    sf_line = f"\n   🚀 Strength {c['breakout_strength']}/100 | ⏱️ Freshness {c['breakout_freshness']}/100"
+
+                lines.append(f"{i}. <b>{c['symbol']}</b> — Priority {c['pearl_priority_score']}/100{type_tag}\n"
+                             f"   Discovery {ds} | Emergence {emg}{persist_str}{sf_line}\n"
                              f"   ({comp_str}){structure_str}\n"
                              f"   <i>{c.get('why_now', '')}</i>")
 
