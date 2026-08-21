@@ -201,20 +201,106 @@ def compute_false_pearl_risk_pct(risk: dict) -> int:
     return _FALSE_PEARL_RISK_PCT.get(severity, 50)
 
 
+def compute_pearl_priority_v2(discovery_score: Optional[float], emergence_score: Optional[float],
+                               trend_change: dict, breakout: dict, ecosystem_trend: dict,
+                               evidence_completeness_pct: Optional[float], false_pearl_risk_pct: int) -> dict:
+    """v3.8 — Pearl Priority v2. Same RANKING-ONLY boundary as v1
+    (discovery_score alone still drives tier classification, never this
+    score) — the change is EXPOSING every component's contribution
+    instead of collapsing straight to a final number, per explicit
+    instruction: 'otherwise the Priority Score becomes another black
+    box.' Every candidate's priority score is now fully decomposable.
+
+    Returns {"final": float, "components": {each contribution, signed}}.
+    """
+    if discovery_score is None:
+        return {"final": None, "components": {}}
+
+    components = {}
+    components["discovery"] = round(discovery_score * 0.45, 1)
+    components["emergence"] = round((emergence_score if emergence_score is not None else 50.0) * 0.25, 1)
+
+    trend_pts = 6 if trend_change.get("label") == "REVERSAL_BULLISH" else (
+        -6 if trend_change.get("label") == "REVERSAL_BEARISH" else 0)
+    components["trend_change"] = trend_pts
+
+    breakout_pts = 6 if breakout.get("label") == "BREAKOUT" else 0
+    components["breakout"] = breakout_pts
+
+    sector_pts = 5 if ecosystem_trend.get("label") == "ABOVE_SECTOR" else (
+        -5 if ecosystem_trend.get("label") == "BELOW_SECTOR" else 0)
+    components["sector"] = sector_pts
+
+    # NEW in v2: evidence completeness and false-pearl risk now directly
+    # visible as their own line items in the decomposition, not silently
+    # folded into other numbers — completeness rewards a fuller picture
+    # (up to +8), false-pearl risk penalizes proportionally (up to -15)
+    completeness_pts = round(((evidence_completeness_pct or 0) / 100.0) * 8, 1)
+    components["evidence_completeness"] = completeness_pts
+
+    risk_pts = round(-((false_pearl_risk_pct or 0) / 100.0) * 15, 1)
+    components["false_pearl_penalty"] = risk_pts
+
+    final = sum(components.values())
+    final = round(max(0.0, min(100.0, final)), 1)
+    return {"final": final, "components": components}
+
+
+def classify_emergence_alert(discovery_score: Optional[float], emergence_score: Optional[float]) -> dict:
+    """v3.8 — the GOOD case, made explicit: an asset with very high
+    Emergence (something is changing extremely fast) but only moderate
+    Discovery (the evidence-based score hasn't caught up yet) deserves
+    its OWN alert type — 'early investigation,' distinct from and NOT
+    equivalent to a Pearl or High-Potential classification. This is
+    exactly the ambiguity your mentor flagged: it could be an emerging
+    Pearl the model hasn't recognized yet, OR a false/emotional spike —
+    the alert says 'look at this,' not 'this is good.'"""
+    if emergence_score is None or discovery_score is None:
+        return {"is_alert": False}
+    if emergence_score >= 90 and discovery_score < 80:
+        return {"is_alert": True, "label": "⚡ EARLY INVESTIGATION",
+                "detail": f"Emergence {emergence_score:.0f} with only moderate discovery evidence "
+                          f"({discovery_score:.0f}) — rapid change detected, not yet a Pearl-level thesis."}
+    return {"is_alert": False}
+
+
+def build_why_now_summary(discovery_score: Optional[float], velocity: Optional[dict], trend_change: dict,
+                           breakout: dict, ecosystem_trend: dict, evidence_completeness_pct: Optional[float],
+                           invalidation_conditions: list) -> str:
+    """v3.8 — a deterministic, template-based 3-line summary built ONLY
+    from structured fields already computed this run — NOT an LLM call
+    (no new API dependency, no new cost, and no risk of a language model
+    inventing a causal story the data doesn't support). Describes the
+    OBSERVED SEQUENCE, explicitly not claiming causality, per the
+    explicit 'not necessarily causal' instruction."""
+    line1_parts = []
+    if velocity and velocity.get("volume_label") in ("SURGING", "ELEVATED"):
+        line1_parts.append(f"volume {velocity['volume_label'].lower()} ({velocity.get('volume_ratio')}x baseline)")
+    if trend_change.get("label") == "REVERSAL_BULLISH":
+        line1_parts.append("a positive trend transition")
+    elif trend_change.get("label") == "REVERSAL_BEARISH":
+        line1_parts.append("a negative trend transition")
+    if ecosystem_trend.get("label") == "ABOVE_SECTOR":
+        line1_parts.append("stronger relative sector performance")
+    line1 = ("Observed together: " + ", ".join(line1_parts) + ".") if line1_parts else "No strong co-occurring signals observed."
+
+    line2_parts = []
+    if breakout.get("label") == "BREAKOUT":
+        line2_parts.append(f"breakout structure improving ({breakout.get('pct_above_20d_high')}% above prior 20d high)")
+    completeness_note = f"evidence {evidence_completeness_pct:.0f}% complete" if evidence_completeness_pct is not None else "evidence completeness unknown"
+    line2_parts.append(completeness_note)
+    line2 = "; ".join(line2_parts) + "."
+
+    line3 = f"Would be invalidated by: {'; '.join(invalidation_conditions[:3])}." if invalidation_conditions else ""
+
+    return "\n".join([line1, line2, line3]).strip()
+
+
 def compute_pearl_priority_score(discovery_score: Optional[float], emergence_score: Optional[float],
                                   trend_change: dict, breakout: dict, ecosystem_trend: dict) -> Optional[float]:
-    """v3.7 — Pearl Priority Score. RANKING-ONLY, not a scoring-authority
-    replacement: discovery_score remains the sole basis for PEARL/
-    HIGH_POTENTIAL/CANDIDATE/WATCH tier classification (see
-    classify_tier() above) — that boundary is deliberate, per
-    evidence.py's no-shortcuts rule. This score exists ONLY to answer
-    'given everything shortlisted today, which 5 are worth looking at
-    FIRST' — a display/ordering concept, never a gate.
-
-    Weighting: discovery_score (50%) + emergence_score (30%) dominate,
-    with small bonuses/penalties (up to +/-10 combined) for trend
-    reversal, breakout, and sector outperformance — informational
-    tie-breakers, not primary drivers."""
+    """DEPRECATED — kept only so nothing that still imports the old v1
+    function breaks. Use compute_pearl_priority_v2() for new code, which
+    exposes the full decomposition instead of a single opaque number."""
     if discovery_score is None:
         return None
 
