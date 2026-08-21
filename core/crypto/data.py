@@ -95,6 +95,7 @@ def reset_run_state() -> None:
     _rate_limited_this_run[0] = False
     _platform_cache.clear()
     _ohlc_cache.clear()
+    _coin_details_cache.clear()
 
 
 # Per-run in-memory cache — keyed by coin_id, cleared naturally each
@@ -103,6 +104,7 @@ def reset_run_state() -> None:
 # else needing it reuse the SAME result instead of calling again.
 _platform_cache: Dict[str, dict] = {}
 _ohlc_cache: Dict[str, "pd.DataFrame"] = {}
+_coin_details_cache: Dict[str, dict] = {}
 
 
 def _throttle() -> None:
@@ -228,37 +230,43 @@ def fetch_coin_details(coin_id: str) -> dict:
     same endpoint independently — that duplication was a real bug: it
     doubled CoinGecko call volume for zero benefit and was a direct
     contributor to the 429-throttling seen in production runs. Always
-    call this ONCE per coin and reuse both fields from the result."""
+    call this ONCE per coin and reuse both fields from the result.
+
+    v3.7 FIX: this function itself is now CACHED per run — previously
+    only fetch_platforms() cached its result, but fetch_coin_categories()
+    called this function fresh every time even for a coin whose
+    platforms had already been fetched and cached. Caching HERE means
+    both derived functions share one cached call, not two independent
+    ones."""
+    if coin_id in _coin_details_cache:
+        return _coin_details_cache[coin_id]
     data = _cg_get(f"/coins/{coin_id}", {
         "localization": "false", "tickers": "false", "market_data": "false",
         "community_data": "false", "developer_data": "false",
     })
     if not data:
-        return {"categories": None, "platforms": {}}
-    return {
-        "categories": [c.lower() for c in (data.get("categories") or []) if c],
-        "platforms": {k: v for k, v in (data.get("platforms") or {}).items() if v},
-    }
+        result = {"categories": None, "platforms": {}}
+    else:
+        result = {
+            "categories": [c.lower() for c in (data.get("categories") or []) if c],
+            "platforms": {k: v for k, v in (data.get("platforms") or {}).items() if v},
+        }
+    _coin_details_cache[coin_id] = result
+    return result
 
 
 # Kept as thin wrappers for any external caller still using the old names —
-# but internal workflow code now calls fetch_coin_details() once instead.
+# both now transparently share fetch_coin_details()'s cache.
 def fetch_coin_categories(coin_id: str) -> List[str]:
     d = fetch_coin_details(coin_id)
     return d["categories"] or []
 
 
 def fetch_platforms(coin_id: str) -> Dict[str, str]:
-    """CACHED per run — this is called independently by the whale check,
-    risk engine, and velocity engine, all for the same coin_id within a
-    single scoring pass. Without this cache, that's 3 identical API
-    calls for one coin instead of 1 — exactly the duplication your
-    mentor flagged."""
-    if coin_id in _platform_cache:
-        return _platform_cache[coin_id]
-    result = fetch_coin_details(coin_id)["platforms"]
-    _platform_cache[coin_id] = result
-    return result
+    """Thin wrapper over the now-cached fetch_coin_details() — kept for
+    backward compatibility with existing call sites, but the actual
+    caching happens one level down now."""
+    return fetch_coin_details(coin_id)["platforms"]
 
 
 def fetch_daily_ohlc(coin_id: str, days: int = 95) -> pd.DataFrame:

@@ -201,6 +201,48 @@ def compute_false_pearl_risk_pct(risk: dict) -> int:
     return _FALSE_PEARL_RISK_PCT.get(severity, 50)
 
 
+def compute_pearl_priority_score(discovery_score: Optional[float], emergence_score: Optional[float],
+                                  trend_change: dict, breakout: dict, ecosystem_trend: dict) -> Optional[float]:
+    """v3.7 — Pearl Priority Score. RANKING-ONLY, not a scoring-authority
+    replacement: discovery_score remains the sole basis for PEARL/
+    HIGH_POTENTIAL/CANDIDATE/WATCH tier classification (see
+    classify_tier() above) — that boundary is deliberate, per
+    evidence.py's no-shortcuts rule. This score exists ONLY to answer
+    'given everything shortlisted today, which 5 are worth looking at
+    FIRST' — a display/ordering concept, never a gate.
+
+    Weighting: discovery_score (50%) + emergence_score (30%) dominate,
+    with small bonuses/penalties (up to +/-10 combined) for trend
+    reversal, breakout, and sector outperformance — informational
+    tie-breakers, not primary drivers."""
+    if discovery_score is None:
+        return None
+
+    base = discovery_score * 0.5 + (emergence_score or 50.0) * 0.3
+    # emergence defaults to neutral 50 in the blend (not excluded) since
+    # this is a RANKING score where every candidate needs a comparable
+    # number — unlike discovery_score, which correctly excludes missing
+    # components from its own weighted average
+    remaining_weight = 20.0
+    bonus = 0.0
+
+    if trend_change.get("label") == "REVERSAL_BULLISH":
+        bonus += 6
+    elif trend_change.get("label") == "REVERSAL_BEARISH":
+        bonus -= 6
+
+    if breakout.get("label") == "BREAKOUT":
+        bonus += 6
+
+    if ecosystem_trend.get("label") == "ABOVE_SECTOR":
+        bonus += 5
+    elif ecosystem_trend.get("label") == "BELOW_SECTOR":
+        bonus -= 5
+
+    final = base + min(remaining_weight, max(-remaining_weight, bonus))
+    return round(max(0.0, min(100.0, final)), 1)
+
+
 def compute_emergence_score(velocity: Optional[dict], relative_anomaly: Optional[dict]) -> Optional[float]:
     """v3.6 — Emergence score. Separate from discovery_score on purpose:
     measures RATE OF CHANGE and how unusual that change is relative to
