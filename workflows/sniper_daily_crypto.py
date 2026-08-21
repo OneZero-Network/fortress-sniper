@@ -106,15 +106,17 @@ def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
 
 
 def _format_candidate_short(c: dict) -> str:
-    """Compact one-line format — symbol, score, status. No component
-    breakdown, no reasons/invalidation text, no velocity/divergence
-    detail. That detail still exists (see the Sheets export and, if you
-    want it, _format_candidate() for the full view) — this is just what
-    goes into the everyday Telegram message so it's actually scannable."""
+    """Compact one-line format — symbol, score, Emergence (if computed),
+    status. No component breakdown, no reasons/invalidation text — that
+    detail still exists in the run log's FULL DETAIL section and the
+    Sheets export, this is just what goes into the everyday Telegram
+    message so it's actually scannable."""
     score = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
+    emergence = c.get("emergence_score")
+    emg_tag = f" 🔥{emergence:.0f}" if emergence is not None else ""
     status_short = c["status"].split(" — ")[0] if c.get("status") else "?"
     tier_tag = f"[{c.get('universe_tier', '')}]" if c.get("universe_tier") not in (None, "WATCHLIST") else ""
-    return f"{c['symbol']} {tier_tag} — {score}/100 — {status_short}"
+    return f"{c['symbol']} {tier_tag} — {score}/100{emg_tag} — {status_short}"
 
 
 def _format_candidate(c: dict) -> str:
@@ -361,6 +363,7 @@ def run() -> None:
         tier = c.get("universe_tier", "UNKNOWN")
         peers = [v for v in velocities_by_tier.get(tier, []) if v is not None]
         c["relative_anomaly"] = velocity_divergence.compute_relative_anomaly(c.get("velocity"), peers)
+        c["emergence_score"] = pearl_score.compute_emergence_score(c.get("velocity"), c.get("relative_anomaly"))
 
     # keep the old grouping names for the rest of the message-building
     # code below — pearl+high-potential+candidate tiers all surface as
@@ -465,7 +468,9 @@ def run() -> None:
             lines.append(f"\n🔎 <b>HIGH-POTENTIAL ({len(high_potential_tier)})</b> — score 80+, evidence incomplete")
             for c in high_potential_tier[:15]:
                 score = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
-                lines.append(f"{c['symbol']} — {score}/100 — worth a manual look")
+                emergence = c.get("emergence_score")
+                emg_tag = f" 🔥{emergence:.0f}" if emergence is not None else ""
+                lines.append(f"{c['symbol']} — {score}/100{emg_tag} — worth a manual look")
         if candidate_tier:
             lines.append(f"\n🔎 <b>CANDIDATES ({len(candidate_tier)})</b>")
             for c in candidate_tier[:15]:
@@ -486,13 +491,38 @@ def run() -> None:
 
     plain = message.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
     log.info(plain)
+
+    # ── FULL-DETAIL LOG (GitHub Actions log only, NOT Telegram) — the
+    # compact message deliberately dropped component breakdowns to keep
+    # Telegram readable, but that also silently removed the ability to
+    # inspect WHY a top candidate scored what it did without opening the
+    # Sheet. This restores that visibility in the run log, where it
+    # belongs for debugging/inspection without re-bloating Telegram.
+    log.info("=== FULL DETAIL: top candidates (log only, not sent to Telegram) ===")
+    for c in (pearl_tier + high_potential_tier + candidate_tier)[:15]:
+        log.info(f"--- {c['symbol']} ---")
+        log.info(f"  discovery_score={c['discovery_score']}, evidence_completeness_pct={c['evidence_completeness_pct']}%, "
+                 f"emergence_score={c.get('emergence_score')}, tier={c.get('tier')}, false_pearl_risk_pct={c['false_pearl_risk_pct']}")
+        log.info(f"  components: {c['components']}")
+        log.info(f"  components_available: {c['components_available']}")
+        news_state = c.get("news") or {}
+        log.info(f"  news: available={news_state.get('available')}, label={news_state.get('label')}, "
+                 f"forward_catalyst={news_state.get('forward_catalyst')}")
+        whale_state = c.get("whale_accum") or {}
+        log.info(f"  whale: available={whale_state.get('available')}, label={whale_state.get('label')}")
+        ra = c.get("relative_anomaly") or {}
+        log.info(f"  relative_anomaly: {ra}")
+        log.info(f"  reasons_why: {c['reasons_why']}")
+        log.info(f"  invalidation_conditions: {c['invalidation_conditions']}")
+
     send_telegram(message)
 
     try:
         header_row = ["symbol", "is_watchlist_pearl", "discovery_score", "evidence_completeness_pct", "tier",
-                      "whale", "news", "liquidity", "structure", "onchain",
+                      "emergence_score", "whale", "news", "liquidity", "structure", "onchain",
                       "false_pearl_risk_pct", "status", "reasons_why"]
         rows = [[c["symbol"], c["is_watchlist_pearl"], c["discovery_score"], c["evidence_completeness_pct"], c["tier"],
+                 c.get("emergence_score"),
                  c["components"].get("whale"), c["components"].get("news"), c["components"].get("liquidity"),
                  c["components"].get("structure"), c["components"].get("onchain"),
                  c["false_pearl_risk_pct"], c["status"], "; ".join(c["reasons_why"])]
