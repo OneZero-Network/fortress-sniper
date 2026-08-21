@@ -365,6 +365,48 @@ def run() -> None:
         c["relative_anomaly"] = velocity_divergence.compute_relative_anomaly(c.get("velocity"), peers)
         c["emergence_score"] = pearl_score.compute_emergence_score(c.get("velocity"), c.get("relative_anomaly"))
 
+    # ── v3.7 Trend Change + Breakout + Ecosystem Trend — new lenses.
+    # Trend change: zero extra calls (coin_snapshot data already in hand).
+    # Breakout: reuses the SAME cached OHLC as velocity — zero additional
+    # API calls despite calling fetch_daily_ohlc again for the same coin.
+    # Ecosystem trend: uses coin categories (now properly cached, see
+    # v3.7's data.py fix) grouped across THIS shortlist only.
+    from core.crypto import trend_breakout
+    coin_snapshot_by_symbol = {coin["symbol"]: coin for coin in shortlist}
+    for pearl in watchlist:
+        coin_snapshot_by_symbol.setdefault(pearl["symbol"], None)
+
+    category_pct7d: dict = {}  # category -> list of pct_7d
+    category_by_symbol: dict = {}
+    for c in shortlisted:
+        coin_id = coin_id_by_symbol.get(c["symbol"])
+        try:
+            cats = cdata.fetch_coin_categories(coin_id) if coin_id else []
+        except Exception as e:
+            log.debug(f"category fetch failed for {c['symbol']}: {e}")
+            cats = []
+        primary_cat = cats[0] if cats else None
+        category_by_symbol[c["symbol"]] = primary_cat
+        snap = coin_snapshot_by_symbol.get(c["symbol"])
+        if primary_cat and snap and snap.get("pct_7d") is not None:
+            category_pct7d.setdefault(primary_cat, []).append(snap["pct_7d"])
+
+    for c in shortlisted:
+        coin_id = coin_id_by_symbol.get(c["symbol"])
+        snap = coin_snapshot_by_symbol.get(c["symbol"])
+        c["trend_change"] = trend_breakout.detect_trend_change(snap)
+        try:
+            c["breakout"] = trend_breakout.detect_breakout(coin_id) if coin_id else {"available": False, "label": "NONE"}
+        except Exception as e:
+            log.debug(f"breakout check failed for {c['symbol']}: {e}")
+            c["breakout"] = {"available": False, "label": "NONE"}
+        own_pct7d = snap.get("pct_7d") if snap else None
+        primary_cat = category_by_symbol.get(c["symbol"])
+        peer_pcts = [p for p in category_pct7d.get(primary_cat, [])] if primary_cat else []
+        c["ecosystem_trend"] = trend_breakout.compute_ecosystem_trend(own_pct7d, peer_pcts)
+        c["pearl_priority_score"] = pearl_score.compute_pearl_priority_score(
+            c["discovery_score"], c.get("emergence_score"), c["trend_change"], c["breakout"], c["ecosystem_trend"])
+
     # keep the old grouping names for the rest of the message-building
     # code below — pearl+high-potential+candidate tiers all surface as
     # "investigate", HIGH_POTENTIAL is displayed in its own section below
@@ -460,6 +502,30 @@ def run() -> None:
 
     if pearl_tier or high_potential_tier or candidate_tier or watch_candidates or avoid_candidates:
         lines = [header]
+
+        # ── 🏆 TOP 5 — ranked by Pearl Priority Score (discovery_score
+        # + emergence + trend/breakout/sector bonuses), NOT by
+        # discovery_score alone. This is a RANKING/DISPLAY convenience —
+        # tier membership (PEARL/HIGH_POTENTIAL/CANDIDATE) above is still
+        # decided purely by discovery_score, unaffected by this ordering.
+        ranked_by_priority = sorted(
+            [c for c in shortlisted if c.get("pearl_priority_score") is not None],
+            key=lambda c: c["pearl_priority_score"], reverse=True)
+        if ranked_by_priority:
+            lines.append(f"🏆 <b>TOP 5</b> (ranked by Priority Score — discovery + emergence + trend/breakout/sector)")
+            for c in ranked_by_priority[:5]:
+                ds = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
+                signals = []
+                if c["trend_change"].get("label") in ("REVERSAL_BULLISH", "REVERSAL_BEARISH"):
+                    signals.append(c["trend_change"]["label"].replace("REVERSAL_", "↩"))
+                if c["breakout"].get("label") == "BREAKOUT":
+                    signals.append("📈BREAKOUT")
+                if c["ecosystem_trend"].get("label") == "ABOVE_SECTOR":
+                    signals.append("🌐vs-sector+")
+                sig_str = f" [{', '.join(signals)}]" if signals else ""
+                lines.append(f"{c['symbol']} — Priority {c['pearl_priority_score']}/100 "
+                             f"(discovery {ds}, emergence {c.get('emergence_score') or 'n/a'}){sig_str}")
+
         if pearl_tier:
             lines.append(f"\n⭐ <b>PEARLS ({len(pearl_tier)})</b>")
             for c in pearl_tier[:15]:
@@ -512,6 +578,10 @@ def run() -> None:
         log.info(f"  whale: available={whale_state.get('available')}, label={whale_state.get('label')}")
         ra = c.get("relative_anomaly") or {}
         log.info(f"  relative_anomaly: {ra}")
+        log.info(f"  trend_change: {c.get('trend_change')}")
+        log.info(f"  breakout: {c.get('breakout')}")
+        log.info(f"  ecosystem_trend: {c.get('ecosystem_trend')}")
+        log.info(f"  pearl_priority_score: {c.get('pearl_priority_score')}")
         log.info(f"  reasons_why: {c['reasons_why']}")
         log.info(f"  invalidation_conditions: {c['invalidation_conditions']}")
 
@@ -519,10 +589,13 @@ def run() -> None:
 
     try:
         header_row = ["symbol", "is_watchlist_pearl", "discovery_score", "evidence_completeness_pct", "tier",
-                      "emergence_score", "whale", "news", "liquidity", "structure", "onchain",
+                      "emergence_score", "pearl_priority_score", "trend_change", "breakout", "ecosystem_trend",
+                      "whale", "news", "liquidity", "structure", "onchain",
                       "false_pearl_risk_pct", "status", "reasons_why"]
         rows = [[c["symbol"], c["is_watchlist_pearl"], c["discovery_score"], c["evidence_completeness_pct"], c["tier"],
-                 c.get("emergence_score"),
+                 c.get("emergence_score"), c.get("pearl_priority_score"),
+                 (c.get("trend_change") or {}).get("label"), (c.get("breakout") or {}).get("label"),
+                 (c.get("ecosystem_trend") or {}).get("label"),
                  c["components"].get("whale"), c["components"].get("news"), c["components"].get("liquidity"),
                  c["components"].get("structure"), c["components"].get("onchain"),
                  c["false_pearl_risk_pct"], c["status"], "; ".join(c["reasons_why"])]
