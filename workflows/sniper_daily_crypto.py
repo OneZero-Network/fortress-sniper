@@ -404,8 +404,15 @@ def run() -> None:
         primary_cat = category_by_symbol.get(c["symbol"])
         peer_pcts = [p for p in category_pct7d.get(primary_cat, [])] if primary_cat else []
         c["ecosystem_trend"] = trend_breakout.compute_ecosystem_trend(own_pct7d, peer_pcts)
-        c["pearl_priority_score"] = pearl_score.compute_pearl_priority_score(
-            c["discovery_score"], c.get("emergence_score"), c["trend_change"], c["breakout"], c["ecosystem_trend"])
+        priority_result = pearl_score.compute_pearl_priority_v2(
+            c["discovery_score"], c.get("emergence_score"), c["trend_change"], c["breakout"], c["ecosystem_trend"],
+            c.get("evidence_completeness_pct"), c.get("false_pearl_risk_pct"))
+        c["pearl_priority_score"] = priority_result["final"]
+        c["priority_components"] = priority_result["components"]
+        c["emergence_alert"] = pearl_score.classify_emergence_alert(c["discovery_score"], c.get("emergence_score"))
+        c["why_now"] = pearl_score.build_why_now_summary(
+            c["discovery_score"], c.get("velocity"), c["trend_change"], c["breakout"],
+            c["ecosystem_trend"], c.get("evidence_completeness_pct"), c.get("invalidation_conditions", []))
 
     # keep the old grouping names for the rest of the message-building
     # code below — pearl+high-potential+candidate tiers all surface as
@@ -503,54 +510,47 @@ def run() -> None:
     if pearl_tier or high_potential_tier or candidate_tier or watch_candidates or avoid_candidates:
         lines = [header]
 
-        # ── 🏆 TOP 5 — ranked by Pearl Priority Score (discovery_score
-        # + emergence + trend/breakout/sector bonuses), NOT by
-        # discovery_score alone. This is a RANKING/DISPLAY convenience —
-        # tier membership (PEARL/HIGH_POTENTIAL/CANDIDATE) above is still
-        # decided purely by discovery_score, unaffected by this ordering.
+        # ── 🏆 PEARL RADAR (Priority Score, decomposed) ─────────────────
         ranked_by_priority = sorted(
             [c for c in shortlisted if c.get("pearl_priority_score") is not None],
             key=lambda c: c["pearl_priority_score"], reverse=True)
         if ranked_by_priority:
-            lines.append(f"🏆 <b>TOP 5</b> (ranked by Priority Score — discovery + emergence + trend/breakout/sector)")
-            for c in ranked_by_priority[:5]:
+            lines.append(f"🏆 <b>PEARL RADAR — TOP 5</b> (combined priority: discovery+emergence+trend+breakout+sector, "
+                         f"minus false-pearl risk)")
+            for i, c in enumerate(ranked_by_priority[:5], 1):
                 ds = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
-                signals = []
-                if c["trend_change"].get("label") in ("REVERSAL_BULLISH", "REVERSAL_BEARISH"):
-                    signals.append(c["trend_change"]["label"].replace("REVERSAL_", "↩"))
-                if c["breakout"].get("label") == "BREAKOUT":
-                    signals.append("📈BREAKOUT")
-                if c["ecosystem_trend"].get("label") == "ABOVE_SECTOR":
-                    signals.append("🌐vs-sector+")
-                sig_str = f" [{', '.join(signals)}]" if signals else ""
-                lines.append(f"{c['symbol']} — Priority {c['pearl_priority_score']}/100 "
-                             f"(discovery {ds}, emergence {c.get('emergence_score') or 'n/a'}){sig_str}")
+                emg = f"{c['emergence_score']:.0f}" if c.get("emergence_score") is not None else "n/a"
+                pc = c.get("priority_components", {})
+                comp_str = " | ".join(f"{k}:{v:+.1f}" if k not in ("discovery","emergence") else f"{k}:{v:.1f}"
+                                        for k, v in pc.items())
+                alert_tag = " ⚡ALERT" if c.get("emergence_alert", {}).get("is_alert") else ""
+                lines.append(f"{i}. <b>{c['symbol']}</b> — Priority {c['pearl_priority_score']}/100{alert_tag}\n"
+                             f"   Discovery {ds} | Emergence {emg}\n"
+                             f"   ({comp_str})\n"
+                             f"   <i>{c.get('why_now', '')}</i>")
 
-        if pearl_tier:
-            lines.append(f"\n⭐ <b>PEARLS ({len(pearl_tier)})</b>")
-            for c in pearl_tier[:15]:
-                lines.append(_format_candidate_short(c))
-        if high_potential_tier:
-            lines.append(f"\n🔎 <b>HIGH-POTENTIAL ({len(high_potential_tier)})</b> — score 80+, evidence incomplete")
-            for c in high_potential_tier[:15]:
-                score = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
-                emergence = c.get("emergence_score")
-                emg_tag = f" 🔥{emergence:.0f}" if emergence is not None else ""
-                lines.append(f"{c['symbol']} — {score}/100{emg_tag} — worth a manual look")
-        if candidate_tier:
-            lines.append(f"\n🔎 <b>CANDIDATES ({len(candidate_tier)})</b>")
-            for c in candidate_tier[:15]:
-                lines.append(_format_candidate_short(c))
-        if watch_candidates:
-            lines.append(f"\n👀 <b>WATCH ({len(watch_candidates)})</b>")
-            for c in watch_candidates[:15]:
-                lines.append(f"{c['symbol']} — {c['discovery_score']:.0f}/100")
-        if avoid_candidates:
-            lines.append(f"\n🚫 <b>FALSE PEARLS ({len(avoid_candidates)})</b> — high risk, do not investigate")
-            for c in avoid_candidates[:15]:
-                lines.append(f"{c['symbol']} — {c['false_pearl_risk_pct']}% false-pearl risk")
-        lines.append(f"\n<i>Full detail (why each surfaced, component breakdown, velocity/divergence) "
-                     f"is in the CRYPTO_PEARL_CANDIDATES sheet — this message is intentionally compact.</i>")
+        # ── ⚡ EMERGENCE ALERTS — the GOOD case, called out explicitly,
+        # NOT a Pearl claim, an "investigate why this is moving" flag ──
+        emergence_alerts = [c for c in shortlisted if c.get("emergence_alert", {}).get("is_alert")]
+        if emergence_alerts:
+            lines.append(f"\n⚡ <b>EMERGENCE ALERTS ({len(emergence_alerts)})</b> — rapid change, evidence not yet caught up")
+            for c in sorted(emergence_alerts, key=lambda c: c.get("emergence_score", 0), reverse=True)[:5]:
+                lines.append(f"{c['symbol']} — Emergence {c['emergence_score']:.0f}, Discovery {c['discovery_score']:.0f} — "
+                             f"could be an early Pearl OR a false spike, worth a manual look")
+
+        # ── 🚨 DIVERGENCE — where signals disagree unusually ────────────
+        divergent = [c for c in shortlisted if (c.get("divergence") or {}).get("label")
+                     in ("BULLISH_DIVERGENCE", "BEARISH_DIVERGENCE")]
+        if divergent:
+            lines.append(f"\n🚨 <b>DIVERGENCE ({len(divergent)})</b> — signals disagreeing")
+            for c in divergent[:5]:
+                lines.append(f"{c['symbol']} — {c['divergence']['label']}: {c['divergence'].get('detail', '')}")
+
+        # ── Everything else: COUNTS ONLY, full detail lives in Sheets ───
+        lines.append(f"\n🔎 High-Potential: {len(high_potential_tier)} | Candidates: {len(candidate_tier)} | "
+                     f"👀 Watch: {len(watch_candidates)} | 🚫 False Pearls: {len(avoid_candidates)}")
+        lines.append(f"<i>Full breakdown for every candidate — discovery/emergence/priority components, "
+                     f"why-now text, invalidation conditions — is in the CRYPTO_PEARL_CANDIDATES sheet.</i>")
         message = "\n".join(lines)
     else:
         message = header + "\nNo candidates surfaced enough evidence today. That's a legitimate outcome, not a failure — this ran successfully and found nothing worth your attention right now."
