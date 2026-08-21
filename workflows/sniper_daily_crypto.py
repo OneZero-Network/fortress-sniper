@@ -59,7 +59,9 @@ COLD_SCAN_TOP_N = int(os.getenv("CRYPTO_COLD_SCAN_TOP_N", "60"))
 
 
 def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
-                      is_watchlist_pearl: bool, pearl_thesis: Optional[str] = None) -> Optional[dict]:
+                      is_watchlist_pearl: bool, pearl_thesis: Optional[str] = None,
+                      liquidity_score_override: Optional[float] = None,
+                      structure_score_override: Optional[float] = None) -> Optional[dict]:
     """Fetches whale/news/risk/on-chain signals for one candidate and
     runs them through pearl_score.compute_pearl_score(). Returns None on
     total failure (never a fabricated result)."""
@@ -91,7 +93,9 @@ def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
         log.debug(f"risk check failed for {symbol}: {e}")
         risk = {"severity": "UNCHECKED"}
 
-    result = pearl_score.compute_pearl_score(symbol, coin_snapshot, whale_accum, news, risk, onchain_quality)
+    result = pearl_score.compute_pearl_score(symbol, coin_snapshot, whale_accum, news, risk, onchain_quality,
+                                              liquidity_score_override=liquidity_score_override,
+                                              structure_score_override=structure_score_override)
     result["is_watchlist_pearl"] = is_watchlist_pearl
     result["pearl_thesis"] = pearl_thesis
     result["news"] = news
@@ -251,6 +255,33 @@ def run() -> None:
         if c:
             all_scored.append(c)
 
+    # ── v3.4 TIER-RELATIVE LIQUIDITY/STRUCTURE SCORING — pre-pass, zero
+    # extra API calls (uses coin_snapshot data already fetched). Fixes a
+    # real bug found in production: the old absolute formula saturated
+    # near 100 for almost any reasonably-liquid Large/Mid-cap coin
+    # (verified: AVAX/RED/MAGMA all showed identical 100/100 liquidity
+    # despite genuinely different turnover ratios). Now each coin's
+    # liquidity/structure score reflects where it actually sits among
+    # its OWN tier's peers this run.
+    from core.crypto import pearl_score as pscore
+    raw_liq_by_tier: dict = {}
+    raw_struct_by_tier: dict = {}
+    for coin in shortlist:
+        tier = coin["universe_tier"]
+        raw_liq_by_tier.setdefault(tier, {})[coin["symbol"]] = pscore.raw_liquidity_metric(coin)
+        raw_struct_by_tier.setdefault(tier, {})[coin["symbol"]] = pscore.raw_structure_metric(coin)
+
+    liquidity_pct_by_symbol: dict = {}
+    structure_pct_by_symbol: dict = {}
+    for tier, raw_map in raw_liq_by_tier.items():
+        peer_values = list(raw_map.values())
+        for sym, raw_val in raw_map.items():
+            liquidity_pct_by_symbol[sym] = pscore.percentile_rank(raw_val, peer_values)
+    for tier, raw_map in raw_struct_by_tier.items():
+        peer_values = list(raw_map.values())
+        for sym, raw_val in raw_map.items():
+            structure_pct_by_symbol[sym] = pscore.percentile_rank(raw_val, peer_values)
+
     skipped_budget = []
     for coin in shortlist:
         if coin["symbol"] in watchlist_symbols:
@@ -262,7 +293,9 @@ def run() -> None:
             skipped_budget.append(coin["symbol"])
             continue
         diag["scanned"] += 1
-        c = _score_candidate(coin["symbol"], coin["id"], coin_snapshot=coin, is_watchlist_pearl=False)
+        c = _score_candidate(coin["symbol"], coin["id"], coin_snapshot=coin, is_watchlist_pearl=False,
+                              liquidity_score_override=liquidity_pct_by_symbol.get(coin["symbol"]),
+                              structure_score_override=structure_pct_by_symbol.get(coin["symbol"]))
         _tally_diagnostic(c, diag)
         if c:
             c["universe_tier"] = coin["universe_tier"]
