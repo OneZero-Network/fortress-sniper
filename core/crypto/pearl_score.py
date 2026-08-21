@@ -63,7 +63,54 @@ def _news_component(news: Optional[dict]) -> Optional[float]:
     return round(base, 1)
 
 
+def raw_liquidity_metric(coin_snapshot: Optional[dict]) -> Optional[float]:
+    """The RAW turnover ratio (volume/market cap), before any squashing
+    to 0-100. v3.4 exposes this separately so callers can rank it
+    WITHIN A TIER (percentile) instead of against a fixed global
+    formula — the global formula was found to saturate near 100 for
+    almost any reasonably-liquid Large/Mid-cap coin, failing to
+    discriminate 'ordinary for this tier' from 'unusual for this tier.'"""
+    if not coin_snapshot:
+        return None
+    vol = coin_snapshot.get("volume_24h")
+    mcap = coin_snapshot.get("market_cap")
+    if not vol or not mcap or mcap <= 0:
+        return None
+    return vol / mcap
+
+
+def raw_structure_metric(coin_snapshot: Optional[dict]) -> Optional[float]:
+    """The RAW blended 7d/30d momentum, before squashing. Same
+    tier-relative rationale as raw_liquidity_metric."""
+    if not coin_snapshot:
+        return None
+    p7 = coin_snapshot.get("pct_7d")
+    p30 = coin_snapshot.get("pct_30d")
+    if p7 is None and p30 is None:
+        return None
+    return 0.6 * (p7 or 0.0) + 0.4 * (p30 or 0.0)
+
+
+def percentile_rank(value: Optional[float], peer_values: list) -> Optional[float]:
+    """Generic 0-100 percentile of value within peer_values (inclusive
+    of itself). Requires at least 5 peers to produce a meaningful rank —
+    below that, returns None rather than a rank among 2-3 coins that
+    isn't statistically meaningful."""
+    if value is None:
+        return None
+    valid_peers = [v for v in peer_values if v is not None]
+    if len(valid_peers) < 5:
+        return None
+    rank = sum(1 for v in valid_peers if v < value)
+    return round(100.0 * rank / len(valid_peers), 1)
+
+
 def _liquidity_component(coin_snapshot: Optional[dict]) -> Optional[float]:
+    """FALLBACK ONLY — used when no tier-peer context is available (e.g.
+    watchlist pearls scored outside the tier funnel). The PREFERRED path
+    is tier-relative percentile scoring — see raw_liquidity_metric() +
+    percentile_rank(), wired in by the caller via
+    compute_pearl_score()'s liquidity_score_override parameter."""
     if not coin_snapshot:
         return None
     vol = coin_snapshot.get("volume_24h")
@@ -77,9 +124,8 @@ def _liquidity_component(coin_snapshot: Optional[dict]) -> Optional[float]:
 
 
 def _structure_component(coin_snapshot: Optional[dict]) -> Optional[float]:
-    """DESCRIPTIVE momentum read — 'is price structure improving,' not a
-    predictive claim. Deliberately simple (unlike the rejected technical
-    trigger's RSI/ADX combination)."""
+    """FALLBACK ONLY — see _liquidity_component's docstring, same
+    rationale applies here."""
     if not coin_snapshot:
         return None
     p7 = coin_snapshot.get("pct_7d")
@@ -156,17 +202,29 @@ def compute_false_pearl_risk_pct(risk: dict) -> int:
 
 
 def compute_pearl_score(symbol: str, coin_snapshot: Optional[dict], whale_accum: Optional[dict],
-                         news: Optional[dict], risk: dict, onchain_quality: Optional[float]) -> dict:
+                         news: Optional[dict], risk: dict, onchain_quality: Optional[float],
+                         liquidity_score_override: Optional[float] = None,
+                         structure_score_override: Optional[float] = None) -> dict:
     """Returns the full Pearl candidate record: discovery_score, per-
     component breakdown, false_pearl_risk_pct, status, reasons_why,
     invalidation_conditions. Components with no data are EXCLUDED from
     the weighted average (not defaulted), and reported as 'n/a' rather
-    than silently treated as neutral."""
+    than silently treated as neutral.
+
+    v3.4: liquidity_score_override/structure_score_override let the
+    caller supply TIER-RELATIVE PERCENTILE scores (computed across the
+    candidate's own universe_tier peers, using raw_liquidity_metric() +
+    percentile_rank()) instead of the old global absolute formula. This
+    is the preferred path — the absolute formula was found to saturate
+    near 100 for almost any reasonably-liquid Large/Mid-cap coin,
+    failing to discriminate ordinary from unusual. When no override is
+    given (no tier-peer context available, e.g. a watchlist pearl scored
+    outside the funnel), falls back to the old absolute formula."""
     components = {
         "whale": _whale_component(whale_accum),
         "news": _news_component(news),
-        "liquidity": _liquidity_component(coin_snapshot),
-        "structure": _structure_component(coin_snapshot),
+        "liquidity": liquidity_score_override if liquidity_score_override is not None else _liquidity_component(coin_snapshot),
+        "structure": structure_score_override if structure_score_override is not None else _structure_component(coin_snapshot),
         "onchain": _onchain_component(onchain_quality),
     }
     weights = {"whale": 0.25, "news": 0.20, "liquidity": 0.15, "structure": 0.20, "onchain": 0.20}
