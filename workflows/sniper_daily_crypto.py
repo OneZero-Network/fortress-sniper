@@ -36,7 +36,7 @@ from typing import List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.db import init_crypto_tables, save_pearl_observation
+from core.db import init_crypto_tables, save_pearl_observation, get_symbol_persistence
 from core.telegram import send as send_telegram
 from core.sheets_client import push_sheet
 from core.crypto import config as ccfg
@@ -524,8 +524,11 @@ def run() -> None:
                 comp_str = " | ".join(f"{k}:{v:+.1f}" if k not in ("discovery","emergence") else f"{k}:{v:.1f}"
                                         for k, v in pc.items())
                 alert_tag = " ⚡ALERT" if c.get("emergence_alert", {}).get("is_alert") else ""
+                persist = get_symbol_persistence(c["symbol"])
+                persist_str = (f" | 📅 seen {persist['times_seen']}x over {persist['days_in_radar']}d"
+                               if persist["times_seen"] > 0 else " | 📅 first time on radar")
                 lines.append(f"{i}. <b>{c['symbol']}</b> — Priority {c['pearl_priority_score']}/100{alert_tag}\n"
-                             f"   Discovery {ds} | Emergence {emg}\n"
+                             f"   Discovery {ds} | Emergence {emg}{persist_str}\n"
                              f"   ({comp_str})\n"
                              f"   <i>{c.get('why_now', '')}</i>")
 
