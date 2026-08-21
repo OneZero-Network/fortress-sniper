@@ -201,6 +201,49 @@ def compute_false_pearl_risk_pct(risk: dict) -> int:
     return _FALSE_PEARL_RISK_PCT.get(severity, 50)
 
 
+def compute_emergence_score(velocity: Optional[dict], relative_anomaly: Optional[dict]) -> Optional[float]:
+    """v3.6 — Emergence score. Separate from discovery_score on purpose:
+    measures RATE OF CHANGE and how unusual that change is relative to
+    peers, not 'is this a good asset overall.' A coin can have a modest
+    discovery_score but a very high Emergence score (something is
+    rapidly changing, worth watching even if the broader picture isn't
+    complete yet) — or the reverse (a solid, stable discovery_score with
+    low Emergence, nothing acutely happening right now).
+
+    Zero extra API calls — built entirely from velocity (v3.0) and
+    relative_anomaly (v3.3) data already computed for the same
+    candidate. Returns None if neither input is available, rather than
+    a fabricated middle value."""
+    parts = []
+    weights = []
+
+    if velocity:
+        vol_ratio = velocity.get("volume_ratio")
+        if vol_ratio is not None:
+            # 1x (normal) -> 0, 5x+ -> 100, squashed
+            vol_score = max(0.0, min(100.0, (vol_ratio - 1.0) * 25.0))
+            parts.append(vol_score)
+            weights.append(0.4)
+        accel = velocity.get("price_acceleration_pct")
+        if accel is not None:
+            # abs(accel) since deceleration is ALSO an emergence signal
+            # (something changing direction sharply), not just accel-up
+            accel_score = max(0.0, min(100.0, abs(accel) * 2.5))
+            parts.append(accel_score)
+            weights.append(0.3)
+
+    if relative_anomaly and relative_anomaly.get("available"):
+        vol_pct = relative_anomaly.get("volume_percentile")
+        if vol_pct is not None:
+            parts.append(vol_pct)
+            weights.append(0.3)
+
+    if not parts:
+        return None
+    total_w = sum(weights)
+    return round(sum(p * w for p, w in zip(parts, weights)) / total_w, 1)
+
+
 def compute_pearl_score(symbol: str, coin_snapshot: Optional[dict], whale_accum: Optional[dict],
                          news: Optional[dict], risk: dict, onchain_quality: Optional[float],
                          liquidity_score_override: Optional[float] = None,
