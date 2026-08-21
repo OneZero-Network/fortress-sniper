@@ -81,10 +81,26 @@ def compute_ecosystem_trend(coin_own_pct_7d: Optional[float], sector_peer_pct_7d
                 "detail": f"underperforming its sector average by {delta:+.1f}pp ({coin_own_pct_7d:+.1f}% vs sector {sector_avg:+.1f}%)"}
     return {"available": True, "label": "IN_LINE_WITH_SECTOR", "sector_avg_pct_7d": round(sector_avg, 1),
             "detail": f"roughly tracking its sector average ({coin_own_pct_7d:+.1f}% vs sector {sector_avg:+.1f}%)"}
+
+
+def detect_breakout(coin_id: str) -> dict:
     """Reuses the cached OHLC fetch (v3.3) — costs zero additional API
     calls if velocity already fetched this coin's history this run.
     Checks today's close against the prior 20-day high, EXCLUDING today
-    (so a coin can't 'break out' against its own current price)."""
+    (so a coin can't 'break out' against its own current price).
+
+    v3.9.1 HOTFIX: this function's 'def' line was accidentally deleted
+    during a v3.7 edit that inserted compute_ecosystem_trend() above it —
+    the function body survived as orphaned dead code with no header,
+    meaning every call to trend_breakout.detect_breakout() raised
+    AttributeError (function doesn't exist), silently caught by the
+    calling code's try/except and defaulted to label='NONE' every time.
+    That is the CONFIRMED root cause of breakout showing +0.0 for every
+    single Top-5 candidate across at least two production runs — not a
+    market-conditions coincidence, a real bug. Restored here, along with
+    ALWAYS-computed distance-to-high/low (requested explicitly, even
+    when no breakout fires) and a volume-persistence check.
+    """
     try:
         hist = cdata.fetch_daily_ohlc(coin_id, days=30)
     except Exception as e:
@@ -96,13 +112,43 @@ def compute_ecosystem_trend(coin_own_pct_7d: Optional[float], sector_peer_pct_7d
 
     close_today = float(hist["close"].iloc[-1])
     prior_20d_high = float(hist["high"].iloc[-21:-1].max())
+    prior_20d_low = float(hist["low"].iloc[-21:-1].min())
 
     if prior_20d_high <= 0:
         return {"available": False, "label": "NONE"}
 
+    # ALWAYS computed now, not just when a breakout fires — per explicit
+    # request: "even if the current breakout score is zero, explicitly
+    # report distance from recent high/low."
+    dist_from_high_pct = round(100.0 * (close_today - prior_20d_high) / prior_20d_high, 2)
+    dist_from_low_pct = round(100.0 * (close_today - prior_20d_low) / prior_20d_low, 2)
+
+    # Volume persistence: is today's elevated volume the FIRST elevated
+    # day, or has it been elevated for several consecutive days already?
+    # This distinguishes a fresh spike from an established, multi-day move.
+    volume = hist["volume"].astype(float)
+    avg_vol_30d = volume.iloc[:-1].mean() if len(volume) > 1 else None
+    consecutive_elevated_days = 0
+    if avg_vol_30d and avg_vol_30d > 0:
+        for v in reversed(volume.tolist()):
+            if v > avg_vol_30d * 1.5:
+                consecutive_elevated_days += 1
+            else:
+                break
+
+    result = {
+        "available": True,
+        "dist_from_20d_high_pct": dist_from_high_pct,
+        "dist_from_20d_low_pct": dist_from_low_pct,
+        "consecutive_elevated_volume_days": consecutive_elevated_days,
+    }
+
     if close_today > prior_20d_high:
-        pct_above = round(100.0 * (close_today - prior_20d_high) / prior_20d_high, 2)
-        return {"available": True, "label": "BREAKOUT", "pct_above_20d_high": pct_above,
-                "detail": f"closed {pct_above:+.1f}% above its prior 20-day high"}
-    return {"available": True, "label": "NO_BREAKOUT", "pct_above_20d_high": None,
-            "detail": "trading within its recent 20-day range"}
+        result.update({"label": "BREAKOUT", "pct_above_20d_high": dist_from_high_pct,
+                        "detail": f"closed {dist_from_high_pct:+.1f}% above its prior 20-day high"})
+    else:
+        result.update({"label": "NO_BREAKOUT", "pct_above_20d_high": None,
+                        "detail": (f"trading within its recent 20-day range "
+                                    f"({dist_from_high_pct:+.1f}% from the high, {dist_from_low_pct:+.1f}% from the low"
+                                    f"{f', volume elevated {consecutive_elevated_days}d running' if consecutive_elevated_days >= 2 else ''})")})
+    return result

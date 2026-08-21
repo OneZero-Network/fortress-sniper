@@ -220,8 +220,17 @@ def compute_pearl_priority_v2(discovery_score: Optional[float], emergence_score:
     components["discovery"] = round(discovery_score * 0.45, 1)
     components["emergence"] = round((emergence_score if emergence_score is not None else 50.0) * 0.25, 1)
 
-    trend_pts = 6 if trend_change.get("label") == "REVERSAL_BULLISH" else (
-        -6 if trend_change.get("label") == "REVERSAL_BEARISH" else 0)
+    trend_label = trend_change.get("label")
+    if trend_label == "REVERSAL_BULLISH":
+        trend_pts = 6
+    elif trend_label == "REVERSAL_BEARISH":
+        trend_pts = -6
+    elif trend_label == "CONTINUATION_UP":
+        trend_pts = 2  # smaller than a fresh reversal — sustained trend confirmation, not a new event
+    elif trend_label == "CONTINUATION_DOWN":
+        trend_pts = -2
+    else:
+        trend_pts = 0
     components["trend_change"] = trend_pts
 
     breakout_pts = 6 if breakout.get("label") == "BREAKOUT" else 0
