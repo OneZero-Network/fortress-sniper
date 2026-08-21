@@ -532,11 +532,18 @@ def run() -> None:
                 # silently broken before — see the fix note in
                 # trend_breakout.py). Shows distance-to-high/low and
                 # volume persistence even when no breakout is confirmed.
+                # RAW VALUES also shown per explicit instruction: "don't
+                # tune a breakout model until we know the calculation is
+                # correct" — this exposes current_price/20d_high/diff/pct
+                # directly so the math can be audited from the message
+                # itself, not just inferred.
                 bo = c.get("breakout") or {}
                 if bo.get("available"):
                     vol_persist = f", vol elevated {bo['consecutive_elevated_volume_days']}d" if bo.get("consecutive_elevated_volume_days", 0) >= 2 else ""
                     structure_str = (f"\n   📐 Structure: {bo['dist_from_20d_high_pct']:+.1f}% from 20d high, "
-                                     f"{bo['dist_from_20d_low_pct']:+.1f}% from 20d low{vol_persist}, {bo['label']}")
+                                     f"{bo['dist_from_20d_low_pct']:+.1f}% from 20d low{vol_persist}, {bo['label']}\n"
+                                     f"   🔍 RAW AUDIT: price=${bo['current_price']:.6f} | 20d_high=${bo['prior_20d_high_raw']:.6f} "
+                                     f"| diff=${bo['diff_from_high_usd']:.6f} | rows_used={bo['ohlc_rows_used']}")
                 else:
                     structure_str = "\n   📐 Structure: n/a (insufficient price history)"
 
