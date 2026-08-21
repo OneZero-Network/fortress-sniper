@@ -527,9 +527,22 @@ def run() -> None:
                 persist = get_symbol_persistence(c["symbol"])
                 persist_str = (f" | 📅 seen {persist['times_seen']}x over {persist['days_in_radar']}d"
                                if persist["times_seen"] > 0 else " | 📅 first time on radar")
+
+                # v3.9.1 — breakout structure, ALWAYS shown (this was
+                # silently broken before — see the fix note in
+                # trend_breakout.py). Shows distance-to-high/low and
+                # volume persistence even when no breakout is confirmed.
+                bo = c.get("breakout") or {}
+                if bo.get("available"):
+                    vol_persist = f", vol elevated {bo['consecutive_elevated_volume_days']}d" if bo.get("consecutive_elevated_volume_days", 0) >= 2 else ""
+                    structure_str = (f"\n   📐 Structure: {bo['dist_from_20d_high_pct']:+.1f}% from 20d high, "
+                                     f"{bo['dist_from_20d_low_pct']:+.1f}% from 20d low{vol_persist}, {bo['label']}")
+                else:
+                    structure_str = "\n   📐 Structure: n/a (insufficient price history)"
+
                 lines.append(f"{i}. <b>{c['symbol']}</b> — Priority {c['pearl_priority_score']}/100{alert_tag}\n"
                              f"   Discovery {ds} | Emergence {emg}{persist_str}\n"
-                             f"   ({comp_str})\n"
+                             f"   ({comp_str}){structure_str}\n"
                              f"   <i>{c.get('why_now', '')}</i>")
 
         # ── ⚡ EMERGENCE ALERTS — the GOOD case, called out explicitly,
