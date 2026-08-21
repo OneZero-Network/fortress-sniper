@@ -201,6 +201,143 @@ def compute_false_pearl_risk_pct(risk: dict) -> int:
     return _FALSE_PEARL_RISK_PCT.get(severity, 50)
 
 
+def compute_breakout_strength(breakout: dict, velocity: Optional[dict], ecosystem_trend: dict) -> Optional[float]:
+    """v4.0 — 'How convincing is the breakout?' Rewards magnitude,
+    volume confirmation, and sector outperformance WITHOUT penalizing
+    how far above the prior high the price already is — that's what
+    Freshness is for, kept deliberately separate per explicit
+    instruction: strength and freshness answer different questions and
+    conflating them was exactly the gap that made ONG (132% extended)
+    look identical to PEOPLE (17.9%, fresher) in the old binary +6 flag."""
+    if not breakout or not breakout.get("available"):
+        return None
+    base = 40.0
+    dist = breakout.get("dist_from_20d_high_pct") or 0.0
+    if dist > 0:
+        base += min(30.0, dist * 0.25)  # magnitude matters for strength, uncapped concern about extension
+    if velocity and velocity.get("volume_ratio"):
+        base += min(20.0, (velocity["volume_ratio"] - 1.0) * 3.0)
+    if ecosystem_trend and ecosystem_trend.get("label") == "ABOVE_SECTOR":
+        base += 10.0
+    return round(max(0.0, min(100.0, base)), 1)
+
+
+def compute_breakout_freshness(breakout: dict) -> Optional[float]:
+    """v4.0 — 'How early are we, relative to the breakout?' The INVERSE
+    concern from Strength: a coin that's 132% above its prior high with
+    7 days of elevated volume is a MOMENTUM EVENT already well underway,
+    not an early discovery — Freshness scores that low deliberately,
+    regardless of how strong/convincing the move itself looks."""
+    if not breakout or not breakout.get("available"):
+        return None
+    dist = breakout.get("dist_from_20d_high_pct") or 0.0
+    elevated_days = breakout.get("consecutive_elevated_volume_days") or 0
+
+    dist_penalty = min(70.0, max(0.0, dist) * 0.5)
+    days_penalty = min(20.0, elevated_days * 3.0)
+    freshness = 100.0 - dist_penalty - days_penalty
+    return round(max(0.0, min(100.0, freshness)), 1)
+
+
+def compute_overextension_penalty(freshness: Optional[float]) -> float:
+    """v4.0 — a PENALTY, not another positive signal, per explicit
+    instruction: 'that prevents +132% above breakout from automatically
+    looking better than +10% with fresh acceleration.' Low freshness
+    directly costs priority points rather than freshness simply being
+    absent from the positive side of the ledger."""
+    if freshness is None:
+        return 0.0
+    return round(-((100.0 - freshness) / 100.0) * 12.0, 1)  # up to -12 for freshness=0
+
+
+def classify_pearl_type(discovery_score: Optional[float], evidence_completeness_pct: Optional[float],
+                         emergence_score: Optional[float], freshness: Optional[float],
+                         false_pearl_risk_pct: int, tier: Optional[str]) -> dict:
+    """v4.0 — the 5-way classification your mentor specified. This is a
+    DISPLAY/interpretation label layered on top of the existing tier
+    system (PEARL/HIGH_POTENTIAL/CANDIDATE/WATCH/FALSE_PEARL from
+    classify_tier()) — it does NOT replace that authority, it explains
+    what KIND of opportunity a candidate represents once it's already
+    cleared the evidence bar to be shown at all."""
+    if false_pearl_risk_pct >= 70:
+        return {"label": "🚫 FALSE PEARL", "detail": "attractive surface behavior contradicted by risk/evidence"}
+    if tier == "WATCH":
+        return {"label": "👀 WATCH", "detail": "interesting but weak/incomplete evidence"}
+
+    high_evidence = (evidence_completeness_pct or 0) >= 60
+    high_discovery = (discovery_score or 0) >= 80
+    high_emergence = (emergence_score or 0) >= 75
+    high_freshness = freshness is not None and freshness >= 60
+    low_freshness = freshness is not None and freshness < 30
+
+    if high_discovery and high_emergence and high_freshness:
+        return {"label": "💎 EARLY PEARL", "detail": "strong evidence + fresh emergence — the closest thing to the original 'find it before it's obvious' goal"}
+    if (high_discovery or high_emergence) and low_freshness:
+        return {"label": "🚀 MOMENTUM BREAKOUT", "detail": "very strong move but already extended — this is a momentum event, not necessarily an early discovery"}
+    if high_emergence and not high_discovery:
+        return {"label": "⚡ EMERGENCE ALERT", "detail": "something changing rapidly; insufficient confirmation yet"}
+    return {"label": "👀 WATCH", "detail": "interesting but weak/incomplete evidence"}
+
+
+def compute_pearl_priority_v3(discovery_score: Optional[float], emergence_score: Optional[float],
+                               trend_change: dict, breakout: dict, ecosystem_trend: dict, velocity: Optional[dict],
+                               evidence_completeness_pct: Optional[float], false_pearl_risk_pct: int) -> dict:
+    """v4.0 — Pearl Priority v3. Same RANKING-ONLY boundary as v1/v2
+    (discovery_score alone still drives tier classification via
+    classify_tier(), never this score). The change: replaces the old
+    BINARY breakout flag (+6 regardless of whether a move is 15% or
+    132% extended) with separately-computed Breakout Strength (how
+    convincing) and Freshness (how early), with overextension as an
+    explicit PENALTY rather than another positive signal — per the
+    explicit instruction this prevents '+132% above breakout'
+    automatically outranking '+10% with fresh acceleration.'
+
+    Returns {"final": float, "components": {...}, "breakout_strength":
+    float|None, "breakout_freshness": float|None, "pearl_type": dict}.
+    """
+    if discovery_score is None:
+        return {"final": None, "components": {}, "breakout_strength": None,
+                "breakout_freshness": None, "pearl_type": None}
+
+    components = {}
+    components["discovery"] = round(discovery_score * 0.40, 1)
+    components["emergence"] = round((emergence_score if emergence_score is not None else 50.0) * 0.20, 1)
+
+    trend_label = trend_change.get("label")
+    if trend_label == "REVERSAL_BULLISH":
+        trend_pts = 6
+    elif trend_label == "REVERSAL_BEARISH":
+        trend_pts = -6
+    elif trend_label == "CONTINUATION_UP":
+        trend_pts = 2
+    elif trend_label == "CONTINUATION_DOWN":
+        trend_pts = -2
+    else:
+        trend_pts = 0
+    components["trend_change"] = trend_pts
+
+    strength = compute_breakout_strength(breakout, velocity, ecosystem_trend)
+    freshness = compute_breakout_freshness(breakout)
+    components["breakout_strength"] = round((strength or 0) * 0.12, 1) if strength is not None else 0.0
+    components["overextension_penalty"] = compute_overextension_penalty(freshness)
+
+    sector_pts = 5 if ecosystem_trend.get("label") == "ABOVE_SECTOR" else (
+        -5 if ecosystem_trend.get("label") == "BELOW_SECTOR" else 0)
+    components["sector"] = sector_pts
+
+    completeness_pts = round(((evidence_completeness_pct or 0) / 100.0) * 8, 1)
+    components["evidence_completeness"] = completeness_pts
+
+    risk_pts = round(-((false_pearl_risk_pct or 0) / 100.0) * 15, 1)
+    components["false_pearl_penalty"] = risk_pts
+
+    final = sum(components.values())
+    final = round(max(0.0, min(100.0, final)), 1)
+
+    return {"final": final, "components": components,
+            "breakout_strength": strength, "breakout_freshness": freshness}
+
+
 def compute_pearl_priority_v2(discovery_score: Optional[float], emergence_score: Optional[float],
                                trend_change: dict, breakout: dict, ecosystem_trend: dict,
                                evidence_completeness_pct: Optional[float], false_pearl_risk_pct: int) -> dict:
