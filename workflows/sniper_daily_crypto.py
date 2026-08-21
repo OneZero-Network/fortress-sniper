@@ -105,6 +105,18 @@ def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
     return result
 
 
+def _format_candidate_short(c: dict) -> str:
+    """Compact one-line format — symbol, score, status. No component
+    breakdown, no reasons/invalidation text, no velocity/divergence
+    detail. That detail still exists (see the Sheets export and, if you
+    want it, _format_candidate() for the full view) — this is just what
+    goes into the everyday Telegram message so it's actually scannable."""
+    score = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
+    status_short = c["status"].split(" — ")[0] if c.get("status") else "?"
+    tier_tag = f"[{c.get('universe_tier', '')}]" if c.get("universe_tier") not in (None, "WATCHLIST") else ""
+    return f"{c['symbol']} {tier_tag} — {score}/100 — {status_short}"
+
+
 def _format_candidate(c: dict) -> str:
     comps = c["components"]
 
@@ -428,69 +440,46 @@ def run() -> None:
     log.info(f"{len(pearl_candidates)} PEARL CANDIDATE(s), {len(watch_candidates)} WATCH, "
              f"{len(avoid_candidates)} AVOID")
 
-    from core.db import get_pearl_flywheel_stats
-    fw_stats = get_pearl_flywheel_stats()
-    fw_line = ("📊 Track record so far: " + ", ".join(f"{k}={v}" for k, v in sorted(fw_stats.items()))
-               if fw_stats else "📊 Track record: no resolved observations yet — flywheel just started")
-
-    coverage_note = (f" | ⚠️ {len(skipped_budget)} skipped (API budget)" if skipped_budget else "")
-    rate_limit_note = " | ⚠️ provider rate-limited during this run" if cdata.was_rate_limited_this_run() else ""
+    coverage_note = (f" | ⚠️{len(skipped_budget)} budget-skipped" if skipped_budget else "")
+    rate_limit_note = " | ⚠️rate-limited" if cdata.was_rate_limited_this_run() else ""
     diagnostic_block = (
-        f"🔬 <b>PEARL PIPELINE DIAGNOSTIC</b> — {datetime.now(timezone.utc).strftime('%d %b')}\n"
-        f"Universe: {diag['universe']} | Scanned: {diag['scanned']} | Usable: {diag['usable']} | "
-        f"Entered scorer: {diag['entered_scorer']}{coverage_note}\n"
-        f"API calls this run: {cdata.get_api_call_count()}/{cdata.API_CALL_BUDGET}{rate_limit_note}\n"
-        f"Rejected — missing data: {diag['rejected_missing_data']} | "
-        f"false pearl: {diag['rejected_false_pearl']} | "
-        f"insufficient evidence: {diag['rejected_insufficient_evidence']}\n"
-        f"Score distribution — 90+: {diag['score_90plus']} | 80-89: {diag['score_80_89']} | "
-        f"70-79: {diag['score_70_79']} | 60-69: {diag['score_60_69']}\n"
-        f"Final — ⭐ Pearls: {diag['final_pearl']} | 🔎 High-Potential: {diag['final_high_potential']} | "
-        f"Candidates: {diag['final_candidate']} | 👀 Watch: {diag['final_watch']} | 🚫 False Pearls: {diag['final_false_pearl']}\n"
+        f"Scanned {diag['scanned']}, scored {diag['entered_scorer']}{coverage_note}{rate_limit_note} — "
+        f"⭐{diag['final_pearl']} 🔎HP{diag['final_high_potential']} "
+        f"Cand{diag['final_candidate']} 👀{diag['final_watch']} 🚫{diag['final_false_pearl']}\n"
     )
 
     header = (
-        f"🔎 <b>FORTRESS_CRYPTO — Pearl Detection Machine</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n\n"
-        f"📊 <b>Evidence Level: {ev['label']}</b>\n"
-        f"<i>Every score below is built from unvalidated (Level 0) observation signals — "
-        f"whale activity, news, liquidity, price structure, on-chain health. This means: "
-        f"'deserves attention,' NOT 'will make money.' No layer here has been proven predictive yet — "
-        f"research continues in parallel (see the Research Tools workflow).</i>\n\n"
-        f"🌐 Market regime (context only — this layer is REJECTED, not used in scoring): {regime['label']}\n"
-        f"{fw_line}\n\n"
+        f"🔎 <b>FORTRESS_CRYPTO — Pearl Detection Machine</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n"
+        f"📊 Evidence Level: {ev['label']} — deserves attention, NOT a buy/sell signal.\n"
+        f"🌐 Regime (context only, not scored): {regime['label']}\n\n"
         f"{diagnostic_block}"
     )
 
     if pearl_tier or high_potential_tier or candidate_tier or watch_candidates or avoid_candidates:
         lines = [header]
         if pearl_tier:
-            lines.append(f"\n━━━ ⭐ PEARLS ({len(pearl_tier)}) ━━━\n")
-            for c in pearl_tier[:10]:
-                lines.append(_format_candidate(c))
-                lines.append("")
+            lines.append(f"\n⭐ <b>PEARLS ({len(pearl_tier)})</b>")
+            for c in pearl_tier[:15]:
+                lines.append(_format_candidate_short(c))
         if high_potential_tier:
-            lines.append(f"\n━━━ 🔎 HIGH-POTENTIAL ({len(high_potential_tier)}) — score clears 80, but evidence coverage is incomplete ━━━\n")
-            for c in high_potential_tier[:10]:
-                missing = [n for n in ("whale", "news", "liquidity", "structure", "onchain")
-                           if n not in c.get("components_available", [])]
-                lines.append(f"<b>{c['symbol']}</b> — Score {c['discovery_score']}/100 "
-                             f"(Evidence completeness {c['evidence_completeness_pct']}%)\n"
-                             f"   Missing: {', '.join(missing) if missing else 'none'}\n"
-                             f"   Status: insufficient evidence for Pearl — worth a manual look")
-                lines.append("")
+            lines.append(f"\n🔎 <b>HIGH-POTENTIAL ({len(high_potential_tier)})</b> — score 80+, evidence incomplete")
+            for c in high_potential_tier[:15]:
+                score = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
+                lines.append(f"{c['symbol']} — {score}/100 — worth a manual look")
         if candidate_tier:
-            lines.append(f"\n━━━ 🔎 CANDIDATES ({len(candidate_tier)}) — interesting but incomplete evidence ━━━\n")
-            for c in candidate_tier[:10]:
-                lines.append(_format_candidate(c))
-                lines.append("")
+            lines.append(f"\n🔎 <b>CANDIDATES ({len(candidate_tier)})</b>")
+            for c in candidate_tier[:15]:
+                lines.append(_format_candidate_short(c))
         if watch_candidates:
-            lines.append(f"\n━━━ 👀 WATCH ({len(watch_candidates)}) ━━━")
-            for c in watch_candidates[:8]:
-                lines.append(f"   {c['symbol']}: {c['discovery_score']}/100, evidence completeness {c['evidence_completeness_pct']}%, false-pearl risk {c['false_pearl_risk_pct']}%")
+            lines.append(f"\n👀 <b>WATCH ({len(watch_candidates)})</b>")
+            for c in watch_candidates[:15]:
+                lines.append(f"{c['symbol']} — {c['discovery_score']:.0f}/100")
         if avoid_candidates:
-            lines.append(f"\n━━━ 🚫 FALSE PEARLS ({len(avoid_candidates)}) ━━━")
-            for c in avoid_candidates[:8]:
-                lines.append(f"   {c['symbol']}: {c['false_pearl_risk_pct']}% false-pearl risk (score would've been {c['discovery_score']})")
+            lines.append(f"\n🚫 <b>FALSE PEARLS ({len(avoid_candidates)})</b> — high risk, do not investigate")
+            for c in avoid_candidates[:15]:
+                lines.append(f"{c['symbol']} — {c['false_pearl_risk_pct']}% false-pearl risk")
+        lines.append(f"\n<i>Full detail (why each surfaced, component breakdown, velocity/divergence) "
+                     f"is in the CRYPTO_PEARL_CANDIDATES sheet — this message is intentionally compact.</i>")
         message = "\n".join(lines)
     else:
         message = header + "\nNo candidates surfaced enough evidence today. That's a legitimate outcome, not a failure — this ran successfully and found nothing worth your attention right now."
