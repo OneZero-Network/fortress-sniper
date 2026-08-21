@@ -138,9 +138,14 @@ def detect_breakout(coin_id: str) -> dict:
 
     result = {
         "available": True,
+        "current_price": close_today,
+        "prior_20d_high_raw": prior_20d_high,
+        "prior_20d_low_raw": prior_20d_low,
+        "diff_from_high_usd": round(close_today - prior_20d_high, 8),
         "dist_from_20d_high_pct": dist_from_high_pct,
         "dist_from_20d_low_pct": dist_from_low_pct,
         "consecutive_elevated_volume_days": consecutive_elevated_days,
+        "ohlc_rows_used": len(hist),
     }
 
     if close_today > prior_20d_high:
