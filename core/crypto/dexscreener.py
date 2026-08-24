@@ -146,18 +146,73 @@ def check_dex_security(pair: dict) -> dict:
 
 
 def fetch_boosted_base_tokens(limit: int = 30) -> List[dict]:
-    """Stage 1a — discovery seed. Uses the token-boosts endpoint (surfaces
-    recently-active/promoted tokens across chains) filtered to Base.
-    NOTE: boost activity itself is explicitly NOT used as a signal (see
-    module docstring) — this is only used to generate a candidate LIST
-    to then fetch real pair data for, same way the CoinGecko scanner
-    uses market-cap rank purely to generate a candidate list."""
+    """Discovery source A — token-boosts endpoint. NOTE: boost activity
+    itself is explicitly NOT used as a signal (see module docstring) —
+    only used to generate a candidate list. Per the honest finding from
+    v4.7's first real run: this source alone returned exactly 1 token,
+    far too narrow to be 'Base discovery' — it must be ONE of several
+    sources, never the whole universe."""
     data = _get("/token-boosts/latest/v1")
     if not data:
         return []
     tokens = data if isinstance(data, list) else data.get("tokens", [])
     base_tokens = [t for t in tokens if t.get("chainId") == "base"]
+    for t in base_tokens:
+        t["_source"] = "BOOSTED"
     return base_tokens[:limit]
+
+
+def fetch_profiled_base_tokens(limit: int = 30) -> List[dict]:
+    """Discovery source B — token-profiles endpoint. A DIFFERENT curated
+    feed than token-boosts (tokens that have set up a DexScreener
+    profile — logo, socials, description — a weaker, less-gameable
+    signal of genuine project activity than a paid boost, though still
+    not a full universe scan)."""
+    data = _get("/token-profiles/latest/v1")
+    if not data:
+        return []
+    tokens = data if isinstance(data, list) else data.get("tokens", [])
+    base_tokens = [t for t in tokens if t.get("chainId") == "base"]
+    for t in base_tokens:
+        t["_source"] = "PROFILED"
+    return base_tokens[:limit]
+
+
+def fetch_search_base_pairs(query_terms: List[str] = None) -> List[dict]:
+    """Discovery source C — the search endpoint, queried against common
+    Base quote-token tickers. This is the closest approximation to a
+    genuine 'active pairs' scan the free public API offers (DexScreener
+    doesn't expose a bare 'list every pair on chain X' endpoint) — most
+    real trading activity on Base quotes against WETH or USDC, so
+    searching for those terms surfaces a broader, less-curated set of
+    currently-active pairs than either boost or profile feeds. Returns
+    full pair objects directly (unlike the other two sources, which
+    return token stubs needing a follow-up fetch_pair_data call)."""
+    query_terms = query_terms or ["WETH", "USDC"]
+    all_pairs = []
+    for term in query_terms:
+        data = _get(f"/latest/dex/search?q={term}")
+        if not data:
+            continue
+        pairs = data.get("pairs") or []
+        base_pairs = [p for p in pairs if p.get("chainId") == "base"]
+        for p in base_pairs:
+            p["_source"] = "SEARCH"
+        all_pairs.extend(base_pairs)
+    return all_pairs
+
+
+def dedupe_pairs_by_address(pairs: List[dict]) -> List[dict]:
+    """Multiple discovery sources can surface the SAME pair — dedupe by
+    pairAddress, keeping the first-seen source tag (source attribution
+    matters for later measuring which discovery channel is actually
+    valuable, per the roadmap's 'keep boosted as a separate label')."""
+    seen = {}
+    for p in pairs:
+        addr = p.get("pairAddress")
+        if addr and addr not in seen:
+            seen[addr] = p
+    return list(seen.values())
 
 
 def fetch_pair_data(token_address: str, chain: str = "base") -> Optional[dict]:
@@ -174,26 +229,40 @@ def fetch_pair_data(token_address: str, chain: str = "base") -> Optional[dict]:
     return max(base_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0)
 
 
-def apply_viability_filters(pair: dict) -> dict:
-    """Stage 2 — reject: low liquidity, low volume, too few transactions.
-    Returns {"passes": bool, "reasons": [...]} — reasons list is always
-    populated (even on pass, showing what was checked), never a bare
-    True/False with no explanation."""
+def apply_liquidity_filter(pair: dict) -> dict:
+    """Stage 2a — liquidity floor only, split out from the combined
+    viability check so the discovery funnel can report each stage's
+    survivor count separately, per explicit request."""
     liquidity = (pair.get("liquidity") or {}).get("usd") or 0
+    passes = liquidity >= MIN_LIQUIDITY_USD
+    return {"passes": passes, "liquidity_usd": liquidity,
+            "reason": "passes liquidity floor" if passes else f"liquidity ${liquidity:,.0f} below ${MIN_LIQUIDITY_USD:,} floor"}
+
+
+def apply_activity_filter(pair: dict) -> dict:
+    """Stage 2b — volume + transaction floors only, split out from the
+    combined viability check for the same funnel-reporting reason."""
     volume_24h = (pair.get("volume") or {}).get("h24") or 0
     txns_24h_data = (pair.get("txns") or {}).get("h24") or {}
     txns_24h = (txns_24h_data.get("buys") or 0) + (txns_24h_data.get("sells") or 0)
-
     reasons = []
-    if liquidity < MIN_LIQUIDITY_USD:
-        reasons.append(f"liquidity ${liquidity:,.0f} below ${MIN_LIQUIDITY_USD:,} floor")
     if volume_24h < MIN_VOLUME_24H_USD:
         reasons.append(f"24h volume ${volume_24h:,.0f} below ${MIN_VOLUME_24H_USD:,} floor")
     if txns_24h < MIN_TXNS_24H:
         reasons.append(f"{txns_24h} txns/24h below {MIN_TXNS_24H} floor")
+    return {"passes": len(reasons) == 0, "volume_24h_usd": volume_24h, "txns_24h": txns_24h,
+            "reasons": reasons or ["passes activity floor"]}
 
-    return {"passes": len(reasons) == 0, "reasons": reasons or ["passes all viability floors"],
-            "liquidity_usd": liquidity, "volume_24h_usd": volume_24h, "txns_24h": txns_24h}
+
+def apply_viability_filters(pair: dict) -> dict:
+    """Combined liquidity + activity check — kept for any caller that
+    wants the single combined pass/fail (e.g. dex_flywheel.py's
+    resolution path doesn't need the split funnel detail)."""
+    liq = apply_liquidity_filter(pair)
+    act = apply_activity_filter(pair)
+    reasons = ([] if liq["passes"] else [liq["reason"]]) + (act["reasons"] if not act["passes"] else [])
+    return {"passes": liq["passes"] and act["passes"], "reasons": reasons or ["passes all viability floors"],
+            "liquidity_usd": liq["liquidity_usd"], "volume_24h_usd": act["volume_24h_usd"], "txns_24h": act["txns_24h"]}
 
 
 def compute_flow_signals(pair: dict) -> dict:
