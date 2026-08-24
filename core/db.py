@@ -282,9 +282,28 @@ def init_crypto_tables() -> None:
             first_seen_at       TEXT,
             first_seen_price    REAL,
             first_seen_liquidity_usd REAL,
+            first_seen_volume_24h_usd REAL,
+            first_seen_buys     INTEGER,
+            first_seen_sells    INTEGER,
+            first_seen_txns     INTEGER,
             first_seen_pair_age_hours REAL,
             first_seen_vol_accel_ratio REAL,
-            first_seen_flow_label TEXT
+            first_seen_flow_label TEXT,
+            first_seen_security_status TEXT,
+            -- v4.7 resolution columns — appended over time, mirroring the
+            -- proven crypto_pearl_observations pattern. Running max/min
+            -- are updated at each check, never backfilled early.
+            price_1h  REAL, return_1h_pct  REAL, resolved_1h  INTEGER DEFAULT 0,
+            price_6h  REAL, return_6h_pct  REAL, resolved_6h  INTEGER DEFAULT 0,
+            price_24h REAL, return_24h_pct REAL, resolved_24h INTEGER DEFAULT 0,
+            price_3d  REAL, return_3d_pct  REAL, resolved_3d  INTEGER DEFAULT 0,
+            price_7d  REAL, return_7d_pct  REAL, resolved_7d  INTEGER DEFAULT 0,
+            max_upside_pct       REAL,
+            max_drawdown_pct     REAL,
+            liquidity_change_pct REAL,
+            volume_change_pct    REAL,
+            security_status_changed INTEGER DEFAULT 0,
+            last_checked_at      TEXT
         );
         """)
         # Self-migrating column addition for databases created before this
@@ -302,6 +321,28 @@ def init_crypto_tables() -> None:
             log.info("Migrated: added pearl_type_at_discovery column to crypto_pearl_observations")
         except Exception:
             pass  # column already exists — expected on every run after the first
+
+        # v4.7 — new columns on crypto_dex_first_seen (table introduced in
+        # v4.6, so existing deployments need these added, not just created)
+        dex_new_columns = [
+            ("first_seen_volume_24h_usd", "REAL"), ("first_seen_buys", "INTEGER"),
+            ("first_seen_sells", "INTEGER"), ("first_seen_txns", "INTEGER"),
+            ("first_seen_security_status", "TEXT"),
+            ("price_1h", "REAL"), ("return_1h_pct", "REAL"), ("resolved_1h", "INTEGER DEFAULT 0"),
+            ("price_6h", "REAL"), ("return_6h_pct", "REAL"), ("resolved_6h", "INTEGER DEFAULT 0"),
+            ("price_24h", "REAL"), ("return_24h_pct", "REAL"), ("resolved_24h", "INTEGER DEFAULT 0"),
+            ("price_3d", "REAL"), ("return_3d_pct", "REAL"), ("resolved_3d", "INTEGER DEFAULT 0"),
+            ("price_7d", "REAL"), ("return_7d_pct", "REAL"), ("resolved_7d", "INTEGER DEFAULT 0"),
+            ("max_upside_pct", "REAL"), ("max_drawdown_pct", "REAL"),
+            ("liquidity_change_pct", "REAL"), ("volume_change_pct", "REAL"),
+            ("security_status_changed", "INTEGER DEFAULT 0"), ("last_checked_at", "TEXT"),
+        ]
+        for col_name, col_type in dex_new_columns:
+            try:
+                con.execute(f"ALTER TABLE crypto_dex_first_seen ADD COLUMN {col_name} {col_type}")
+                con.commit()
+            except Exception:
+                pass  # column already exists — expected on every run after the first
     log.info(f"Crypto tables initialized in {DB_PATH}")
 
 
@@ -804,23 +845,26 @@ def get_emergence_conversion_rate(days_back: int = 14) -> dict:
 
 
 def log_dex_first_seen(pair_address: str, symbol: str, chain: str, price: float, liquidity_usd: float,
-                        pair_age_hours: float, vol_accel_ratio: float, flow_label: str) -> bool:
-    """v4.6 — INSERT OR IGNORE: only the TRUE first detection is ever
-    stored. Returns True if this was genuinely the first time (a new
-    row was inserted), False if this pair was already seen before
-    (no-op) — the caller can use this to know whether today's scan
-    found something genuinely new."""
+                        volume_24h_usd: float, buys: int, sells: int, pair_age_hours: float,
+                        vol_accel_ratio: float, flow_label: str, security_status: str) -> bool:
+    """v4.7 — full first-seen snapshot, per explicit instruction: 'we
+    need to know exactly what Fortress knew at the moment of discovery'
+    — otherwise a later look at PONS would falsely claim early detection
+    without the receipts. INSERT OR IGNORE: only the TRUE first
+    detection is ever stored. Returns True if this was genuinely new."""
     from datetime import datetime as _dt
     now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    txns = (buys or 0) + (sells or 0)
     with get_conn(write=True) as con:
         cur = con.execute("""
             INSERT OR IGNORE INTO crypto_dex_first_seen
                 (pair_address, symbol, chain, first_seen_at, first_seen_price,
-                 first_seen_liquidity_usd, first_seen_pair_age_hours,
-                 first_seen_vol_accel_ratio, first_seen_flow_label)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (pair_address, symbol.upper(), chain, now, price, liquidity_usd,
-              pair_age_hours, vol_accel_ratio, flow_label))
+                 first_seen_liquidity_usd, first_seen_volume_24h_usd, first_seen_buys,
+                 first_seen_sells, first_seen_txns, first_seen_pair_age_hours,
+                 first_seen_vol_accel_ratio, first_seen_flow_label, first_seen_security_status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (pair_address, symbol.upper(), chain, now, price, liquidity_usd, volume_24h_usd,
+              buys, sells, txns, pair_age_hours, vol_accel_ratio, flow_label, security_status))
         return cur.rowcount > 0
 
 
@@ -828,8 +872,11 @@ def get_dex_first_seen(pair_address: str = None, symbol: str = None) -> Optional
     """Look up by pair_address (preferred, unique) or symbol (may match
     multiple pairs — returns the earliest)."""
     cols = ["pair_address", "symbol", "chain", "first_seen_at", "first_seen_price",
-            "first_seen_liquidity_usd", "first_seen_pair_age_hours",
-            "first_seen_vol_accel_ratio", "first_seen_flow_label"]
+            "first_seen_liquidity_usd", "first_seen_volume_24h_usd", "first_seen_buys",
+            "first_seen_sells", "first_seen_txns", "first_seen_pair_age_hours",
+            "first_seen_vol_accel_ratio", "first_seen_flow_label", "first_seen_security_status",
+            "return_1h_pct", "return_6h_pct", "return_24h_pct", "return_3d_pct", "return_7d_pct",
+            "max_upside_pct", "max_drawdown_pct", "security_status_changed"]
     with get_conn() as con:
         if pair_address:
             row = con.execute(
@@ -845,3 +892,92 @@ def get_dex_first_seen(pair_address: str = None, symbol: str = None) -> Optional
         else:
             return None
     return dict(zip(cols, row)) if row else None
+
+
+def get_dex_pairs_due_for_resolution(horizon: str) -> list:
+    """horizon: '1h'|'6h'|'24h'|'3d'|'7d'. Returns first-seen records old
+    enough for this horizon but not yet resolved at it."""
+    from datetime import datetime as _dt, timedelta as _td
+    hours = {"1h": 1, "6h": 6, "24h": 24, "3d": 72, "7d": 168}
+    cutoff = (_dt.today() - _td(hours=hours[horizon])).strftime("%Y-%m-%d %H:%M:%S")
+    col = f"resolved_{horizon}"
+    cols = ["pair_address", "symbol", "chain", "first_seen_at", "first_seen_price",
+            "first_seen_liquidity_usd", "first_seen_volume_24h_usd", "first_seen_security_status",
+            "max_upside_pct", "max_drawdown_pct"]
+    with get_conn() as con:
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM crypto_dex_first_seen WHERE first_seen_at <= ? AND {col} = 0",
+            (cutoff,)
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def resolve_dex_pair(pair_address: str, horizon: str, price: float, return_pct: float,
+                      liquidity_usd: float = None, volume_24h_usd: float = None,
+                      security_status: str = None) -> None:
+    """v4.7 — appends a resolution AND updates running max_upside/
+    max_drawdown across the pair's whole tracked history — these are
+    running extremes, not point-in-time values, so they're read-modify-
+    written here rather than computed fresh each time."""
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    price_col, return_col, resolved_col = f"price_{horizon}", f"return_{horizon}_pct", f"resolved_{horizon}"
+
+    with get_conn() as con:
+        row = con.execute(
+            "SELECT max_upside_pct, max_drawdown_pct, first_seen_liquidity_usd, "
+            "first_seen_volume_24h_usd, first_seen_security_status FROM crypto_dex_first_seen "
+            "WHERE pair_address = ?", (pair_address,)
+        ).fetchone()
+    if not row:
+        return
+    prev_max_up, prev_max_dd, first_liq, first_vol, first_security = row
+    new_max_up = max(prev_max_up or 0, return_pct)
+    new_max_dd = min(prev_max_dd or 0, return_pct)
+
+    liq_change_pct = round(100.0 * (liquidity_usd - first_liq) / first_liq, 1) if liquidity_usd and first_liq else None
+    vol_change_pct = round(100.0 * (volume_24h_usd - first_vol) / first_vol, 1) if volume_24h_usd and first_vol else None
+    security_changed = 1 if (security_status and first_security and security_status != first_security) else 0
+
+    with get_conn(write=True) as con:
+        con.execute(f"""
+            UPDATE crypto_dex_first_seen
+            SET {price_col}=?, {return_col}=?, {resolved_col}=1,
+                max_upside_pct=?, max_drawdown_pct=?, last_checked_at=?,
+                liquidity_change_pct=COALESCE(?, liquidity_change_pct),
+                volume_change_pct=COALESCE(?, volume_change_pct),
+                security_status_changed=CASE WHEN ?=1 THEN 1 ELSE security_status_changed END
+            WHERE pair_address=?
+        """, (price, return_pct, new_max_up, new_max_dd, now,
+              liq_change_pct, vol_change_pct, security_changed, pair_address))
+
+
+def get_dex_lead_time_vs_coingecko(symbol: str) -> dict:
+    """v4.7 — the specific comparison your mentor asked for: did the DEX
+    lens detect this symbol BEFORE the CoinGecko-sourced Pearl engine
+    did? Compares first_seen_at (DEX) against the earliest observed_at
+    for the same symbol in crypto_pearl_observations (CoinGecko lens).
+    Positive lead_time_hours means DEX detected it first."""
+    with get_conn() as con:
+        dex_row = con.execute(
+            "SELECT first_seen_at FROM crypto_dex_first_seen WHERE symbol = ? "
+            "ORDER BY first_seen_at ASC LIMIT 1", (symbol.upper(),)
+        ).fetchone()
+        cg_row = con.execute(
+            "SELECT observed_at FROM crypto_pearl_observations WHERE symbol = ? "
+            "ORDER BY observed_at ASC LIMIT 1", (symbol.upper(),)
+        ).fetchone()
+
+    if not dex_row or not cg_row:
+        return {"available": False, "detail": "missing data from one or both lenses"}
+
+    from datetime import datetime as _dt
+    dex_time = _dt.strptime(dex_row[0], "%Y-%m-%d %H:%M:%S")
+    cg_time = _dt.strptime(cg_row[0], "%Y-%m-%d %H:%M:%S")
+    lead_hours = round((cg_time - dex_time).total_seconds() / 3600.0, 1)
+
+    return {"available": True, "dex_first_seen": dex_row[0], "coingecko_first_seen": cg_row[0],
+            "lead_time_hours": lead_hours,
+            "detail": (f"DEX detected {lead_hours}h before CoinGecko lens" if lead_hours > 0
+                       else f"CoinGecko detected {-lead_hours}h before DEX lens" if lead_hours < 0
+                       else "both lenses detected at the same time")}
