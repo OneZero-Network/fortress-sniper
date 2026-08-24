@@ -256,6 +256,46 @@ def adapt_to_coin_snapshot(pair: dict) -> dict:
     }
 
 
+def classify_dex_early_move(viability: dict, flow: dict, accel: dict, pair_age_hours: Optional[float],
+                             security: dict, max_pair_age_hours: float = 72.0) -> dict:
+    """v4.7 — 🚨 DEX EARLY MOVE. A STRICTER, all-conditions-must-converge
+    classification, per explicit instruction: 'don't make every Base
+    token appear in Telegram.' Requires ALL of: fresh pair, sufficient
+    liquidity (already gated by viability), accelerating volume,
+    accelerating transactions, buy pressure, meaningful price
+    acceleration, and clean security. Missing even one condition means
+    NOT an early move — still logged/tracked, just not surfaced
+    prominently."""
+    reasons_met = []
+    reasons_missing = []
+
+    is_fresh = pair_age_hours is not None and pair_age_hours <= max_pair_age_hours
+    (reasons_met if is_fresh else reasons_missing).append("fresh pair" if is_fresh else "pair not fresh enough")
+
+    vol_accelerating = accel.get("label") == "ACCELERATING"
+    (reasons_met if vol_accelerating else reasons_missing).append(
+        "volume accelerating" if vol_accelerating else "volume not accelerating")
+
+    txn_accelerating = accel.get("txn_accel_ratio") is not None and accel["txn_accel_ratio"] >= 2.0
+    (reasons_met if txn_accelerating else reasons_missing).append(
+        "transactions accelerating" if txn_accelerating else "transactions not accelerating")
+
+    buy_pressure = flow.get("flow_label") == "STRONG_BUY_PRESSURE"
+    (reasons_met if buy_pressure else reasons_missing).append(
+        "strong buy pressure" if buy_pressure else "no strong buy pressure")
+
+    price_accelerating = flow.get("pct_1h") is not None and flow["pct_1h"] >= 3.0
+    (reasons_met if price_accelerating else reasons_missing).append(
+        "price accelerating" if price_accelerating else "price not accelerating")
+
+    security_clean = security.get("severity") == "CLEAN"
+    (reasons_met if security_clean else reasons_missing).append(
+        "security clean" if security_clean else "security not confirmed clean")
+
+    all_converge = viability["passes"] and is_fresh and vol_accelerating and txn_accelerating and buy_pressure and price_accelerating and security_clean
+    return {"is_early_move": all_converge, "reasons_met": reasons_met, "reasons_missing": reasons_missing}
+
+
 def classify_base_radar_status(viability: dict, flow: dict, security: dict, pair_age_hours: Optional[float]) -> dict:
     """v4.6 — the 🧭 BASE RADAR classification, now with a REAL security
     gate (v4.5 left this as an explicit unclosed gap; v4.6 closes it by
