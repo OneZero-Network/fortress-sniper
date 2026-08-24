@@ -2,16 +2,13 @@
 """
 FORTRESS_CRYPTO — scripts/base_discovery_scan.py
 ══════════════════════════════════════════════════════════════════════════════
-v4.6 — Base DEX Discovery, security gate closed. Runs the full funnel:
-discover boosted Base tokens → fetch pair data → viability filter →
-flow + acceleration signals → REAL security check (reuses risk_engine's
-GoPlus integration, Base natively supported) → adapt into the SAME
-coin_snapshot shape → run through the UNCHANGED pearl_score engine →
-log first-seen timestamp → label 🧭 BASE RADAR / 🚫 HIGH RISK.
-
-A HIGH_RISK token is now genuinely BLOCKED from Base Radar status,
-verified directly: a synthetic honeypot with perfect flow signals was
-confirmed to still get rejected.
+v4.7 — DEX Outcome + Early-Detection Engine. Resolves matured first-seen
+pairs first (same discipline as the Pearl flywheel), then scans for new
+candidates, captures the FULL first-seen snapshot (per explicit
+instruction — "we need to know exactly what Fortress knew at the moment
+of discovery"), and only surfaces 🚨 DEX EARLY MOVE prominently when ALL
+convergence conditions are met — everything else stays logged/tracked
+without flooding Telegram.
 """
 from __future__ import annotations
 import logging
@@ -21,8 +18,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_first_seen
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko
 from core.crypto import dexscreener
+from core.crypto import dex_flywheel
 from core.crypto import pearl_score
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -31,13 +29,17 @@ log = logging.getLogger("fortress.crypto.base_discovery")
 
 
 def run() -> None:
-    log.info("=== Base DEX Discovery v1.1 (manual scan) ===")
+    log.info("=== Base DEX Discovery v4.7 ===")
     init_crypto_tables()
+
+    flywheel_result = dex_flywheel.resolve_matured_dex_pairs()
+    log.info(f"DEX flywheel: {flywheel_result}")
 
     seed_tokens = dexscreener.fetch_boosted_base_tokens(limit=30)
     log.info(f"Discovery seed: {len(seed_tokens)} boosted Base token(s)")
 
-    candidates = []
+    early_moves = []
+    other_candidates = []
     blocked = []
     filtered_out = 0
     new_detections = 0
@@ -53,7 +55,6 @@ def run() -> None:
         viability = dexscreener.apply_viability_filters(pair)
         if not viability["passes"]:
             filtered_out += 1
-            log.info(f"Filtered: {(pair.get('baseToken') or {}).get('symbol')} — {viability['reasons']}")
             continue
 
         flow = dexscreener.compute_flow_signals(pair)
@@ -65,10 +66,13 @@ def run() -> None:
 
         pair_address = pair.get("pairAddress")
         symbol = snapshot["symbol"]
+        txns_24h = (pair.get("txns") or {}).get("h24") or {}
+
         if pair_address:
             was_new = log_dex_first_seen(
-                pair_address, symbol, "base", snapshot["price"],
-                viability["liquidity_usd"], age_hours, accel.get("vol_accel_ratio"), flow["flow_label"])
+                pair_address, symbol, "base", snapshot["price"], viability["liquidity_usd"],
+                viability["volume_24h_usd"], txns_24h.get("buys"), txns_24h.get("sells"),
+                age_hours, accel.get("vol_accel_ratio"), flow["flow_label"], security["severity"])
             if was_new:
                 new_detections += 1
 
@@ -78,48 +82,50 @@ def run() -> None:
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
+        early_move = dexscreener.classify_dex_early_move(viability, flow, accel, age_hours, security)
 
-        candidates.append({"snapshot": snapshot, "flow": flow, "accel": accel, "age_hours": age_hours,
-                           "status": status, "scored": scored, "pair_address": pair_address})
+        entry = {"snapshot": snapshot, "flow": flow, "accel": accel, "age_hours": age_hours,
+                 "status": status, "scored": scored, "early_move": early_move, "pair_address": pair_address}
+        if early_move["is_early_move"]:
+            early_moves.append(entry)
+        else:
+            other_candidates.append(entry)
 
-    log.info(f"Base Radar: {len(candidates)} passed, {len(blocked)} blocked (HIGH_RISK security), "
-             f"{filtered_out} filtered (viability), {new_detections} genuinely new detections")
+    log.info(f"Early moves: {len(early_moves)}, other candidates: {len(other_candidates)}, "
+             f"blocked: {len(blocked)}, filtered: {filtered_out}, new detections: {new_detections}")
 
-    if not candidates and not blocked:
+    if not early_moves and not other_candidates and not blocked:
         message = (f"🧭 <b>Base DEX Discovery</b>\n\n"
                    f"Scanned {len(seed_tokens)} boosted Base token(s), 0 passed viability filters. "
-                   f"That's a legitimate outcome — this ran successfully and found nothing worth "
-                   f"surfacing today.")
+                   f"Legitimate outcome — ran successfully, found nothing worth surfacing today.")
         log.info(message.replace("<b>", "").replace("</b>", ""))
         send_telegram(message)
         return
 
-    candidates.sort(key=lambda c: c["scored"]["discovery_score"] or 0, reverse=True)
+    lines = [f"🧭 <b>Base DEX Discovery</b>"]
 
-    lines = [
-        f"🧭 <b>Base DEX Discovery</b>",
-        f"<i>Security-gated — HIGH_RISK tokens are blocked below, never surfaced as investigable.</i>\n",
-        f"Scanned {len(seed_tokens)} | Passed: {len(candidates)} | "
-        f"Blocked (security): {len(blocked)} | Filtered (viability): {filtered_out} | "
-        f"New detections: {new_detections}\n",
-    ]
-    for c in candidates[:10]:
-        snap = c["snapshot"]
-        accel = c["accel"]
-        ds = c["scored"]["discovery_score"]
-        age_str = f"{c['age_hours']:.0f}h old" if c["age_hours"] is not None else "age unknown"
-        accel_str = f", {accel['label'].lower()}" if accel.get("label") != "NONE" else ""
-        lines.append(
-            f"<b>{snap['symbol']}</b> — {c['status']['detail']}\n"
-            f"   {age_str}{accel_str} | Discovery (preliminary) {ds if ds is not None else 'n/a'}\n"
-        )
+    if early_moves:
+        lines.append(f"\n🚨 <b>DEX EARLY MOVE ({len(early_moves)})</b> — all convergence conditions met")
+        for e in early_moves[:5]:
+            snap = e["snapshot"]
+            lead = get_dex_lead_time_vs_coingecko(snap["symbol"])
+            lead_note = f"\n   {lead['detail']}" if lead.get("available") else ""
+            lines.append(
+                f"<b>{snap['symbol']}</b>\n"
+                f"   Fresh DEX activity + accelerating volume + strong buy imbalance\n"
+                f"   Security: {e['status']['detail'].split(';')[0] if 'flags' not in e['status'] else 'checked'}\n"
+                f"   Evidence: incomplete | First seen: this scan{lead_note}\n"
+                f"   <i>Not a buy signal.</i>\n"
+            )
+
+    lines.append(f"\n<i>Scanned {len(seed_tokens)} | Early moves: {len(early_moves)} | "
+                 f"Other candidates: {len(other_candidates)} (tracked, not surfaced) | "
+                 f"Blocked (security): {len(blocked)} | New detections: {new_detections}</i>")
 
     if blocked:
-        lines.append(f"\n🚫 <b>Blocked ({len(blocked)})</b> — real security check failed, never surfaced above")
-        for b in blocked[:5]:
+        lines.append(f"\n🚫 <b>Blocked ({len(blocked)})</b> — security check failed")
+        for b in blocked[:3]:
             lines.append(f"   {b['snapshot']['symbol']}: {b['status']['detail']}")
-
-    lines.append(f"\n<i>Manual scan only — not wired into the daily production sniper yet.</i>")
 
     message = "\n".join(lines)
     plain = message.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
