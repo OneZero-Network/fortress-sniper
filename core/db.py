@@ -229,6 +229,7 @@ def init_crypto_tables() -> None:
             risk_severity_at_discovery TEXT,
             status_at_discovery     TEXT,
             tier_at_discovery       TEXT,
+            pearl_type_at_discovery TEXT,
             why_it_surfaced         TEXT,
             invalidation_conditions TEXT,
             -- resolution columns — appended over time, never backfilled early
@@ -275,6 +276,12 @@ def init_crypto_tables() -> None:
             con.execute("ALTER TABLE crypto_pearl_observations ADD COLUMN tier_at_discovery TEXT")
             con.commit()
             log.info("Migrated: added tier_at_discovery column to crypto_pearl_observations")
+        except Exception:
+            pass  # column already exists — expected on every run after the first
+        try:
+            con.execute("ALTER TABLE crypto_pearl_observations ADD COLUMN pearl_type_at_discovery TEXT")
+            con.commit()
+            log.info("Migrated: added pearl_type_at_discovery column to crypto_pearl_observations")
         except Exception:
             pass  # column already exists — expected on every run after the first
     log.info(f"Crypto tables initialized in {DB_PATH}")
@@ -487,8 +494,9 @@ def save_pearl_observation(snapshot: dict) -> int:
                  evidence_level, evidence_label, whale_score, whale_label_at_discovery,
                  news_score, news_label_at_discovery, liquidity_score, structure_score,
                  onchain_score, false_pearl_risk_pct, risk_severity_at_discovery,
-                 status_at_discovery, tier_at_discovery, why_it_surfaced, invalidation_conditions)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 status_at_discovery, tier_at_discovery, pearl_type_at_discovery,
+                 why_it_surfaced, invalidation_conditions)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             snapshot["symbol"], snapshot["coin_id"], now, snapshot["price_at_observation"],
             snapshot["discovery_score"], snapshot["evidence_level"], snapshot["evidence_label"],
@@ -497,7 +505,7 @@ def save_pearl_observation(snapshot: dict) -> int:
             snapshot.get("liquidity_score"), snapshot.get("structure_score"),
             snapshot.get("onchain_score"), snapshot["false_pearl_risk_pct"],
             snapshot["risk_severity_at_discovery"], snapshot["status_at_discovery"],
-            snapshot.get("tier_at_discovery"),
+            snapshot.get("tier_at_discovery"), snapshot.get("pearl_type_at_discovery"),
             snapshot["why_it_surfaced"], snapshot["invalidation_conditions"],
         ))
         return cur.lastrowid
@@ -691,4 +699,87 @@ def get_symbol_persistence(symbol: str) -> dict:
         "days_in_radar": days_in_radar,
         "tier_trend": [r[2] for r in rows[-5:]],  # last 5 tier classifications, oldest->newest
         "score_trend": [r[1] for r in rows[-5:]],
+    }
+
+
+def get_pearl_type_outcomes(days_back: int = 14) -> dict:
+    """v4.4 — Pearl Validation Report data source #1. Groups resolved
+    observations by pearl_type_at_discovery (Early Pearl / Emergence /
+    Momentum) and reports outcome buckets: hit +20%/+10% within 7d,
+    thesis held (not invalidated) vs invalidated. This is the report
+    your mentor asked for BEFORE any threshold tuning — evidence, not
+    another feature."""
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = (_dt.today() - _td(days=days_back)).strftime("%Y-%m-%d")
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT pearl_type_at_discovery, return_7d_pct, resolved_7d, lifecycle_state
+            FROM crypto_pearl_observations
+            WHERE observed_at >= ? AND pearl_type_at_discovery IS NOT NULL
+        """, (cutoff,)).fetchall()
+
+    by_type: dict = {}
+    for ptype, r7d, resolved, lifecycle in rows:
+        d = by_type.setdefault(ptype, {"n": 0, "n_resolved_7d": 0, "hit_20pct": 0, "hit_10pct": 0,
+                                        "held_thesis": 0, "invalidated": 0})
+        d["n"] += 1
+        if lifecycle == "INVALIDATED":
+            d["invalidated"] += 1
+        elif lifecycle in ("CONFIRMED", "UNDER_OBSERVATION"):
+            d["held_thesis"] += 1
+        if resolved and r7d is not None:
+            d["n_resolved_7d"] += 1
+            if r7d >= 20:
+                d["hit_20pct"] += 1
+            if r7d >= 10:
+                d["hit_10pct"] += 1
+
+    out = {}
+    for ptype, d in by_type.items():
+        n7 = d["n_resolved_7d"]
+        out[ptype] = {
+            "n_discovered": d["n"],
+            "n_resolved_7d": n7,
+            "pct_hit_20": round(100.0 * d["hit_20pct"] / n7, 1) if n7 else None,
+            "pct_hit_10": round(100.0 * d["hit_10pct"] / n7, 1) if n7 else None,
+            "pct_held_thesis": round(100.0 * d["held_thesis"] / d["n"], 1) if d["n"] else None,
+            "pct_invalidated": round(100.0 * d["invalidated"] / d["n"], 1) if d["n"] else None,
+        }
+    return out
+
+
+def get_emergence_conversion_rate(days_back: int = 14) -> dict:
+    """v4.4 — Pearl Validation Report data source #2. For every symbol
+    that FIRST appeared as an EMERGENCE ALERT, checks whether it EVER
+    later appeared as an EARLY PEARL or HIGH_POTENTIAL — answering
+    'how often does an Emergence Alert become something genuinely
+    interesting.' This is a real, if approximate, conversion-funnel
+    measurement built entirely from data already logged."""
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = (_dt.today() - _td(days=days_back)).strftime("%Y-%m-%d")
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT symbol, observed_at, pearl_type_at_discovery, tier_at_discovery
+            FROM crypto_pearl_observations
+            WHERE observed_at >= ?
+            ORDER BY symbol, observed_at ASC
+        """, (cutoff,)).fetchall()
+
+    by_symbol: dict = {}
+    for symbol, observed_at, ptype, tier in rows:
+        by_symbol.setdefault(symbol, []).append({"observed_at": observed_at, "pearl_type": ptype, "tier": tier})
+
+    emergence_first = [sym for sym, history in by_symbol.items()
+                       if history and history[0]["pearl_type"] == "⚡ EMERGENCE ALERT"]
+    converted = 0
+    for sym in emergence_first:
+        history = by_symbol[sym]
+        if any(h["pearl_type"] == "💎 EARLY PEARL" or h["tier"] == "HIGH_POTENTIAL" for h in history[1:]):
+            converted += 1
+
+    n = len(emergence_first)
+    return {
+        "n_emergence_first_seen": n,
+        "n_converted": converted,
+        "conversion_rate_pct": round(100.0 * converted / n, 1) if n else None,
     }
