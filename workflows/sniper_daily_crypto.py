@@ -214,27 +214,38 @@ def _tally_diagnostic(c: Optional[dict], diag: dict) -> None:
         diag["rejected_missing_data"] += 1
 
 
-def _user_facing_entry(c: dict, rank_emoji: str) -> str:
-    """v4.2 — the investor-facing entry format. Deliberately excludes
-    everything engineering: no raw dollar values, no OHLC timestamps, no
-    component-score decomposition, no rows_used/today_excluded. Answers
-    only: what, why now, how early, how strong is the evidence, what's
-    the main risk. Full technical detail stays in the run log's FULL
-    DETAIL block and the CRYPTO_PEARL_CANDIDATES sheet, unchanged."""
+def _user_facing_entry(c: dict, rank_emoji: str, persist: dict) -> str:
+    """v4.3 — further UX reduction, per explicit instruction, scoring
+    completely frozen: (1) Priority score REMOVED from Telegram —
+    a number like '53/100' reads as a recommendation score even with
+    disclaimers, and category+freshness+why-now is the actually useful
+    information; the exact score stays in the Sheet. (2) Evidence
+    completeness only shown here as an EXCEPTION when it materially
+    differs from the norm (>=60%) — the common ~40% case is now stated
+    ONCE in the banner, not repeated on every single entry. (3) 'Main
+    risk' relabeled 'Watch for' to read less like a warning label and
+    more like guidance. (4) Radar persistence badge added — NEW vs
+    Nth-day, using data the Pearl Flywheel has already been quietly
+    accumulating since v3.9."""
     freshness = c.get("breakout_freshness")
     bo = c.get("breakout") or {}
     move_age = trend_breakout.classify_move_age(bo.get("breakout_age_days")) if bo.get("available") else {"label": ""}
     bullets = pearl_score.build_why_now_bullets(c.get("velocity"), c.get("trend_change", {}), bo, freshness)
     bullet_str = "\n".join(f"   • {b}" for b in bullets) if bullets else "   • No strong co-occurring signals"
-    completeness = c.get("evidence_completeness_pct")
-    comp_str = f"{completeness:.0f}%" if completeness is not None else "n/a"
-    main_risk = c["invalidation_conditions"][0] if c.get("invalidation_conditions") else "unclear"
+    watch_for = c["invalidation_conditions"][0] if c.get("invalidation_conditions") else "unclear"
     type_label = c["pearl_type"]["label"].split(" ", 1)[-1] if c.get("pearl_type") else ""
-    return (f"{rank_emoji} <b>{c['symbol']}</b> — {type_label}\n"
-            f"   Priority: {c['pearl_priority_score']:.0f}/100 | Freshness: {move_age['label']}\n"
-            f"   Why now:\n{bullet_str}\n"
-            f"   Evidence: {comp_str} complete ⚠️\n"
-            f"   Main risk: {main_risk}")
+
+    completeness = c.get("evidence_completeness_pct")
+    evidence_line = ""
+    if completeness is not None and completeness >= 60:
+        evidence_line = f"\n   Evidence: {completeness:.0f}% — stronger confirmation"
+
+    radar_badge = "🆕 NEW" if persist["times_seen"] <= 1 else f"🔁 Day {persist['times_seen']} on radar"
+
+    return (f"{rank_emoji} <b>{c['symbol']}</b> — {type_label} | {radar_badge}\n"
+            f"   {move_age['label']}\n"
+            f"   Why now:\n{bullet_str}{evidence_line}\n"
+            f"   Watch for: {watch_for}")
 
 
 def run() -> None:
@@ -562,24 +573,26 @@ def run() -> None:
         if pearl_tier:
             lines.append(f"💎 <b>{len(pearl_tier)} confirmed Pearl(s) today.</b>")
         else:
-            lines.append(f"No confirmed Pearls yet. The machine found {total_interesting} "
-                         f"early/developing opportunit{'y' if total_interesting == 1 else 'ies'} worth investigating.")
+            lines.append(f"No confirmed Pearls yet. {total_interesting} notable "
+                         f"opportunit{'y' if total_interesting == 1 else 'ies'} detected.")
+        lines.append(f"⚠️ <i>Evidence coverage is currently limited — whale/news/on-chain confirmation "
+                     f"is unavailable for most candidates. These are research opportunities, not buy/sell signals.</i>")
 
         if early_pearls:
-            lines.append(f"\n💎 <b>EARLY PEARLS ({len(early_pearls)})</b> — early in a developing move")
+            lines.append(f"\n💎 <b>EARLY PEARL ({len(early_pearls)})</b>")
             medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 10
             for i, c in enumerate(sorted(early_pearls, key=lambda c: c["pearl_priority_score"], reverse=True)[:5]):
-                lines.append(_user_facing_entry(c, medals[i]))
+                lines.append(_user_facing_entry(c, medals[i], get_symbol_persistence(c["symbol"])))
 
         if emergence_alerts_typed:
-            lines.append(f"\n⚡ <b>EMERGENCE ({len(emergence_alerts_typed)})</b> — rapidly changing, evidence not yet caught up")
+            lines.append(f"\n⚡ <b>EMERGENCE ({len(emergence_alerts_typed)})</b>")
             for c in sorted(emergence_alerts_typed, key=lambda c: c.get("emergence_score", 0), reverse=True)[:5]:
-                lines.append(_user_facing_entry(c, "⚡"))
+                lines.append(_user_facing_entry(c, "⚡", get_symbol_persistence(c["symbol"])))
 
         if momentum:
-            lines.append(f"\n🚀 <b>MOMENTUM ({len(momentum)})</b> — already explosive/extended, not early discovery")
+            lines.append(f"\n🚀 <b>MOMENTUM — NOT EARLY ({len(momentum)})</b>")
             for c in sorted(momentum, key=lambda c: c["pearl_priority_score"], reverse=True)[:5]:
-                lines.append(_user_facing_entry(c, "🚀"))
+                lines.append(_user_facing_entry(c, "🚀", get_symbol_persistence(c["symbol"])))
 
 
         lines.append(f"\n🔬 <b>Evidence status</b>\n"
