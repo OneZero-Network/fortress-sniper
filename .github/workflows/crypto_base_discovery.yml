@@ -1,0 +1,43 @@
+name: Fortress Crypto Base DEX Discovery (hourly)
+
+on:
+  schedule:
+    # Hourly, per explicit request — the security gate is now real
+    # (v4.6) and only convergence-qualified candidates get surfaced
+    # prominently (v4.7), so hourly polling is reasonable for a fast-
+    # moving DEX-native discovery source. The heavier CoinGecko sniper
+    # stays on its daily schedule — this is intentionally NOT the same
+    # cadence, since API cost/candidate-set size are very different.
+    - cron: '15 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: fortress-crypto-base-discovery
+  cancel-in-progress: true
+
+jobs:
+  base-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run Base DEX discovery scan + resolution flywheel
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/base_discovery_scan.py
