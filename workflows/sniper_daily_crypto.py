@@ -522,6 +522,7 @@ def run() -> None:
                     "risk_severity_at_discovery": (c.get("risk") or {}).get("severity", "UNCHECKED"),
                     "status_at_discovery": c["status"],
                     "tier_at_discovery": c.get("tier"),
+                    "pearl_type_at_discovery": (c.get("pearl_type") or {}).get("label"),
                     "why_it_surfaced": "; ".join(c["reasons_why"]),
                     "invalidation_conditions": "; ".join(c["invalidation_conditions"]),
                 })
