@@ -117,6 +117,14 @@ def detect_breakout(coin_id: str) -> dict:
     if prior_20d_high <= 0:
         return {"available": False, "label": "NONE"}
 
+    # ── OHLC AUDIT — actual candle timestamps, not just a row count.
+    # This is what "rows_used=30" was missing: WHICH 30 days. Answers
+    # directly whether the 20-day window is genuinely recent or stale.
+    latest_candle = str(hist["date"].iloc[-1].date())
+    oldest_candle = str(hist["date"].iloc[0].date())
+    window_start = str(hist["date"].iloc[-21].date())
+    window_end = str(hist["date"].iloc[-2].date())  # -2 because -1 (today) is excluded from the window
+
     # ALWAYS computed now, not just when a breakout fires — per explicit
     # request: "even if the current breakout score is zero, explicitly
     # report distance from recent high/low."
@@ -136,6 +144,24 @@ def detect_breakout(coin_id: str) -> dict:
             else:
                 break
 
+    # ── BREAKOUT AGE — "when did the move actually BEGIN, not merely
+    # when did Fortress first notice it." Walks backward day by day,
+    # recomputing a ROLLING 20-day high AS OF EACH PAST DAY (not today's
+    # window), and counts how many consecutive most-recent days closed
+    # above THAT day's own trailing high. A coin that just crossed
+    # yesterday shows breakout_age_days=1; a coin that's been running for
+    # a week shows 7 — directly distinguishing early from already-extended.
+    breakout_age_days = 0
+    closes = hist["close"].astype(float).tolist()
+    highs = hist["high"].astype(float).tolist()
+    n = len(closes)
+    for i in range(n - 1, 19, -1):  # walk backward from today, need 20 prior rows each time
+        trailing_high = max(highs[max(0, i - 20):i])
+        if closes[i] > trailing_high:
+            breakout_age_days += 1
+        else:
+            break
+
     result = {
         "available": True,
         "current_price": close_today,
@@ -146,6 +172,10 @@ def detect_breakout(coin_id: str) -> dict:
         "dist_from_20d_low_pct": dist_from_low_pct,
         "consecutive_elevated_volume_days": consecutive_elevated_days,
         "ohlc_rows_used": len(hist),
+        "latest_candle": latest_candle, "oldest_candle": oldest_candle,
+        "window_start": window_start, "window_end": window_end,
+        "current_candle_excluded": True,
+        "breakout_age_days": breakout_age_days,
     }
 
     if close_today > prior_20d_high:
@@ -157,3 +187,17 @@ def detect_breakout(coin_id: str) -> dict:
                                     f"({dist_from_high_pct:+.1f}% from the high, {dist_from_low_pct:+.1f}% from the low"
                                     f"{f', volume elevated {consecutive_elevated_days}d running' if consecutive_elevated_days >= 2 else ''})")})
     return result
+
+
+def classify_move_age(breakout_age_days: Optional[int]) -> dict:
+    """v4.1 — 'Is Fortress finding something early, or discovering it
+    after it's already moved?' EARLY: breakout_age<2d. DEVELOPING:
+    2-10d. EXTENDED: >10d. Thresholds are reasoned defaults per the
+    explicit spec, not yet calibrated against real outcomes."""
+    if breakout_age_days is None:
+        return {"label": "UNKNOWN", "detail": "no breakout detected"}
+    if breakout_age_days < 2:
+        return {"label": "🟢 EARLY", "detail": f"breakout {breakout_age_days}d old"}
+    if breakout_age_days <= 10:
+        return {"label": "🟡 DEVELOPING", "detail": f"breakout {breakout_age_days}d old"}
+    return {"label": "🔴 EXTENDED", "detail": f"breakout {breakout_age_days}d old — already well underway"}
