@@ -1,0 +1,208 @@
+"""
+FORTRESS_CRYPTO — core/crypto/dexscreener.py
+══════════════════════════════════════════════════════════════════════════════
+v4.5 — Base DEX Discovery v1. A SECOND candidate source alongside the
+existing CoinGecko/liquid-asset universe, per the explicit architecture:
+"Base should be a new source of candidates, not a new scoring system."
+DEX candidates found here are adapted into the SAME coin_snapshot shape
+the existing scanner already produces, then flow through the unchanged
+pearl_score.compute_pearl_score() — no parallel scoring logic.
+
+LICENSING: DexScreener's API terms explicitly permit both commercial and
+non-commercial use (docs.dexscreener.com/api/api-terms-and-conditions).
+The one restriction is building something whose PRIMARY PURPOSE competes
+directly with DexScreener's own product (a token/pair explorer).
+Fortress's primary purpose is a multi-source Pearl detection system —
+DEX data is one input among several (CoinGecko, whale, news), not a
+pair-browsing product. This is a plain reading of the current terms,
+not legal advice — worth a final check before any public commercial
+launch, but the discovery-source use case here is squarely the kind of
+integration the terms describe as permitted.
+
+DELIBERATELY NOT USING DexScreener's own "Trending Score" — per explicit
+instruction, that would mean outsourcing discovery judgment to another
+ranking algorithm, and their own docs note boost activity can inflate
+visibility as a confounder, not organic demand. This module uses the
+underlying raw data (liquidity, volume, transactions, buy/sell flow,
+price-change windows) directly.
+
+THE FUNNEL (5 stages, matching the explicit architecture):
+  1. Discovery  — fetch_boosted_base_tokens() + fetch_pair_data()
+  2. Viability   — apply_viability_filters()
+  3. Momentum    — compute_flow_signals()
+  4. False-Pearl — NOT YET IMPLEMENTED (see honest gap note below)
+  5. Pearl engine — adapt_to_coin_snapshot() hands off to the existing,
+     unchanged pearl_score.compute_pearl_score()
+
+HONEST GAP, stated directly: Stage 4 (honeypot / mint-authority /
+holder-concentration checks) is NOT built in this pass. The existing
+risk_engine.py's False-Pearl check is built around CoinGecko-known
+coins with GoPlus-style checks tied to a coin_id — arbitrary DEX pair
+addresses need a different, not-yet-built integration. Per this gap,
+DEX candidates are surfaced under a SEPARATE 🧭 BASE RADAR label,
+explicitly marked as not yet having passed a false-pearl check —
+never labeled PEARL CANDIDATE or fed into the tier system until that
+gap is closed.
+"""
+from __future__ import annotations
+import logging
+import time
+from typing import Optional, List
+
+import requests
+
+log = logging.getLogger("fortress.crypto.dexscreener")
+
+DEXSCREENER_BASE = "https://api.dexscreener.com"
+_last_call_ts = [0.0]
+
+# Stage 2 — viability floors. Deliberately conservative for a brand-new
+# discovery source with no false-pearl protection yet.
+MIN_LIQUIDITY_USD = 50_000
+MIN_VOLUME_24H_USD = 50_000
+MIN_TXNS_24H = 100
+
+
+def _throttle() -> None:
+    elapsed = time.monotonic() - _last_call_ts[0]
+    if elapsed < 1.0:
+        time.sleep(1.0 - elapsed)
+    _last_call_ts[0] = time.monotonic()
+
+
+def _get(path: str) -> Optional[dict]:
+    _throttle()
+    try:
+        resp = requests.get(f"{DEXSCREENER_BASE}{path}", timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+        log.warning(f"DexScreener {resp.status_code} for {path}")
+        return None
+    except Exception as e:
+        log.warning(f"DexScreener request error ({path}): {e}")
+        return None
+
+
+def fetch_boosted_base_tokens(limit: int = 30) -> List[dict]:
+    """Stage 1a — discovery seed. Uses the token-boosts endpoint (surfaces
+    recently-active/promoted tokens across chains) filtered to Base.
+    NOTE: boost activity itself is explicitly NOT used as a signal (see
+    module docstring) — this is only used to generate a candidate LIST
+    to then fetch real pair data for, same way the CoinGecko scanner
+    uses market-cap rank purely to generate a candidate list."""
+    data = _get("/token-boosts/latest/v1")
+    if not data:
+        return []
+    tokens = data if isinstance(data, list) else data.get("tokens", [])
+    base_tokens = [t for t in tokens if t.get("chainId") == "base"]
+    return base_tokens[:limit]
+
+
+def fetch_pair_data(token_address: str, chain: str = "base") -> Optional[dict]:
+    """Stage 1b — for a candidate token address, fetch its actual pair
+    data (liquidity, volume, txns, price-change windows). If a token has
+    multiple pairs, returns the one with the highest liquidity."""
+    data = _get(f"/latest/dex/tokens/{token_address}")
+    if not data:
+        return None
+    pairs = data.get("pairs") or []
+    base_pairs = [p for p in pairs if p.get("chainId") == chain]
+    if not base_pairs:
+        return None
+    return max(base_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0)
+
+
+def apply_viability_filters(pair: dict) -> dict:
+    """Stage 2 — reject: low liquidity, low volume, too few transactions.
+    Returns {"passes": bool, "reasons": [...]} — reasons list is always
+    populated (even on pass, showing what was checked), never a bare
+    True/False with no explanation."""
+    liquidity = (pair.get("liquidity") or {}).get("usd") or 0
+    volume_24h = (pair.get("volume") or {}).get("h24") or 0
+    txns_24h_data = (pair.get("txns") or {}).get("h24") or {}
+    txns_24h = (txns_24h_data.get("buys") or 0) + (txns_24h_data.get("sells") or 0)
+
+    reasons = []
+    if liquidity < MIN_LIQUIDITY_USD:
+        reasons.append(f"liquidity ${liquidity:,.0f} below ${MIN_LIQUIDITY_USD:,} floor")
+    if volume_24h < MIN_VOLUME_24H_USD:
+        reasons.append(f"24h volume ${volume_24h:,.0f} below ${MIN_VOLUME_24H_USD:,} floor")
+    if txns_24h < MIN_TXNS_24H:
+        reasons.append(f"{txns_24h} txns/24h below {MIN_TXNS_24H} floor")
+
+    return {"passes": len(reasons) == 0, "reasons": reasons or ["passes all viability floors"],
+            "liquidity_usd": liquidity, "volume_24h_usd": volume_24h, "txns_24h": txns_24h}
+
+
+def compute_flow_signals(pair: dict) -> dict:
+    """Stage 3 — momentum/flow, using ONLY data DexScreener actually
+    provides (no historical baseline exists for brand-new pairs, so this
+    uses the multi-window price-change fields DexScreener already
+    returns, same acceleration philosophy as the existing velocity
+    engine). Buy/sell imbalance is genuinely new information the main
+    CoinGecko scanner never had access to."""
+    txns_24h = (pair.get("txns") or {}).get("h24") or {}
+    buys = txns_24h.get("buys") or 0
+    sells = txns_24h.get("sells") or 0
+    total = buys + sells
+    buy_ratio = round(buys / total, 3) if total > 0 else None
+
+    price_change = pair.get("priceChange") or {}
+    pct_1h = price_change.get("h1")
+    pct_6h = price_change.get("h6")
+    pct_24h = price_change.get("h24")
+
+    flow_label = "NONE"
+    if buy_ratio is not None:
+        if buy_ratio >= 0.65:
+            flow_label = "STRONG_BUY_PRESSURE"
+        elif buy_ratio <= 0.35:
+            flow_label = "STRONG_SELL_PRESSURE"
+        else:
+            flow_label = "BALANCED"
+
+    return {"buy_ratio": buy_ratio, "buys": buys, "sells": sells, "flow_label": flow_label,
+            "pct_1h": pct_1h, "pct_6h": pct_6h, "pct_24h": pct_24h}
+
+
+def adapt_to_coin_snapshot(pair: dict) -> dict:
+    """Adapts a DexScreener pair into the SAME coin_snapshot shape the
+    existing CoinGecko scanner produces — this is what lets DEX
+    candidates flow through the UNCHANGED pearl_score.compute_pearl_score()
+    instead of needing parallel scoring logic. Fields DexScreener can't
+    provide (pct_7d, pct_30d — pairs are often too new to have that
+    history) are correctly left None, gracefully excluded by the
+    existing 'don't fabricate missing components' design."""
+    base_token = pair.get("baseToken") or {}
+    liquidity = (pair.get("liquidity") or {}).get("usd") or 0
+    volume_24h = (pair.get("volume") or {}).get("h24") or 0
+    price_change = pair.get("priceChange") or {}
+    return {
+        "id": None,  # no CoinGecko id — DEX-native
+        "symbol": (base_token.get("symbol") or "").upper(),
+        "name": base_token.get("name"),
+        "market_cap": pair.get("fdv") or pair.get("marketCap") or 0,
+        "market_cap_rank": None,
+        "volume_24h": volume_24h,
+        "price": float(pair.get("priceUsd") or 0),
+        "pct_24h": price_change.get("h24"),
+        "pct_7d": None,   # honestly unavailable for most DEX pairs — not fabricated
+        "pct_30d": None,  # honestly unavailable for most DEX pairs — not fabricated
+        "pair_address": pair.get("pairAddress"),
+        "dex_id": pair.get("dexId"),
+        "pair_created_at": pair.get("pairCreatedAt"),
+    }
+
+
+def classify_base_radar_status(viability: dict, flow: dict) -> dict:
+    """The 🧭 BASE RADAR classification, per explicit instruction — a
+    SEPARATE category from the main Pearl hierarchy, since Stage 4
+    (false-pearl check) doesn't exist yet for DEX pairs. NEVER returns
+    a Pearl-hierarchy label."""
+    if not viability["passes"]:
+        return {"label": "🚫 FILTERED", "detail": "; ".join(viability["reasons"])}
+    detail = f"buy/sell flow: {flow['flow_label']}"
+    if flow.get("pct_24h") is not None:
+        detail += f", {flow['pct_24h']:+.1f}% / 24h"
+    return {"label": "🧭 BASE RADAR", "detail": detail,
+            "caveat": "false-pearl check not yet available for DEX pairs — preliminary only"}
