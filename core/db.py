@@ -268,6 +268,24 @@ def init_crypto_tables() -> None:
             top_high_potential_score    REAL,
             avg_discovery_score         REAL
         );
+
+        -- ═══ v4.6 BASE DEX FIRST-SEEN TRACKING ═══ Records the EXACT
+        -- first moment Fortress's DEX lens detected a pair — this is
+        -- what makes "could the DEX lens have found PONS earlier than
+        -- CoinGecko" an answerable question rather than a guess.
+        -- INSERT OR IGNORE semantics: only the true first detection is
+        -- ever stored, never overwritten by later scans.
+        CREATE TABLE IF NOT EXISTS crypto_dex_first_seen (
+            pair_address        TEXT PRIMARY KEY,
+            symbol              TEXT,
+            chain               TEXT,
+            first_seen_at       TEXT,
+            first_seen_price    REAL,
+            first_seen_liquidity_usd REAL,
+            first_seen_pair_age_hours REAL,
+            first_seen_vol_accel_ratio REAL,
+            first_seen_flow_label TEXT
+        );
         """)
         # Self-migrating column addition for databases created before this
         # column existed — avoids another manual paste-into-GitHub step.
@@ -783,3 +801,47 @@ def get_emergence_conversion_rate(days_back: int = 14) -> dict:
         "n_converted": converted,
         "conversion_rate_pct": round(100.0 * converted / n, 1) if n else None,
     }
+
+
+def log_dex_first_seen(pair_address: str, symbol: str, chain: str, price: float, liquidity_usd: float,
+                        pair_age_hours: float, vol_accel_ratio: float, flow_label: str) -> bool:
+    """v4.6 — INSERT OR IGNORE: only the TRUE first detection is ever
+    stored. Returns True if this was genuinely the first time (a new
+    row was inserted), False if this pair was already seen before
+    (no-op) — the caller can use this to know whether today's scan
+    found something genuinely new."""
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn(write=True) as con:
+        cur = con.execute("""
+            INSERT OR IGNORE INTO crypto_dex_first_seen
+                (pair_address, symbol, chain, first_seen_at, first_seen_price,
+                 first_seen_liquidity_usd, first_seen_pair_age_hours,
+                 first_seen_vol_accel_ratio, first_seen_flow_label)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (pair_address, symbol.upper(), chain, now, price, liquidity_usd,
+              pair_age_hours, vol_accel_ratio, flow_label))
+        return cur.rowcount > 0
+
+
+def get_dex_first_seen(pair_address: str = None, symbol: str = None) -> Optional[dict]:
+    """Look up by pair_address (preferred, unique) or symbol (may match
+    multiple pairs — returns the earliest)."""
+    cols = ["pair_address", "symbol", "chain", "first_seen_at", "first_seen_price",
+            "first_seen_liquidity_usd", "first_seen_pair_age_hours",
+            "first_seen_vol_accel_ratio", "first_seen_flow_label"]
+    with get_conn() as con:
+        if pair_address:
+            row = con.execute(
+                f"SELECT {', '.join(cols)} FROM crypto_dex_first_seen WHERE pair_address = ?",
+                (pair_address,)
+            ).fetchone()
+        elif symbol:
+            row = con.execute(
+                f"SELECT {', '.join(cols)} FROM crypto_dex_first_seen WHERE symbol = ? "
+                f"ORDER BY first_seen_at ASC LIMIT 1",
+                (symbol.upper(),)
+            ).fetchone()
+        else:
+            return None
+    return dict(zip(cols, row)) if row else None
