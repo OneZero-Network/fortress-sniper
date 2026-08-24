@@ -542,13 +542,20 @@ def run() -> None:
                 # correct" — this exposes current_price/20d_high/diff/pct
                 # directly so the math can be audited from the message
                 # itself, not just inferred.
+                # v4.1 — OHLC AUDIT (exact candle timestamps, not just a
+                # row count) + Move Age (when did the move actually
+                # BEGIN, not merely when Fortress first noticed it).
                 bo = c.get("breakout") or {}
                 if bo.get("available"):
                     vol_persist = f", vol elevated {bo['consecutive_elevated_volume_days']}d" if bo.get("consecutive_elevated_volume_days", 0) >= 2 else ""
                     structure_str = (f"\n   📐 Structure: {bo['dist_from_20d_high_pct']:+.1f}% from 20d high, "
                                      f"{bo['dist_from_20d_low_pct']:+.1f}% from 20d low{vol_persist}, {bo['label']}\n"
                                      f"   🔍 RAW AUDIT: price=${bo['current_price']:.6f} | 20d_high=${bo['prior_20d_high_raw']:.6f} "
-                                     f"| diff=${bo['diff_from_high_usd']:.6f} | rows_used={bo['ohlc_rows_used']}")
+                                     f"| diff=${bo['diff_from_high_usd']:.6f} | rows_used={bo['ohlc_rows_used']}\n"
+                                     f"   🕐 OHLC AUDIT: latest={bo.get('latest_candle')} | oldest={bo.get('oldest_candle')} | "
+                                     f"20d_window={bo.get('window_start')}→{bo.get('window_end')} | today_excluded={bo.get('current_candle_excluded')}")
+                    move_age = trend_breakout.classify_move_age(bo.get("breakout_age_days"))
+                    structure_str += f"\n   ⏳ Move Age: {move_age['label']} ({move_age['detail']})"
                 else:
                     structure_str = "\n   📐 Structure: n/a (insufficient price history)"
 
