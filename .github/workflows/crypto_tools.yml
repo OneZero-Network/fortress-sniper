@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       tool:
-        description: 'Which tool to run'
+        description: 'Which tool to run (or "all" to run every tool sequentially in one go)'
         required: true
         type: choice
-        default: 'pearl_validation_report'
+        default: 'all'
         options:
+          - all
           - pearl_validation_report
           - pearl_metrics_report
           - symbol_retrospective
@@ -72,6 +73,35 @@ jobs:
           CRYPTO_COMPARISON_LABEL: ${{ inputs.comparison_label }}
         run: |
           case "${{ inputs.tool }}" in
+            all)
+              declare -A SCRIPTS=(
+                [pearl_validation_report]="scripts/pearl_validation_report.py"
+                [pearl_metrics_report]="scripts/pearl_metrics_report.py"
+                [symbol_retrospective]="scripts/symbol_retrospective.py"
+                [backtest_matrix]="scripts/backtest_crypto.py"
+                [v5_falsification_test]="scripts/backtest_v5.py"
+                [regime_audit_v1]="scripts/regime_audit_v1.py"
+                [f1_false_pearl]="scripts/experiment_f1_false_pearl.py"
+                [regime_v2_calibration]="scripts/calibrate_regime_v2.py"
+              )
+              RESULTS=()
+              for name in pearl_validation_report pearl_metrics_report symbol_retrospective \
+                          backtest_matrix v5_falsification_test regime_audit_v1 f1_false_pearl regime_v2_calibration; do
+                path="${SCRIPTS[$name]}"
+                echo "::group::Running $name ($path)"
+                if python "$path"; then
+                  echo "✅ $name completed"
+                  RESULTS+=("✅ $name")
+                else
+                  echo "❌ $name FAILED — continuing to next tool"
+                  RESULTS+=("❌ $name (FAILED)")
+                fi
+                echo "::endgroup::"
+              done
+              echo ""
+              echo "=== SUMMARY ==="
+              printf '%s\n' "${RESULTS[@]}"
+              ;;
             pearl_validation_report)
               python scripts/pearl_validation_report.py
               ;;
