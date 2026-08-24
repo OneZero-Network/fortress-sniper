@@ -50,6 +50,7 @@ from core.crypto import evidence
 from core.crypto import pearl_score
 from core.crypto import pearl_flywheel
 from core.crypto import velocity_divergence
+from core.crypto import trend_breakout
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -213,6 +214,29 @@ def _tally_diagnostic(c: Optional[dict], diag: dict) -> None:
         diag["rejected_missing_data"] += 1
 
 
+def _user_facing_entry(c: dict, rank_emoji: str) -> str:
+    """v4.2 — the investor-facing entry format. Deliberately excludes
+    everything engineering: no raw dollar values, no OHLC timestamps, no
+    component-score decomposition, no rows_used/today_excluded. Answers
+    only: what, why now, how early, how strong is the evidence, what's
+    the main risk. Full technical detail stays in the run log's FULL
+    DETAIL block and the CRYPTO_PEARL_CANDIDATES sheet, unchanged."""
+    freshness = c.get("breakout_freshness")
+    bo = c.get("breakout") or {}
+    move_age = trend_breakout.classify_move_age(bo.get("breakout_age_days")) if bo.get("available") else {"label": ""}
+    bullets = pearl_score.build_why_now_bullets(c.get("velocity"), c.get("trend_change", {}), bo, freshness)
+    bullet_str = "\n".join(f"   • {b}" for b in bullets) if bullets else "   • No strong co-occurring signals"
+    completeness = c.get("evidence_completeness_pct")
+    comp_str = f"{completeness:.0f}%" if completeness is not None else "n/a"
+    main_risk = c["invalidation_conditions"][0] if c.get("invalidation_conditions") else "unclear"
+    type_label = c["pearl_type"]["label"].split(" ", 1)[-1] if c.get("pearl_type") else ""
+    return (f"{rank_emoji} <b>{c['symbol']}</b> — {type_label}\n"
+            f"   Priority: {c['pearl_priority_score']:.0f}/100 | Freshness: {move_age['label']}\n"
+            f"   Why now:\n{bullet_str}\n"
+            f"   Evidence: {comp_str} complete ⚠️\n"
+            f"   Main risk: {main_risk}")
+
+
 def run() -> None:
     log.info(f"=== {ccfg.VERSION} — PEARL DETECTION MACHINE ===")
     init_crypto_tables()
@@ -371,7 +395,6 @@ def run() -> None:
     # API calls despite calling fetch_daily_ohlc again for the same coin.
     # Ecosystem trend: uses coin categories (now properly cached, see
     # v3.7's data.py fix) grouped across THIS shortlist only.
-    from core.crypto import trend_breakout
     coin_snapshot_by_symbol = {coin["symbol"]: coin for coin in shortlist}
     for pearl in watchlist:
         coin_snapshot_by_symbol.setdefault(pearl["symbol"], None)
@@ -502,96 +525,69 @@ def run() -> None:
     diagnostic_block = (
         f"Scanned {diag['scanned']}, scored {diag['entered_scorer']}{coverage_note}{rate_limit_note} — "
         f"⭐{diag['final_pearl']} 🔎HP{diag['final_high_potential']} "
-        f"Cand{diag['final_candidate']} 👀{diag['final_watch']} 🚫{diag['final_false_pearl']}\n"
+        f"Cand{diag['final_candidate']} 👀{diag['final_watch']} 🚫{diag['final_false_pearl']}"
     )
+    # v4.2 — pipeline diagnostic is engineering information, log-only now,
+    # NOT part of the Telegram header. The old header put this directly
+    # in front of the user; per explicit instruction, "scanned/scored"
+    # counts belong in the run log, not the investor-facing message.
+    log.info(f"Pipeline diagnostic (log only): {diagnostic_block}")
 
     header = (
-        f"🔎 <b>FORTRESS_CRYPTO — Pearl Detection Machine</b> ({datetime.now(timezone.utc).strftime('%Y-%m-%d')})\n"
-        f"📊 Evidence Level: {ev['label']} — deserves attention, NOT a buy/sell signal.\n"
-        f"🌐 Regime (context only, not scored): {regime['label']}\n\n"
-        f"{diagnostic_block}"
+        f"💎 <b>PEARL RADAR — {datetime.now(timezone.utc).strftime('%b %d').upper()}</b>\n"
     )
 
     if pearl_tier or high_potential_tier or candidate_tier or watch_candidates or avoid_candidates:
         lines = [header]
 
-        # ── 🏆 PEARL RADAR (Priority Score, decomposed) ─────────────────
-        ranked_by_priority = sorted(
-            [c for c in shortlisted if c.get("pearl_priority_score") is not None],
-            key=lambda c: c["pearl_priority_score"], reverse=True)
-        if ranked_by_priority:
-            lines.append(f"🏆 <b>PEARL RADAR — TOP 5</b> (combined priority: discovery+emergence+trend+breakout+sector, "
-                         f"minus false-pearl risk)")
-            for i, c in enumerate(ranked_by_priority[:5], 1):
-                ds = f"{c['discovery_score']:.0f}" if c["discovery_score"] is not None else "n/a"
-                emg = f"{c['emergence_score']:.0f}" if c.get("emergence_score") is not None else "n/a"
-                pc = c.get("priority_components", {})
-                comp_str = " | ".join(f"{k}:{v:+.1f}" if k not in ("discovery","emergence") else f"{k}:{v:.1f}"
-                                        for k, v in pc.items())
-                alert_tag = " ⚡ALERT" if c.get("emergence_alert", {}).get("is_alert") else ""
-                persist = get_symbol_persistence(c["symbol"])
-                persist_str = (f" | 📅 seen {persist['times_seen']}x over {persist['days_in_radar']}d"
-                               if persist["times_seen"] > 0 else " | 📅 first time on radar")
+        # ── v4.2 — Telegram UX cleanup. NO SCORING CHANGES — this only
+        # changes what reaches Telegram. Full technical detail (raw
+        # prices, OHLC timestamps, component decomposition, priority
+        # math) stays exactly where it already was: the run log's FULL
+        # DETAIL block and the CRYPTO_PEARL_CANDIDATES Sheet, untouched.
+        #
+        # Grouped by OPPORTUNITY TYPE (classify_pearl_type from v4.0),
+        # not ranked by raw Priority Score — a "Top 5 by Priority" was
+        # misleading, since a 132%-extended MOMENTUM move can outscore a
+        # genuinely early breakout on raw Priority while being the
+        # worse discovery. The categories answer the actual question:
+        # "what did you find, why now, how early, how strong is the
+        # evidence, what could invalidate it" — nothing else.
+        typed = [c for c in shortlisted if c.get("pearl_type")]
+        early_pearls = [c for c in typed if c["pearl_type"]["label"] == "💎 EARLY PEARL"]
+        momentum = [c for c in typed if c["pearl_type"]["label"] == "🚀 MOMENTUM BREAKOUT"]
+        emergence_alerts_typed = [c for c in typed if c["pearl_type"]["label"] == "⚡ EMERGENCE ALERT"]
 
-                # v3.9.1 — breakout structure, ALWAYS shown (this was
-                # silently broken before — see the fix note in
-                # trend_breakout.py). Shows distance-to-high/low and
-                # volume persistence even when no breakout is confirmed.
-                # RAW VALUES also shown per explicit instruction: "don't
-                # tune a breakout model until we know the calculation is
-                # correct" — this exposes current_price/20d_high/diff/pct
-                # directly so the math can be audited from the message
-                # itself, not just inferred.
-                # v4.1 — OHLC AUDIT (exact candle timestamps, not just a
-                # row count) + Move Age (when did the move actually
-                # BEGIN, not merely when Fortress first noticed it).
-                bo = c.get("breakout") or {}
-                if bo.get("available"):
-                    vol_persist = f", vol elevated {bo['consecutive_elevated_volume_days']}d" if bo.get("consecutive_elevated_volume_days", 0) >= 2 else ""
-                    structure_str = (f"\n   📐 Structure: {bo['dist_from_20d_high_pct']:+.1f}% from 20d high, "
-                                     f"{bo['dist_from_20d_low_pct']:+.1f}% from 20d low{vol_persist}, {bo['label']}\n"
-                                     f"   🔍 RAW AUDIT: price=${bo['current_price']:.6f} | 20d_high=${bo['prior_20d_high_raw']:.6f} "
-                                     f"| diff=${bo['diff_from_high_usd']:.6f} | rows_used={bo['ohlc_rows_used']}\n"
-                                     f"   🕐 OHLC AUDIT: latest={bo.get('latest_candle')} | oldest={bo.get('oldest_candle')} | "
-                                     f"20d_window={bo.get('window_start')}→{bo.get('window_end')} | today_excluded={bo.get('current_candle_excluded')}")
-                    move_age = trend_breakout.classify_move_age(bo.get("breakout_age_days"))
-                    structure_str += f"\n   ⏳ Move Age: {move_age['label']} ({move_age['detail']})"
-                else:
-                    structure_str = "\n   📐 Structure: n/a (insufficient price history)"
+        total_interesting = len(early_pearls) + len(momentum) + len(emergence_alerts_typed)
+        if pearl_tier:
+            lines.append(f"💎 <b>{len(pearl_tier)} confirmed Pearl(s) today.</b>")
+        else:
+            lines.append(f"No confirmed Pearls yet. The machine found {total_interesting} "
+                         f"early/developing opportunit{'y' if total_interesting == 1 else 'ies'} worth investigating.")
 
-                pearl_type = c.get("pearl_type") or {}
-                type_tag = f" {pearl_type.get('label', '')}" if pearl_type.get("label") else ""
-                sf_line = ""
-                if c.get("breakout_strength") is not None:
-                    sf_line = f"\n   🚀 Strength {c['breakout_strength']}/100 | ⏱️ Freshness {c['breakout_freshness']}/100"
+        if early_pearls:
+            lines.append(f"\n💎 <b>EARLY PEARLS ({len(early_pearls)})</b> — early in a developing move")
+            medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 10
+            for i, c in enumerate(sorted(early_pearls, key=lambda c: c["pearl_priority_score"], reverse=True)[:5]):
+                lines.append(_user_facing_entry(c, medals[i]))
 
-                lines.append(f"{i}. <b>{c['symbol']}</b> — Priority {c['pearl_priority_score']}/100{type_tag}\n"
-                             f"   Discovery {ds} | Emergence {emg}{persist_str}{sf_line}\n"
-                             f"   ({comp_str}){structure_str}\n"
-                             f"   <i>{c.get('why_now', '')}</i>")
+        if emergence_alerts_typed:
+            lines.append(f"\n⚡ <b>EMERGENCE ({len(emergence_alerts_typed)})</b> — rapidly changing, evidence not yet caught up")
+            for c in sorted(emergence_alerts_typed, key=lambda c: c.get("emergence_score", 0), reverse=True)[:5]:
+                lines.append(_user_facing_entry(c, "⚡"))
 
-        # ── ⚡ EMERGENCE ALERTS — the GOOD case, called out explicitly,
-        # NOT a Pearl claim, an "investigate why this is moving" flag ──
-        emergence_alerts = [c for c in shortlisted if c.get("emergence_alert", {}).get("is_alert")]
-        if emergence_alerts:
-            lines.append(f"\n⚡ <b>EMERGENCE ALERTS ({len(emergence_alerts)})</b> — rapid change, evidence not yet caught up")
-            for c in sorted(emergence_alerts, key=lambda c: c.get("emergence_score", 0), reverse=True)[:5]:
-                lines.append(f"{c['symbol']} — Emergence {c['emergence_score']:.0f}, Discovery {c['discovery_score']:.0f} — "
-                             f"could be an early Pearl OR a false spike, worth a manual look")
+        if momentum:
+            lines.append(f"\n🚀 <b>MOMENTUM ({len(momentum)})</b> — already explosive/extended, not early discovery")
+            for c in sorted(momentum, key=lambda c: c["pearl_priority_score"], reverse=True)[:5]:
+                lines.append(_user_facing_entry(c, "🚀"))
 
-        # ── 🚨 DIVERGENCE — where signals disagree unusually ────────────
-        divergent = [c for c in shortlisted if (c.get("divergence") or {}).get("label")
-                     in ("BULLISH_DIVERGENCE", "BEARISH_DIVERGENCE")]
-        if divergent:
-            lines.append(f"\n🚨 <b>DIVERGENCE ({len(divergent)})</b> — signals disagreeing")
-            for c in divergent[:5]:
-                lines.append(f"{c['symbol']} — {c['divergence']['label']}: {c['divergence'].get('detail', '')}")
 
-        # ── Everything else: COUNTS ONLY, full detail lives in Sheets ───
-        lines.append(f"\n🔎 High-Potential: {len(high_potential_tier)} | Candidates: {len(candidate_tier)} | "
-                     f"👀 Watch: {len(watch_candidates)} | 🚫 False Pearls: {len(avoid_candidates)}")
-        lines.append(f"<i>Full breakdown for every candidate — discovery/emergence/priority components, "
-                     f"why-now text, invalidation conditions — is in the CRYPTO_PEARL_CANDIDATES sheet.</i>")
+        lines.append(f"\n🔬 <b>Evidence status</b>\n"
+                     f"Pearls: {len(pearl_tier)} | Early Pearls: {len(early_pearls)} | "
+                     f"Emergence Alerts: {len(emergence_alerts_typed)} | "
+                     f"High Potential: {len(high_potential_tier)} | False Pearls: {len(avoid_candidates)}")
+        lines.append(f"\n<i>Evidence Level 0 — these are discoveries for investigation, not buy/sell signals.</i>")
+        lines.append(f"Full technical evidence → Google Sheet")
         message = "\n".join(lines)
     else:
         message = header + "\nNo candidates surfaced enough evidence today. That's a legitimate outcome, not a failure — this ran successfully and found nothing worth your attention right now."
