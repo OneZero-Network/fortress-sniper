@@ -1,0 +1,136 @@
+name: Fortress Crypto Tools (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: 'Which tool to run'
+        required: true
+        type: choice
+        default: 'pearl_validation_report'
+        options:
+          - pearl_validation_report
+          - pearl_metrics_report
+          - symbol_retrospective
+          - all_research
+          - backtest_matrix
+          - v5_falsification_test
+          - regime_audit_v1
+          - f1_false_pearl
+          - regime_v2_calibration
+      symbol:
+        description: 'For symbol_retrospective only — which symbol to reconstruct'
+        required: false
+        default: 'PONS'
+      days_back:
+        description: 'For pearl_validation_report only — how many days back'
+        required: false
+        default: '14'
+      comparison_label:
+        description: 'For pearl_metrics_report only — comparison period label (blank = baseline only)'
+        required: false
+        default: ''
+
+concurrency:
+  group: fortress-crypto-tools
+  cancel-in-progress: true
+
+jobs:
+  run-tool:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run selected tool
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          CRYPTOPANIC_API_KEY: ${{ secrets.CRYPTOPANIC_API_KEY }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+          BSCSCAN_API_KEY: ${{ secrets.BSCSCAN_API_KEY }}
+          POLYGONSCAN_API_KEY: ${{ secrets.POLYGONSCAN_API_KEY }}
+          SYMBOL: ${{ inputs.symbol }}
+          CRYPTO_VALIDATION_DAYS: ${{ inputs.days_back }}
+          CRYPTO_COMPARISON_LABEL: ${{ inputs.comparison_label }}
+        run: |
+          case "${{ inputs.tool }}" in
+            pearl_validation_report)
+              python scripts/pearl_validation_report.py
+              ;;
+            pearl_metrics_report)
+              python scripts/pearl_metrics_report.py
+              ;;
+            symbol_retrospective)
+              python scripts/symbol_retrospective.py
+              ;;
+            backtest_matrix)
+              python scripts/backtest_crypto.py
+              ;;
+            v5_falsification_test)
+              python scripts/backtest_v5.py
+              ;;
+            regime_audit_v1)
+              python scripts/regime_audit_v1.py
+              ;;
+            f1_false_pearl)
+              python scripts/experiment_f1_false_pearl.py
+              ;;
+            regime_v2_calibration)
+              python scripts/calibrate_regime_v2.py
+              ;;
+            all_research)
+              declare -A SCRIPTS=(
+                [backtest_matrix]="scripts/backtest_crypto.py"
+                [v5_falsification_test]="scripts/backtest_v5.py"
+                [regime_audit_v1]="scripts/regime_audit_v1.py"
+                [f1_false_pearl]="scripts/experiment_f1_false_pearl.py"
+                [regime_v2_calibration]="scripts/calibrate_regime_v2.py"
+              )
+              RESULTS=()
+              for name in backtest_matrix v5_falsification_test regime_audit_v1 f1_false_pearl regime_v2_calibration; do
+                path="${SCRIPTS[$name]}"
+                echo "::group::Running $name ($path)"
+                if python "$path"; then
+                  echo "✅ $name completed"
+                  RESULTS+=("✅ $name")
+                else
+                  echo "❌ $name FAILED — continuing to next tool"
+                  RESULTS+=("❌ $name (FAILED)")
+                fi
+                echo "::endgroup::"
+              done
+              echo ""
+              echo "=== SUMMARY ==="
+              printf '%s\n' "${RESULTS[@]}"
+              ;;
+            *)
+              echo "Unknown tool selection: ${{ inputs.tool }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-tools-${{ inputs.tool }}-${{ github.run_id }}
+          path: outputs/
+          retention-days: 30
