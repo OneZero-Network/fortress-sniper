@@ -1,0 +1,41 @@
+name: Fortress Crypto Pearl Validation Report (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: 'How many days back to report on'
+        required: false
+        default: '14'
+
+concurrency:
+  group: fortress-crypto-validation-report
+  cancel-in-progress: true
+
+jobs:
+  validation-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run Pearl Validation Report
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CRYPTO_VALIDATION_DAYS: ${{ inputs.days_back }}
+        run: python scripts/pearl_validation_report.py
