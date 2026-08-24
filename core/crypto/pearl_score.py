@@ -410,6 +410,39 @@ def classify_emergence_alert(discovery_score: Optional[float], emergence_score: 
     return {"is_alert": False}
 
 
+def build_why_now_bullets(velocity: Optional[dict], trend_change: dict, breakout: dict,
+                           freshness: Optional[float]) -> list:
+    """v4.2 — Telegram-facing short bullets, distinct from
+    build_why_now_summary() (which stays exactly as-is for the log and
+    Sheet — full sentences with raw percentages, unchanged). This
+    produces 2-4 short human-readable bullets with NO raw dollar values,
+    NO OHLC timestamps, NO percentage-heavy phrasing — just what a
+    person actually needs to understand why something surfaced. Reuses
+    fields already computed; no new signal, no scoring change."""
+    bullets = []
+    if breakout.get("label") == "BREAKOUT":
+        age = breakout.get("breakout_age_days")
+        if age is not None and age <= 1:
+            bullets.append("Fresh breakout" if age == 0 else "Breakout detected yesterday")
+        elif age is not None:
+            bullets.append(f"Breakout {age} days underway")
+        else:
+            bullets.append("Breakout confirmed")
+    if velocity and velocity.get("volume_label") in ("SURGING", "ELEVATED") and velocity.get("volume_ratio"):
+        bullets.append(f"Volume {velocity['volume_ratio']:.1f}× baseline"
+                        + (f", elevated {breakout['consecutive_elevated_volume_days']} days"
+                           if breakout.get("consecutive_elevated_volume_days", 0) >= 2 else ""))
+    if trend_change.get("label") == "REVERSAL_BULLISH":
+        bullets.append("Trend just turned positive")
+    elif trend_change.get("label") in ("CONTINUATION_UP",):
+        bullets.append("Sustained uptrend")
+    if breakout.get("available") and breakout.get("dist_from_20d_high_pct") is not None:
+        dist = breakout["dist_from_20d_high_pct"]
+        if dist <= 20:
+            bullets.append(f"{dist:.0f}% above previous 20-day high")
+    return bullets[:4]
+
+
 def build_why_now_summary(discovery_score: Optional[float], velocity: Optional[dict], trend_change: dict,
                            breakout: dict, ecosystem_trend: dict, evidence_completeness_pct: Optional[float],
                            invalidation_conditions: list) -> str:
