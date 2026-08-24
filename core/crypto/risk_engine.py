@@ -36,7 +36,7 @@ log = logging.getLogger("fortress.crypto.risk")
 
 _session = requests.Session()
 _GOPLUS_BASE = "https://api.gopluslabs.io/api/v1/token_security"
-_CHAIN_ID_MAP = {"ethereum": "1", "binance-smart-chain": "56", "polygon-pos": "137"}
+_CHAIN_ID_MAP = {"ethereum": "1", "binance-smart-chain": "56", "polygon-pos": "137", "base": "8453"}
 
 _last_call_ts = [0.0]
 _MIN_INTERVAL = 1.0  # GoPlus free tier is generous but still finite

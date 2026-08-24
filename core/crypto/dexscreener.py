@@ -83,6 +83,68 @@ def _get(path: str) -> Optional[dict]:
         return None
 
 
+def compute_pair_age_hours(pair: dict) -> Optional[float]:
+    """v4.6 — fresh-pair detection. pairCreatedAt is epoch milliseconds.
+    Answers the actual question your mentor's architecture needs: is
+    this genuinely early (a few hours old) or already well-established
+    (weeks old, just now getting boosted)?"""
+    created_at_ms = pair.get("pairCreatedAt")
+    if not created_at_ms:
+        return None
+    age_seconds = time.time() - (created_at_ms / 1000.0)
+    return round(age_seconds / 3600.0, 1)
+
+
+def compute_acceleration(pair: dict) -> dict:
+    """v4.6 — volume and transaction ACCELERATION using DexScreener's own
+    multi-window fields (m5/h1/h6/h24) — the same 'is this speeding up or
+    just elevated' philosophy as the existing velocity engine, but built
+    fresh here since DEX pairs don't have the daily OHLC history that
+    engine relies on. Compares the most recent short window's RATE
+    against the longer window's average rate — if 1h volume is running
+    hotter than the 24h average would predict, that's genuine
+    acceleration, not just 'volume happens to be high today.'"""
+    vol = pair.get("volume") or {}
+    txns = pair.get("txns") or {}
+
+    vol_h1 = vol.get("h1") or 0
+    vol_h24 = vol.get("h24") or 0
+    expected_h1_if_steady = vol_h24 / 24.0 if vol_h24 else 0
+    vol_accel_ratio = round(vol_h1 / expected_h1_if_steady, 2) if expected_h1_if_steady > 0 else None
+
+    txns_h1 = ((txns.get("h1") or {}).get("buys") or 0) + ((txns.get("h1") or {}).get("sells") or 0)
+    txns_h24 = ((txns.get("h24") or {}).get("buys") or 0) + ((txns.get("h24") or {}).get("sells") or 0)
+    expected_h1_txns_if_steady = txns_h24 / 24.0 if txns_h24 else 0
+    txn_accel_ratio = round(txns_h1 / expected_h1_txns_if_steady, 2) if expected_h1_txns_if_steady > 0 else None
+
+    label = "NONE"
+    if vol_accel_ratio is not None:
+        if vol_accel_ratio >= 3:
+            label = "ACCELERATING"
+        elif vol_accel_ratio <= 0.3:
+            label = "DECELERATING"
+        else:
+            label = "STEADY"
+
+    return {"vol_accel_ratio": vol_accel_ratio, "txn_accel_ratio": txn_accel_ratio, "label": label}
+
+
+def check_dex_security(pair: dict) -> dict:
+    """v4.6 — REAL security gate, closing the gap left open in v4.5.
+    Reuses risk_engine.assess_false_pearl_risk() directly — GoPlus
+    natively covers Base (chain_id 8453, added to risk_engine.py's
+    _CHAIN_ID_MAP), and DexScreener's baseToken.address IS the contract
+    address GoPlus needs. No parallel security-checking logic built —
+    same tested infrastructure the CoinGecko-sourced candidates use."""
+    from . import risk_engine
+    base_token = pair.get("baseToken") or {}
+    address = base_token.get("address")
+    if not address:
+        return {"available": False, "flags": [], "severity": "UNCHECKED",
+                "detail": "no contract address in pair data"}
+    return risk_engine.assess_false_pearl_risk({"base": address})
+
+
 def fetch_boosted_base_tokens(limit: int = 30) -> List[dict]:
     """Stage 1a — discovery seed. Uses the token-boosts endpoint (surfaces
     recently-active/promoted tokens across chains) filtered to Base.
@@ -194,15 +256,33 @@ def adapt_to_coin_snapshot(pair: dict) -> dict:
     }
 
 
-def classify_base_radar_status(viability: dict, flow: dict) -> dict:
-    """The 🧭 BASE RADAR classification, per explicit instruction — a
-    SEPARATE category from the main Pearl hierarchy, since Stage 4
-    (false-pearl check) doesn't exist yet for DEX pairs. NEVER returns
-    a Pearl-hierarchy label."""
+def classify_base_radar_status(viability: dict, flow: dict, security: dict, pair_age_hours: Optional[float]) -> dict:
+    """v4.6 — the 🧭 BASE RADAR classification, now with a REAL security
+    gate (v4.5 left this as an explicit unclosed gap; v4.6 closes it by
+    reusing risk_engine's GoPlus integration). HIGH_RISK still surfaces
+    (warning-only philosophy, consistent with the main CoinGecko path)
+    but is now loudly labeled instead of silently absent."""
     if not viability["passes"]:
         return {"label": "🚫 FILTERED", "detail": "; ".join(viability["reasons"])}
-    detail = f"buy/sell flow: {flow['flow_label']}"
+
+    detail_parts = [f"buy/sell flow: {flow['flow_label']}"]
     if flow.get("pct_24h") is not None:
-        detail += f", {flow['pct_24h']:+.1f}% / 24h"
-    return {"label": "🧭 BASE RADAR", "detail": detail,
-            "caveat": "false-pearl check not yet available for DEX pairs — preliminary only"}
+        detail_parts.append(f"{flow['pct_24h']:+.1f}% / 24h")
+    if pair_age_hours is not None:
+        detail_parts.append(f"pair age: {pair_age_hours:.0f}h")
+
+    if security["severity"] == "HIGH_RISK":
+        return {"label": "🚫 HIGH RISK", "detail": "; ".join(security["flags"]),
+                "security_checked": True}
+
+    label = "🧭 BASE RADAR"
+    caveat = None
+    if security["severity"] == "UNCHECKED":
+        caveat = "security check unavailable for this token — unverified, not confirmed safe"
+    elif security["severity"] == "CAUTION":
+        detail_parts.append(f"⚠️ {len(security['flags'])} security flag(s)")
+
+    result = {"label": label, "detail": "; ".join(detail_parts), "security_checked": security["available"]}
+    if caveat:
+        result["caveat"] = caveat
+    return result
