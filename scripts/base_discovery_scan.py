@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -166,6 +166,7 @@ def run() -> None:
             after_security.append(pair)
 
     early_moves = []
+    building_candidates = []
     other_candidates = []
 
     for pair in after_security:
@@ -175,15 +176,29 @@ def run() -> None:
         pair_address = pair.get("pairAddress")
         symbol = snapshot["symbol"]
         early_move = pair["_early_move"]
+        security = pair["_security"]
+
+        # ── v4.7.6 — stage classification + per-scan logging for EVERY
+        # candidate, not just Early Moves. This is the near-miss flywheel
+        # your mentor asked for: BUILDINGCAT (+997%, 5/6 conditions met)
+        # gets recorded as BUILDING instead of silently vanishing into
+        # "other" — and the log entry lets a future scan detect if it
+        # (or anything else) later graduates to EARLY_MOVE.
+        stage_result = dexscreener.classify_dex_stage(early_move, security)
+        if pair_address:
+            log_dex_stage(pair_address, symbol, stage_result["stage"],
+                          stage_result["conditions_met"], flow.get("pct_24h"))
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
 
         entry = {"snapshot": snapshot, "source": pair.get("_source", "?"), "scored": scored,
-                 "early_move": early_move, "pair_address": pair_address,
+                 "early_move": early_move, "stage": stage_result, "pair_address": pair_address,
                  "pct_24h": flow.get("pct_24h"), "flow_label": flow.get("flow_label")}
         if early_move["is_early_move"]:
             early_moves.append(entry)
+        elif stage_result["stage"] == "BUILDING":
+            building_candidates.append(entry)
         else:
             other_candidates.append(entry)
 
@@ -214,37 +229,60 @@ def run() -> None:
                          f"Evidence: Level 0 — unvalidated\n"
                          f"Next: Outcome tracking 1h → 6h → 24h\n")
     else:
-        unique_others: dict = {}
-        for c in other_candidates:
+        # ── BUILDING candidates take priority for display — they're
+        # genuinely closer to qualifying (2+ conditions met) than
+        # anything in "other_candidates" (0-1 conditions). Dedupe by
+        # symbol same as before.
+        unique_building: dict = {}
+        for c in building_candidates:
             sym = c["snapshot"]["symbol"]
-            unique_others.setdefault(sym, []).append(c)
-        deduped_others = []
-        for sym, pools in unique_others.items():
-            best = max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
-            deduped_others.append(best)
+            unique_building.setdefault(sym, []).append(c)
+        deduped_building = []
+        for sym, pools in unique_building.items():
+            best = max(pools, key=lambda c: c["stage"]["conditions_met"])
+            deduped_building.append(best)
+        deduped_building.sort(key=lambda c: (-c["stage"]["conditions_met"], -(c.get("pct_24h") or 0)))
 
-        # ── "Closest developing signals" — per explicit instruction: 16
-        # survivors collapsing to a bare "no actionable discovery" line
-        # hides a real result (something is happening, just not early
-        # enough yet). Rank by how close to qualifying (fewest missing
-        # conditions), then by 24h magnitude, show only the top 3.
-        deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
-        closest = deduped_others[:3]
-
+        total_monitored = len(building_candidates) + len(other_candidates)
         lines.append(f"🧭 <b>BASE DEX RADAR — {today}</b>\n")
         lines.append(f"Result: No Early Move confirmed today.")
-        lines.append(f"{len(deduped_others)} asset(s) passed safety + activity screening.\n")
-        lines.append(f"🟡 {len(deduped_others)} being monitored")
+        lines.append(f"{total_monitored} asset(s) passed safety + activity screening.\n")
+        lines.append(f"🟡 {len(deduped_building)} building" if deduped_building else f"🟡 {total_monitored} being monitored")
         lines.append(f"🟢 0 security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
         lines.append(f"⚡ 0 Early Moves")
 
-        if closest:
-            lines.append(f"\nClosest developing signals:")
-            for c in closest:
+        if deduped_building:
+            lines.append(f"\n🟡 <b>BUILDING ({len(deduped_building)})</b> — real partial confirmation, not yet full convergence")
+            for c in deduped_building[:3]:
                 snap = c["snapshot"]
                 pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else "n/a"
-                reason = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "not yet confirmed"
-                lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {reason}")
+                missing = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "unconfirmed"
+                lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {c['stage']['conditions_met']}/6 conditions, "
+                             f"missing: {missing}")
+        else:
+            unique_others: dict = {}
+            for c in other_candidates:
+                sym = c["snapshot"]["symbol"]
+                unique_others.setdefault(sym, []).append(c)
+            deduped_others = [max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
+                              for sym, pools in unique_others.items()]
+            deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
+            if deduped_others:
+                lines.append(f"\nClosest developing signals:")
+                for c in deduped_others[:3]:
+                    snap = c["snapshot"]
+                    pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else "n/a"
+                    reason = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "not yet confirmed"
+                    lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {reason}")
+
+        # ── Graduations — pairs that were BUILDING at some point and
+        # LATER showed EARLY_MOVE. Direct evidence about whether BUILDING
+        # is a real precursor signal, not just noise.
+        graduations = get_dex_graduations(days_back=7)
+        if graduations:
+            lines.append(f"\n📈 <b>Graduated this week ({len(graduations)})</b> — was BUILDING, later confirmed EARLY_MOVE")
+            for g in graduations[:3]:
+                lines.append(f"• {g['symbol']} — first flagged {g['first_building_at']}")
 
         lines.append(f"\nStatus: Monitoring for acceleration.")
 
