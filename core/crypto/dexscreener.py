@@ -433,9 +433,18 @@ def classify_dex_stage(early_move_result: dict, security: dict) -> dict:
     condition checks — BUILDING means 2+ conditions genuinely met (real
     partial confirmation) but not the full convergence required for
     EARLY_MOVE. A security failure overrides everything — never BUILDING
-    or EARLY_MOVE on a token that failed the security check."""
+    or EARLY_MOVE on a token that failed the security check.
+
+    v4.7.8 FIX: 'already_extended' (price already moved 2x+, per
+    classify_dex_early_move's independent magnitude check) now ALSO
+    overrides BUILDING — a coin that's already up 885% isn't 'building'
+    toward anything, that move already happened. Returns a distinct
+    ALREADY_EXTENDED stage so it's still tracked/logged (never silently
+    dropped), just never shown as a developing opportunity."""
     if security.get("severity") == "HIGH_RISK":
         return {"stage": "BLOCKED", "conditions_met": 0}
+    if early_move_result.get("already_extended"):
+        return {"stage": "ALREADY_EXTENDED", "conditions_met": len(early_move_result["reasons_met"])}
     if early_move_result["is_early_move"]:
         return {"stage": "EARLY_MOVE", "conditions_met": len(early_move_result["reasons_met"])}
     n_met = len(early_move_result["reasons_met"])
@@ -445,7 +454,8 @@ def classify_dex_stage(early_move_result: dict, security: dict) -> dict:
 
 
 def classify_dex_early_move(viability: dict, flow: dict, accel: dict, pair_age_hours: Optional[float],
-                             security: dict, max_pair_age_hours: float = 72.0) -> dict:
+                             security: dict, max_pair_age_hours: float = 72.0,
+                             already_extended_threshold_pct: float = 100.0) -> dict:
     """v4.7 — 🚨 DEX EARLY MOVE. A STRICTER, all-conditions-must-converge
     classification, per explicit instruction: 'don't make every Base
     token appear in Telegram.' Requires ALL of: fresh pair, sufficient
@@ -453,7 +463,14 @@ def classify_dex_early_move(viability: dict, flow: dict, accel: dict, pair_age_h
     accelerating transactions, buy pressure, meaningful price
     acceleration, and clean security. Missing even one condition means
     NOT an early move — still logged/tracked, just not surfaced
-    prominently."""
+    prominently.
+
+    v4.7.8 FIX: pool AGE and price MAGNITUDE are different things — a
+    pool created 5 hours ago that's already +885% is 'fresh' by age but
+    the move already happened. Added an INDEPENDENT check on pct_24h
+    (default: already 2x+ = already_extended) that overrides
+    is_early_move regardless of how fresh the pool itself is. 'Want the
+    next 2-10x, not the past one' — this is that check."""
     reasons_met = []
     reasons_missing = []
 
@@ -480,8 +497,15 @@ def classify_dex_early_move(viability: dict, flow: dict, accel: dict, pair_age_h
     (reasons_met if security_clean else reasons_missing).append(
         "security clean" if security_clean else "security not confirmed clean")
 
-    all_converge = viability["passes"] and is_fresh and vol_accelerating and txn_accelerating and buy_pressure and price_accelerating and security_clean
-    return {"is_early_move": all_converge, "reasons_met": reasons_met, "reasons_missing": reasons_missing}
+    pct_24h = flow.get("pct_24h")
+    already_extended = pct_24h is not None and pct_24h >= already_extended_threshold_pct
+    if already_extended:
+        reasons_missing.append(f"already up {pct_24h:+.0f}% in 24h — this move already happened")
+
+    all_converge = (viability["passes"] and is_fresh and vol_accelerating and txn_accelerating
+                     and buy_pressure and price_accelerating and security_clean and not already_extended)
+    return {"is_early_move": all_converge, "reasons_met": reasons_met, "reasons_missing": reasons_missing,
+            "already_extended": already_extended}
 
 
 def classify_base_radar_status(viability: dict, flow: dict, security: dict, pair_age_hours: Optional[float]) -> dict:
