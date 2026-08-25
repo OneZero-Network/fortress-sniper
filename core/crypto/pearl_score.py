@@ -250,6 +250,54 @@ def compute_overextension_penalty(freshness: Optional[float]) -> float:
     return round(-((100.0 - freshness) / 100.0) * 12.0, 1)  # up to -12 for freshness=0
 
 
+def compute_precursor_signals(pct_7d: Optional[float], pct_24h: Optional[float],
+                               velocity: Optional[dict], trend_change: dict, ecosystem_trend: dict,
+                               components: dict) -> dict:
+    """v4.9 — Pre-Pearl precursor detection, per explicit instruction:
+    'coin is only +3%, but FIVE INDEPENDENT VARIABLES changed sharply
+    in the last 6-24h' — that is a fundamentally different, stronger
+    claim than one blended score being high because of a single loud
+    signal (e.g. a 12x volume spike alone dragging the whole earliness
+    score up). This checks each signal INDEPENDENTLY and counts how
+    many genuinely confirm at once — convergence, not magnitude.
+
+    The five independent variables, using data already computed
+    (zero extra API calls):
+      1. Volume accelerating (velocity engine)
+      2. Fresh trend transition (not a continuation of an old move)
+      3. Sector/ecosystem relative outperformance
+      4. Liquidity structurally healthy (turnover expanding)
+      5. Price structure improving, independent of raw price change
+
+    Deliberately does NOT count 'price already moved' as a positive
+    signal — that's the opposite of a precursor."""
+    signals = []
+
+    if velocity and velocity.get("volume_label") in ("SURGING", "ELEVATED") and velocity.get("volume_ratio", 0) >= 2.0:
+        signals.append("volume accelerating")
+
+    if trend_change.get("label") == "REVERSAL_BULLISH":
+        signals.append("fresh trend transition")
+
+    if ecosystem_trend.get("label") == "ABOVE_SECTOR":
+        signals.append("sector outperformance beginning")
+
+    liquidity_comp = components.get("liquidity")
+    if liquidity_comp is not None and liquidity_comp >= 70:
+        signals.append("liquidity structurally healthy")
+
+    structure_comp = components.get("structure")
+    if structure_comp is not None and structure_comp >= 70:
+        signals.append("price structure improving")
+
+    # Small realized move — this ISN'T itself a "signal" the way the
+    # others are (it's the absence of lateness, not evidence of change),
+    # so it's tracked separately and doesn't count toward convergence.
+    hasnt_moved_yet = (pct_7d is None or abs(pct_7d) < 15) and (pct_24h is None or abs(pct_24h) < 10)
+
+    return {"count": len(signals), "signals": signals, "hasnt_moved_yet": hasnt_moved_yet}
+
+
 def compute_earliness_score(pct_7d: Optional[float], pct_24h: Optional[float],
                              velocity: Optional[dict], trend_change: dict,
                              breakout_freshness: Optional[float]) -> Optional[float]:
@@ -299,17 +347,31 @@ def compute_earliness_score(pct_7d: Optional[float], pct_24h: Optional[float],
     return round(max(0.0, min(100.0, final)), 1)
 
 
-def classify_earliness(earliness_score: Optional[float], discovery_score: Optional[float]) -> dict:
-    """v4.8 — the quality × earliness matrix, exactly as specified:
-    'A coin with weak evidence but exceptional early behavioral change
-    is a candidate for investigation, not a Pearl. A coin that already
-    pumped is not a Pearl merely because the evidence is strong.'"""
+def classify_earliness(earliness_score: Optional[float], discovery_score: Optional[float],
+                        precursor: Optional[dict] = None) -> dict:
+    """v4.9 — hardened: PRE-PEARL and EARLY SETUP now require BOTH a high
+    blended earliness score AND real multi-signal convergence (2+
+    independent precursor variables confirmed, per the explicit
+    instruction). This prevents a single loud signal (e.g. one big
+    volume spike) from dragging the blended score above 70 and getting
+    mislabeled PRE-PEARL when nothing else actually confirms it — the
+    strengthened bar is: several independent things changing at once,
+    not one number being high."""
     if earliness_score is None:
         return {"label": "⚫ UNKNOWN", "detail": "insufficient data to judge earliness"}
+
+    precursor_count = precursor["count"] if precursor else 0
     high_discovery = (discovery_score or 0) >= 75
+
     if earliness_score >= 70:
-        return ({"label": "⚡ PRE-PEARL", "detail": "exceptional early behavioral change"} if not high_discovery
-                else {"label": "🟡 EARLY SETUP", "detail": "strong evidence AND still early"})
+        if precursor_count < 2:
+            return {"label": "🟠 DEVELOPING",
+                    "detail": f"earliness score high but only {precursor_count} independent signal(s) "
+                              f"confirm — not yet genuine convergence"}
+        detail_signals = ", ".join(precursor["signals"]) if precursor else ""
+        return ({"label": "⚡ PRE-PEARL", "detail": f"{precursor_count} independent signals converging: {detail_signals}"}
+                if not high_discovery else
+                {"label": "🟡 EARLY SETUP", "detail": f"strong evidence + {precursor_count} converging signals: {detail_signals}"})
     if earliness_score < 20:
         return {"label": "🚀 LATE", "detail": "this move already happened — not an early discovery"}
     if earliness_score < 40:
