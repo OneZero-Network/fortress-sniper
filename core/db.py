@@ -290,6 +290,7 @@ def init_crypto_tables() -> None:
             first_seen_vol_accel_ratio REAL,
             first_seen_flow_label TEXT,
             first_seen_security_status TEXT,
+            is_early_move_at_discovery INTEGER DEFAULT 0,
             -- v4.7 resolution columns — appended over time, mirroring the
             -- proven crypto_pearl_observations pattern. Running max/min
             -- are updated at each check, never backfilled early.
@@ -325,6 +326,7 @@ def init_crypto_tables() -> None:
         # v4.7 — new columns on crypto_dex_first_seen (table introduced in
         # v4.6, so existing deployments need these added, not just created)
         dex_new_columns = [
+            ("is_early_move_at_discovery", "INTEGER DEFAULT 0"),
             ("first_seen_volume_24h_usd", "REAL"), ("first_seen_buys", "INTEGER"),
             ("first_seen_sells", "INTEGER"), ("first_seen_txns", "INTEGER"),
             ("first_seen_security_status", "TEXT"),
@@ -846,12 +848,19 @@ def get_emergence_conversion_rate(days_back: int = 14) -> dict:
 
 def log_dex_first_seen(pair_address: str, symbol: str, chain: str, price: float, liquidity_usd: float,
                         volume_24h_usd: float, buys: int, sells: int, pair_age_hours: float,
-                        vol_accel_ratio: float, flow_label: str, security_status: str) -> bool:
+                        vol_accel_ratio: float, flow_label: str, security_status: str,
+                        is_early_move: bool = False) -> bool:
     """v4.7 — full first-seen snapshot, per explicit instruction: 'we
     need to know exactly what Fortress knew at the moment of discovery'
     — otherwise a later look at PONS would falsely claim early detection
     without the receipts. INSERT OR IGNORE: only the TRUE first
-    detection is ever stored. Returns True if this was genuinely new."""
+    detection is ever stored. Returns True if this was genuinely new.
+
+    v4.7.4: is_early_move records whether THIS candidate was classified
+    as a full DEX EARLY MOVE at the moment of discovery — needed to
+    later classify outcomes as SUCCESS/NO EDGE (an asset that moved a
+    lot but was NEVER called an early move is 'no edge,' not a failure
+    of the early-move thesis, since no thesis was ever made)."""
     from datetime import datetime as _dt
     now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
     txns = (buys or 0) + (sells or 0)
@@ -861,10 +870,12 @@ def log_dex_first_seen(pair_address: str, symbol: str, chain: str, price: float,
                 (pair_address, symbol, chain, first_seen_at, first_seen_price,
                  first_seen_liquidity_usd, first_seen_volume_24h_usd, first_seen_buys,
                  first_seen_sells, first_seen_txns, first_seen_pair_age_hours,
-                 first_seen_vol_accel_ratio, first_seen_flow_label, first_seen_security_status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 first_seen_vol_accel_ratio, first_seen_flow_label, first_seen_security_status,
+                 is_early_move_at_discovery)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (pair_address, symbol.upper(), chain, now, price, liquidity_usd, volume_24h_usd,
-              buys, sells, txns, pair_age_hours, vol_accel_ratio, flow_label, security_status))
+              buys, sells, txns, pair_age_hours, vol_accel_ratio, flow_label, security_status,
+              int(is_early_move)))
         return cur.rowcount > 0
 
 
@@ -903,7 +914,7 @@ def get_dex_pairs_due_for_resolution(horizon: str) -> list:
     col = f"resolved_{horizon}"
     cols = ["pair_address", "symbol", "chain", "first_seen_at", "first_seen_price",
             "first_seen_liquidity_usd", "first_seen_volume_24h_usd", "first_seen_security_status",
-            "max_upside_pct", "max_drawdown_pct"]
+            "max_upside_pct", "max_drawdown_pct", "is_early_move_at_discovery"]
     with get_conn() as con:
         rows = con.execute(
             f"SELECT {', '.join(cols)} FROM crypto_dex_first_seen WHERE first_seen_at <= ? AND {col} = 0",
