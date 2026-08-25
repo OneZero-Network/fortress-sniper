@@ -214,14 +214,39 @@ def run() -> None:
                          f"Evidence: Level 0 — unvalidated\n"
                          f"Next: Outcome tracking 1h → 6h → 24h\n")
     else:
-        collapsed_count = len(set(c["snapshot"]["symbol"] for c in other_candidates))
+        unique_others: dict = {}
+        for c in other_candidates:
+            sym = c["snapshot"]["symbol"]
+            unique_others.setdefault(sym, []).append(c)
+        deduped_others = []
+        for sym, pools in unique_others.items():
+            best = max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
+            deduped_others.append(best)
+
+        # ── "Closest developing signals" — per explicit instruction: 16
+        # survivors collapsing to a bare "no actionable discovery" line
+        # hides a real result (something is happening, just not early
+        # enough yet). Rank by how close to qualifying (fewest missing
+        # conditions), then by 24h magnitude, show only the top 3.
+        deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
+        closest = deduped_others[:3]
+
         lines.append(f"🧭 <b>BASE DEX RADAR — {today}</b>\n")
-        lines.append(f"Result: No Early Moves detected today.")
-        lines.append(f"{len(after_security)} asset(s) passed the safety/activity filters, but none "
-                     f"currently meets Fortress's Early-Move criteria.")
-        lines.append(f"🟢 No security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
-        lines.append(f"⚪ No actionable discovery")
-        lines.append(f"\nStatus: Monitoring continues.")
+        lines.append(f"Result: No Early Move confirmed today.")
+        lines.append(f"{len(deduped_others)} asset(s) passed safety + activity screening.\n")
+        lines.append(f"🟡 {len(deduped_others)} being monitored")
+        lines.append(f"🟢 0 security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
+        lines.append(f"⚡ 0 Early Moves")
+
+        if closest:
+            lines.append(f"\nClosest developing signals:")
+            for c in closest:
+                snap = c["snapshot"]
+                pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else "n/a"
+                reason = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "not yet confirmed"
+                lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {reason}")
+
+        lines.append(f"\nStatus: Monitoring for acceleration.")
 
     # ── Outcome resolutions — the 5-state vocabulary, per explicit spec ──
     resolutions = flywheel_result.get("resolutions", [])
