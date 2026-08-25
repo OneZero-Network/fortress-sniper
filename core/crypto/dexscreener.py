@@ -426,6 +426,24 @@ def adapt_to_coin_snapshot(pair: dict) -> dict:
     }
 
 
+def classify_dex_stage(early_move_result: dict, security: dict) -> dict:
+    """v4.7.6 — 🟡 BUILDING state, per explicit instruction: the missing
+    layer between WATCH and ⚡ EARLY MOVE. Reuses classify_dex_early_move's
+    reasons_met/reasons_missing directly rather than re-implementing the
+    condition checks — BUILDING means 2+ conditions genuinely met (real
+    partial confirmation) but not the full convergence required for
+    EARLY_MOVE. A security failure overrides everything — never BUILDING
+    or EARLY_MOVE on a token that failed the security check."""
+    if security.get("severity") == "HIGH_RISK":
+        return {"stage": "BLOCKED", "conditions_met": 0}
+    if early_move_result["is_early_move"]:
+        return {"stage": "EARLY_MOVE", "conditions_met": len(early_move_result["reasons_met"])}
+    n_met = len(early_move_result["reasons_met"])
+    if n_met >= 2:
+        return {"stage": "BUILDING", "conditions_met": n_met}
+    return {"stage": "NONE", "conditions_met": n_met}
+
+
 def classify_dex_early_move(viability: dict, flow: dict, accel: dict, pair_age_hours: Optional[float],
                              security: dict, max_pair_age_hours: float = 72.0) -> dict:
     """v4.7 — 🚨 DEX EARLY MOVE. A STRICTER, all-conditions-must-converge
