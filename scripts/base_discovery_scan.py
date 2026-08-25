@@ -290,13 +290,26 @@ def run() -> None:
             deduped_others = [max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
                               for sym, pools in unique_others.items()]
             deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
-            if deduped_others:
+
+            # ── v4.9.2 fix: this fallback branch was NEVER given the
+            # unchanged-streak suppression built in v4.9.1 — AERO/BRETT/
+            # TOSHI land HERE (0-1 conditions met), not in the BUILDING
+            # branch, which is exactly why the earlier fix had zero
+            # effect in production. Same fresh/stale split, applied here.
+            fresh_others = [c for c in deduped_others if c["unchanged_streak"] < 3]
+            stale_others = [c for c in deduped_others if c["unchanged_streak"] >= 3]
+
+            if fresh_others:
                 lines.append(f"\nClosest developing signals:")
-                for c in deduped_others[:3]:
+                for c in fresh_others[:3]:
                     snap = c["snapshot"]
                     pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else "n/a"
                     reason = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "not yet confirmed"
                     lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {reason}")
+            if stale_others:
+                stale_names = ", ".join(c["snapshot"]["symbol"] for c in stale_others[:5])
+                lines.append(f"\n⏸️ <b>Unchanged {stale_others[0]['unchanged_streak']}+ scans "
+                             f"({len(stale_others)})</b>: {stale_names} — no new signal, still logged")
 
         # ── Graduations — pairs that were BUILDING at some point and
         # LATER showed EARLY_MOVE. Direct evidence about whether BUILDING
