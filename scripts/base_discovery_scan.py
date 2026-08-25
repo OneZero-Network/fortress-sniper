@@ -78,6 +78,19 @@ def _gather_universe() -> dict:
             pair["_source"] = "PROFILED"
             all_pairs.append(pair)
 
+    top_boosted_diag = dexscreener.fetch_top_boosted_base_tokens_diagnostic(limit=30)
+    source_diagnostics.append(top_boosted_diag)
+    log.info(f"Source TOP_BOOSTED: status={top_boosted_diag['status']}, "
+             f"raw={top_boosted_diag['raw_item_count']}, base={top_boosted_diag['base_item_count']}")
+    for t in top_boosted_diag["items"]:
+        addr = t.get("tokenAddress")
+        if not addr:
+            continue
+        pair = dexscreener.fetch_pair_data(addr, chain="base")
+        if pair:
+            pair["_source"] = "TOP_BOOSTED"
+            all_pairs.append(pair)
+
     search_diag = dexscreener.fetch_search_base_pairs_diagnostic()
     source_diagnostics.append(search_diag)
     log.info(f"Source SEARCH: status={search_diag['status']}, "
