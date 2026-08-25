@@ -215,37 +215,44 @@ def _tally_diagnostic(c: Optional[dict], diag: dict) -> None:
 
 
 def _user_facing_entry(c: dict, rank_emoji: str, persist: dict) -> str:
-    """v4.3 — further UX reduction, per explicit instruction, scoring
-    completely frozen: (1) Priority score REMOVED from Telegram —
-    a number like '53/100' reads as a recommendation score even with
-    disclaimers, and category+freshness+why-now is the actually useful
-    information; the exact score stays in the Sheet. (2) Evidence
-    completeness only shown here as an EXCEPTION when it materially
-    differs from the norm (>=60%) — the common ~40% case is now stated
-    ONCE in the banner, not repeated on every single entry. (3) 'Main
-    risk' relabeled 'Watch for' to read less like a warning label and
-    more like guidance. (4) Radar persistence badge added — NEW vs
-    Nth-day, using data the Pearl Flywheel has already been quietly
-    accumulating since v3.9."""
+    """v4.7.4 — further UX tightening, per explicit instruction: 'If a
+    number doesn't change what the user should understand or do, it
+    doesn't belong in Telegram.' Bullets are now short, emoji-tagged
+    signals (🟢 fresh breakout, 🔥 volume, 📈 trend, ⚠️ evidence gap)
+    instead of plain dash-prefixed sentences — matching the target
+    format exactly. Explicit Status + Sheet pointer added per entry.
+    Scoring is completely untouched — this is presentation only."""
     freshness = c.get("breakout_freshness")
     bo = c.get("breakout") or {}
     move_age = trend_breakout.classify_move_age(bo.get("breakout_age_days")) if bo.get("available") else {"label": ""}
-    bullets = pearl_score.build_why_now_bullets(c.get("velocity"), c.get("trend_change", {}), bo, freshness)
-    bullet_str = "\n".join(f"   • {b}" for b in bullets) if bullets else "   • No strong co-occurring signals"
     watch_for = c["invalidation_conditions"][0] if c.get("invalidation_conditions") else "unclear"
     type_label = c["pearl_type"]["label"].split(" ", 1)[-1] if c.get("pearl_type") else ""
 
-    completeness = c.get("evidence_completeness_pct")
-    evidence_line = ""
-    if completeness is not None and completeness >= 60:
-        evidence_line = f"\n   Evidence: {completeness:.0f}% — stronger confirmation"
+    tags = []
+    if bo.get("label") == "BREAKOUT" and move_age.get("label", "").startswith("🟢"):
+        tags.append("🟢 Fresh breakout")
+    elif bo.get("label") == "BREAKOUT":
+        tags.append(f"{move_age.get('label', '')} breakout")
+    velocity = c.get("velocity") or {}
+    if velocity.get("volume_ratio") and velocity.get("volume_label") in ("SURGING", "ELEVATED"):
+        tags.append(f"🔥 {velocity['volume_ratio']:.1f}× volume")
+    trend_label = c.get("trend_change", {}).get("label", "")
+    if trend_label in ("CONTINUATION_UP", "REVERSAL_BULLISH"):
+        tags.append("📈 Sustained trend" if trend_label == "CONTINUATION_UP" else "📈 Trend just turned positive")
 
+    completeness = c.get("evidence_completeness_pct")
+    if completeness is not None and completeness < 60:
+        tags.append("⚠️ Evidence incomplete")
+    elif completeness is not None:
+        tags.append(f"✅ Evidence {completeness:.0f}% — stronger confirmation")
+
+    tag_lines = "\n".join(f"   {t}" for t in tags) if tags else "   No strong co-occurring signals"
     radar_badge = "🆕 NEW" if persist["times_seen"] <= 1 else f"🔁 Day {persist['times_seen']} on radar"
 
     return (f"{rank_emoji} <b>{c['symbol']}</b> — {type_label} | {radar_badge}\n"
-            f"   {move_age['label']}\n"
-            f"   Why now:\n{bullet_str}{evidence_line}\n"
-            f"   Watch for: {watch_for}")
+            f"{tag_lines}\n"
+            f"   Watch for: {watch_for}\n"
+            f"   Status: Investigate")
 
 
 def run() -> None:
