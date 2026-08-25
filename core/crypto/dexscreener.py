@@ -83,6 +83,29 @@ def _get(path: str) -> Optional[dict]:
         return None
 
 
+def _get_with_diagnostics(path: str) -> dict:
+    """v4.7.2 — same request as _get(), but ALWAYS returns full
+    diagnostic info regardless of outcome, per explicit instruction:
+    'SEARCH SOURCE UNAVAILABLE / ZERO RESULTS' must be distinguishable
+    states, not both silently collapsed to an empty list."""
+    _throttle()
+    try:
+        resp = requests.get(f"{DEXSCREENER_BASE}{path}", timeout=15)
+        result = {"http_status": resp.status_code, "response_size_bytes": len(resp.content),
+                  "data": None, "error": None}
+        if resp.status_code == 200:
+            try:
+                result["data"] = resp.json()
+            except Exception as e:
+                result["error"] = f"JSON parse failure: {e}"
+        else:
+            result["error"] = f"HTTP {resp.status_code}"
+        return result
+    except Exception as e:
+        return {"http_status": None, "response_size_bytes": 0, "data": None,
+                "error": f"request exception: {e}"}
+
+
 def compute_pair_age_hours(pair: dict) -> Optional[float]:
     """v4.6 — fresh-pair detection. pairCreatedAt is epoch milliseconds.
     Answers the actual question your mentor's architecture needs: is
@@ -145,61 +168,115 @@ def check_dex_security(pair: dict) -> dict:
     return risk_engine.assess_false_pearl_risk({"base": address})
 
 
-def fetch_boosted_base_tokens(limit: int = 30) -> List[dict]:
-    """Discovery source A — token-boosts endpoint. NOTE: boost activity
-    itself is explicitly NOT used as a signal (see module docstring) —
-    only used to generate a candidate list. Per the honest finding from
-    v4.7's first real run: this source alone returned exactly 1 token,
-    far too narrow to be 'Base discovery' — it must be ONE of several
-    sources, never the whole universe."""
-    data = _get("/token-boosts/latest/v1")
-    if not data:
-        return []
+def fetch_boosted_base_tokens_diagnostic(limit: int = 30) -> dict:
+    """v4.7.2 — Coverage Audit. Returns full diagnostics, not just a
+    filtered list: how many items the API returned in total (across ALL
+    chains), how many survived the Base filter, HTTP status, and any
+    parse failures — so 'zero results' can be attributed to the right
+    cause instead of silently treated as 'no Base opportunities.'"""
+    result = _get_with_diagnostics("/token-boosts/latest/v1")
+    data = result["data"]
+    if data is None:
+        return {"source": "BOOSTED", "http_status": result["http_status"],
+                "response_size_bytes": result["response_size_bytes"],
+                "raw_item_count": 0, "base_item_count": 0, "items": [],
+                "status": "UNAVAILABLE", "error": result["error"]}
+
     tokens = data if isinstance(data, list) else data.get("tokens", [])
     base_tokens = [t for t in tokens if t.get("chainId") == "base"]
     for t in base_tokens:
         t["_source"] = "BOOSTED"
-    return base_tokens[:limit]
+    return {"source": "BOOSTED", "http_status": result["http_status"],
+            "response_size_bytes": result["response_size_bytes"],
+            "raw_item_count": len(tokens), "base_item_count": len(base_tokens),
+            "items": base_tokens[:limit],
+            "status": "ZERO_RESULTS" if len(base_tokens) == 0 and len(tokens) > 0 else "OK",
+            "error": None}
 
 
-def fetch_profiled_base_tokens(limit: int = 30) -> List[dict]:
-    """Discovery source B — token-profiles endpoint. A DIFFERENT curated
-    feed than token-boosts (tokens that have set up a DexScreener
-    profile — logo, socials, description — a weaker, less-gameable
-    signal of genuine project activity than a paid boost, though still
-    not a full universe scan)."""
-    data = _get("/token-profiles/latest/v1")
-    if not data:
-        return []
+def fetch_profiled_base_tokens_diagnostic(limit: int = 30) -> dict:
+    """v4.7.2 — same diagnostic treatment as the boosted source."""
+    result = _get_with_diagnostics("/token-profiles/latest/v1")
+    data = result["data"]
+    if data is None:
+        return {"source": "PROFILED", "http_status": result["http_status"],
+                "response_size_bytes": result["response_size_bytes"],
+                "raw_item_count": 0, "base_item_count": 0, "items": [],
+                "status": "UNAVAILABLE", "error": result["error"]}
+
     tokens = data if isinstance(data, list) else data.get("tokens", [])
     base_tokens = [t for t in tokens if t.get("chainId") == "base"]
     for t in base_tokens:
         t["_source"] = "PROFILED"
-    return base_tokens[:limit]
+    return {"source": "PROFILED", "http_status": result["http_status"],
+            "response_size_bytes": result["response_size_bytes"],
+            "raw_item_count": len(tokens), "base_item_count": len(base_tokens),
+            "items": base_tokens[:limit],
+            "status": "ZERO_RESULTS" if len(base_tokens) == 0 and len(tokens) > 0 else "OK",
+            "error": None}
 
 
-def fetch_search_base_pairs(query_terms: List[str] = None) -> List[dict]:
-    """Discovery source C — the search endpoint, queried against common
-    Base quote-token tickers. This is the closest approximation to a
-    genuine 'active pairs' scan the free public API offers (DexScreener
-    doesn't expose a bare 'list every pair on chain X' endpoint) — most
-    real trading activity on Base quotes against WETH or USDC, so
-    searching for those terms surfaces a broader, less-curated set of
-    currently-active pairs than either boost or profile feeds. Returns
-    full pair objects directly (unlike the other two sources, which
-    return token stubs needing a follow-up fetch_pair_data call)."""
-    query_terms = query_terms or ["WETH", "USDC"]
+def fetch_search_base_pairs_diagnostic(query_terms: List[str] = None) -> dict:
+    """v4.7.2 — Coverage Audit, and a reasoned strategy change.
+
+    CONFIRMED (via DexScreener's own documented behavior, checked
+    directly, not guessed): the search endpoint is HARD-CAPPED at ~30
+    results and RELEVANCE-RANKED ACROSS EVERY CHAIN DexScreener indexes.
+    A generic query like 'WETH' matches an enormous number of pairs on
+    Ethereum mainnet alone — it is entirely plausible that all 30 top-
+    ranked results for a generic query are non-Base, meaning the search
+    genuinely returns pairs, just none on the chain we filter for
+    afterward. That is DIFFERENT from the request failing.
+
+    FIX ATTEMPTED (a hypothesis, not a blind tune): querying Base-native
+    token tickers (AERO — Aerodrome, Base's flagship DEX; BRETT, DEGEN,
+    TOSHI — well-known Base-ecosystem tokens) instead of generic
+    cross-chain terms, since these tokens are predominantly or
+    exclusively traded on Base, biasing the relevance ranking toward
+    Base results before the chain filter even runs. The NEW per-query
+    raw/base counts in this diagnostic will directly confirm or refute
+    whether this actually helps, on the very next run."""
+    query_terms = query_terms or ["AERO", "BRETT", "DEGEN", "TOSHI"]
     all_pairs = []
+    per_query = []
     for term in query_terms:
-        data = _get(f"/latest/dex/search?q={term}")
-        if not data:
+        result = _get_with_diagnostics(f"/latest/dex/search?q={term}")
+        data = result["data"]
+        if data is None:
+            per_query.append({"query": term, "http_status": result["http_status"],
+                              "raw_count": 0, "base_count": 0, "status": "UNAVAILABLE",
+                              "error": result["error"]})
             continue
         pairs = data.get("pairs") or []
         base_pairs = [p for p in pairs if p.get("chainId") == "base"]
         for p in base_pairs:
             p["_source"] = "SEARCH"
         all_pairs.extend(base_pairs)
-    return all_pairs
+        per_query.append({"query": term, "http_status": result["http_status"],
+                          "raw_count": len(pairs), "base_count": len(base_pairs),
+                          "status": "ZERO_RESULTS" if len(base_pairs) == 0 and len(pairs) > 0 else "OK",
+                          "error": None})
+
+    total_raw = sum(q["raw_count"] for q in per_query)
+    return {"source": "SEARCH", "per_query": per_query,
+            "raw_item_count": total_raw, "base_item_count": len(all_pairs),
+            "items": all_pairs,
+            "status": "ZERO_RESULTS" if len(all_pairs) == 0 and total_raw > 0 else
+                      ("UNAVAILABLE" if total_raw == 0 else "OK")}
+
+
+# Thin backward-compatible wrappers — return just the item list, for any
+# caller that doesn't need the full diagnostic.
+def fetch_boosted_base_tokens(limit: int = 30) -> List[dict]:
+    return fetch_boosted_base_tokens_diagnostic(limit)["items"]
+
+
+def fetch_profiled_base_tokens(limit: int = 30) -> List[dict]:
+    return fetch_profiled_base_tokens_diagnostic(limit)["items"]
+
+
+def fetch_search_base_pairs(query_terms: List[str] = None) -> List[dict]:
+    return fetch_search_base_pairs_diagnostic(query_terms)["items"]
 
 
 def dedupe_pairs_by_address(pairs: List[dict]) -> List[dict]:
