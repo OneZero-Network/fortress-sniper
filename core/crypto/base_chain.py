@@ -42,15 +42,47 @@ log = logging.getLogger("fortress.crypto.base_chain")
 
 BASE_RPC_URL = "https://mainnet.base.org"
 
-# Uniswap V3 Factory on Base — documented, standard address.
-# VERIFY against basescan.org/address/... before trusting in production;
-# this sandbox cannot confirm it against a live chain.
-UNISWAP_V3_FACTORY_BASE = "0x33128a8fC17869897dcE68Ed026d694621f6FDf"
+# Uniswap V3 Factory — deployed via deterministic CREATE2 with the SAME
+# address across nearly all EVM chains (Ethereum, Base, Arbitrum,
+# Optimism, Polygon), which is why this specific value is so widely and
+# consistently cited across Uniswap's own documentation and integration
+# guides.
+#
+# v4.9.10 CRITICAL FIX: the previous hardcoded value was 39 hex
+# characters — ALSO one short of the required 40 (20 bytes) — a second
+# silent truncation, caught only because the new self-check assertion
+# below fired immediately at import time instead of failing silently
+# downstream. UNLIKE the topic hash, a contract address cannot be
+# independently computed — it's a fact about what's actually deployed
+# on-chain. This corrected value has the right length and matches the
+# well-known canonical cross-chain address, but has NOT been verified
+# against a live Base RPC or block explorer from this sandbox (no
+# external network access here). Recommend a final check against
+# basescan.org before treating this as fully confirmed.
+UNISWAP_V3_FACTORY_BASE = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 
-# keccak256("PoolCreated(address,address,uint24,int24,address)") — the
-# standard Uniswap V3 PoolCreated event topic, identical across all
+# keccak256("PoolCreated(address,address,uint24,int24,address)") —
+# the standard Uniswap V3 PoolCreated event topic, identical across all
 # chains (derived from the event signature, not the contract address).
-POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7e5"
+#
+# v4.9.10 CRITICAL FIX: the previous hardcoded value was 63 hex
+# characters — ONE SHORT of the required 64 (32 bytes) — a silent
+# truncation, not a formatting issue. This is almost certainly the real
+# cause of every "Invalid variadic value... did not match any variant"
+# error seen in production: a malformed-length hash cannot deserialize
+# as a valid topic hash under any shape. RECOMPUTED here with an actual
+# keccak256 implementation (pycryptodome), not recalled from memory —
+# verified programmatically to be exactly 64 hex characters.
+POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
+
+# Self-check: fail LOUD and immediately at import time if either
+# hardcoded constant is ever malformed again, rather than producing a
+# cryptic downstream RPC error hours later. This is the exact class of
+# bug that caused v4.9.9's fix attempt to still fail.
+assert len(POOL_CREATED_TOPIC) == 66, \
+    f"POOL_CREATED_TOPIC must be exactly 66 chars (0x + 64 hex), got {len(POOL_CREATED_TOPIC)}"
+assert len(UNISWAP_V3_FACTORY_BASE) == 42, \
+    f"UNISWAP_V3_FACTORY_BASE must be exactly 42 chars (0x + 40 hex), got {len(UNISWAP_V3_FACTORY_BASE)}"
 
 _MIN_INTERVAL = 0.5
 _last_call_ts = [0.0]
