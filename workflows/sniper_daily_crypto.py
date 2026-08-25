@@ -458,6 +458,23 @@ def run() -> None:
             c["discovery_score"], c.get("evidence_completeness_pct"), c.get("emergence_score"),
             c["breakout_freshness"], c["false_pearl_risk_pct"], c.get("tier"),
             pct_7d=c.get("_pct_7d"), pct_24h=c.get("_pct_24h"))
+
+        # ── v4.8 — EARLINESS SCORE, per explicit mandate: "Stop optimizing
+        # for the number of Pearls produced... A coin that already pumped
+        # is not a Pearl merely because the evidence is strong." This is a
+        # RANKING change, not a UI change — Top 5 / priority ordering now
+        # uses quality × earliness instead of raw discovery_score alone,
+        # so an already-moved coin with great fundamentals no longer
+        # outranks a genuinely early, thinner-evidence candidate.
+        c["earliness_score"] = pearl_score.compute_earliness_score(
+            c.get("_pct_7d"), c.get("_pct_24h"), c.get("velocity"), c["trend_change"], c["breakout_freshness"])
+        c["earliness_class"] = pearl_score.classify_earliness(c["earliness_score"], c["discovery_score"])
+        # quality × earliness — both normalized 0-100, multiplied and
+        # rescaled. When earliness is unknown, don't silently zero out
+        # the ranking — use a neutral midpoint instead.
+        _earliness_for_rank = c["earliness_score"] if c["earliness_score"] is not None else 50.0
+        c["quality_x_earliness"] = round((c["discovery_score"] * _earliness_for_rank) / 100.0, 1)
+
         c["why_now"] = pearl_score.build_why_now_summary(
             c["discovery_score"], c.get("velocity"), c["trend_change"], c["breakout"],
             c["ecosystem_trend"], c.get("evidence_completeness_pct"), c.get("invalidation_conditions", []))
@@ -599,7 +616,7 @@ def run() -> None:
         if early_pearls:
             lines.append(f"\n💎 <b>EARLY PEARL ({len(early_pearls)})</b>")
             medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 10
-            for i, c in enumerate(sorted(early_pearls, key=lambda c: c["pearl_priority_score"], reverse=True)[:5]):
+            for i, c in enumerate(sorted(early_pearls, key=lambda c: c["quality_x_earliness"], reverse=True)[:5]):
                 lines.append(_user_facing_entry(c, medals[i], get_symbol_persistence(c["symbol"])))
 
         if emergence_alerts_typed:
@@ -664,6 +681,8 @@ def run() -> None:
         log.info(f"  breakout: {c.get('breakout')}")
         log.info(f"  ecosystem_trend: {c.get('ecosystem_trend')}")
         log.info(f"  pearl_priority_score: {c.get('pearl_priority_score')}")
+        log.info(f"  earliness_score: {c.get('earliness_score')} ({(c.get('earliness_class') or {}).get('label')}) "
+                 f"| quality_x_earliness: {c.get('quality_x_earliness')}")
         log.info(f"  reasons_why: {c['reasons_why']}")
         log.info(f"  invalidation_conditions: {c['invalidation_conditions']}")
 
@@ -671,11 +690,14 @@ def run() -> None:
 
     try:
         header_row = ["symbol", "is_watchlist_pearl", "discovery_score", "evidence_completeness_pct", "tier",
-                      "emergence_score", "pearl_priority_score", "trend_change", "breakout", "ecosystem_trend",
+                      "emergence_score", "pearl_priority_score", "earliness_score", "earliness_class",
+                      "quality_x_earliness", "trend_change", "breakout", "ecosystem_trend",
                       "whale", "news", "liquidity", "structure", "onchain",
                       "false_pearl_risk_pct", "status", "reasons_why"]
         rows = [[c["symbol"], c["is_watchlist_pearl"], c["discovery_score"], c["evidence_completeness_pct"], c["tier"],
                  c.get("emergence_score"), c.get("pearl_priority_score"),
+                 c.get("earliness_score"), (c.get("earliness_class") or {}).get("label"),
+                 c.get("quality_x_earliness"),
                  (c.get("trend_change") or {}).get("label"), (c.get("breakout") or {}).get("label"),
                  (c.get("ecosystem_trend") or {}).get("label"),
                  c["components"].get("whale"), c["components"].get("news"), c["components"].get("liquidity"),
