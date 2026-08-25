@@ -323,6 +323,17 @@ def init_crypto_tables() -> None:
             conditions_met  INTEGER,
             pct_24h         REAL
         );
+
+        -- ═══ v4.9.8 CHAIN-EVENT DISCOVERY CURSOR ═══ Single-row table
+        -- tracking the last Base block number scanned for new-pool
+        -- creation events. This is what makes chain-native discovery
+        -- incremental — each run only looks at blocks since the last
+        -- scan, not the whole chain history every time.
+        CREATE TABLE IF NOT EXISTS crypto_dex_chain_cursor (
+            id                  INTEGER PRIMARY KEY CHECK (id = 1),
+            last_scanned_block  INTEGER,
+            last_scanned_at     TEXT
+        );
         """)
         # Self-migrating column addition for databases created before this
         # column existed — avoids another manual paste-into-GitHub step.
@@ -1091,3 +1102,24 @@ def get_dex_unchanged_streak(pair_address: str, current_stage: str, current_cond
         else:
             break
     return streak
+
+
+def get_dex_chain_cursor() -> Optional[int]:
+    """Last Base block number scanned for new-pool events. None if
+    never scanned before (first run — caller should pick a reasonable
+    starting point, e.g. current_block - N, not genesis)."""
+    with get_conn() as con:
+        row = con.execute("SELECT last_scanned_block FROM crypto_dex_chain_cursor WHERE id = 1").fetchone()
+    return row[0] if row else None
+
+
+def set_dex_chain_cursor(block_number: int) -> None:
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn(write=True) as con:
+        con.execute("""
+            INSERT INTO crypto_dex_chain_cursor (id, last_scanned_block, last_scanned_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET last_scanned_block=excluded.last_scanned_block,
+                last_scanned_at=excluded.last_scanned_at
+        """, (block_number, now))
