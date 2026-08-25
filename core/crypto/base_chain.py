@@ -92,21 +92,34 @@ def get_current_block() -> Optional[int]:
         return None
 
 
-def fetch_new_pool_events(from_block: int, to_block: int) -> List[dict]:
-    """Fetch PoolCreated events in [from_block, to_block]. Returns raw
-    log entries — parse_pool_created_log() extracts the useful fields.
-    Most public RPC endpoints cap eth_getLogs block ranges (often
-    ~2000-10000 blocks per call) — callers should keep ranges modest and
-    expect None on a too-large request, not assume it always succeeds."""
+def fetch_new_pool_events(from_block: int, to_block: int) -> dict:
+    """Fetch PoolCreated events in [from_block, to_block]. Returns
+    {"logs": [...] or None, "ok": bool} — the None/empty-list distinction
+    is preserved explicitly here (v4.9.8's bug: converting a failed call
+    into an empty list made 'RPC failed' indistinguishable from 'RPC
+    succeeded with zero events').
+
+    v4.9.9 FIX: address now sent as an array (['0x...'], not a bare
+    string) and lowercased. The production error — 'Invalid variadic
+    value or array type: data did not match any variant of untagged
+    enum Variadic' — is a Rust/Alloy-style deserialization error
+    consistent with Base's node expecting the address field in its
+    array-typed form. This is a well-reasoned fix based on the actual
+    error text, NOT confirmed against a live response (this sandbox
+    cannot reach external RPC endpoints, same constraint as every other
+    external API in this project). The next real run is the actual
+    test — if CHAIN_EVENT still errors, the improved logging below will
+    show the exact new error message to diagnose further."""
     from_hex = hex(from_block)
     to_hex = hex(to_block)
     result = _rpc_call("eth_getLogs", [{
         "fromBlock": from_hex, "toBlock": to_hex,
-        "address": UNISWAP_V3_FACTORY_BASE, "topics": [POOL_CREATED_TOPIC],
+        "address": [UNISWAP_V3_FACTORY_BASE.lower()],
+        "topics": [POOL_CREATED_TOPIC],
     }])
     if result is None:
-        return []
-    return result
+        return {"logs": None, "ok": False}
+    return {"logs": result, "ok": True}
 
 
 def parse_pool_created_log(log_entry: dict) -> Optional[dict]:
@@ -134,30 +147,41 @@ def parse_pool_created_log(log_entry: dict) -> Optional[dict]:
 
 def discover_new_base_pools(cursor_block: Optional[int], max_blocks_per_call: int = 2000,
                              lookback_blocks_if_no_cursor: int = 5000) -> dict:
-    """v4.9.8 — the actual discovery entrypoint. Returns
-    {new_pools: [...], new_cursor: int, status: str}. On first-ever run
-    (cursor_block is None), starts from (current - lookback) rather than
-    genesis — scanning the whole chain history on first run would be
-    both wasteful and pointless (ancient pools aren't 'new' candidates).
-    """
+    """v4.9.9 — REWRITTEN error handling, per explicit requirement: RPC
+    failure must produce a status that is NEVER 'OK', and the cursor
+    must NEVER advance on failure. Three distinct, honest states:
+    RPC_ERROR (request failed — cursor does NOT advance, so the same
+    blocks get retried next run), OK_ZERO_RESULTS (request succeeded,
+    genuinely zero new pools), OK (request succeeded, pools found)."""
     current_block = get_current_block()
     if current_block is None:
-        return {"new_pools": [], "new_cursor": cursor_block, "status": "RPC_UNAVAILABLE"}
+        log.warning("Base chain scan: eth_blockNumber failed — RPC unreachable")
+        return {"new_pools": [], "new_cursor": cursor_block, "status": "RPC_ERROR"}
 
     from_block = cursor_block if cursor_block is not None else max(0, current_block - lookback_blocks_if_no_cursor)
     if from_block >= current_block:
-        return {"new_pools": [], "new_cursor": current_block, "status": "OK_NO_NEW_BLOCKS"}
+        log.info(f"Base chain scan: from_block={from_block} >= current_block={current_block}, nothing new yet")
+        return {"new_pools": [], "new_cursor": current_block, "status": "OK_ZERO_RESULTS"}
 
     to_block = min(current_block, from_block + max_blocks_per_call)
-    raw_logs = fetch_new_pool_events(from_block, to_block)
+    log.info(f"Base chain scan: from_block={from_block}, to_block={to_block}, current_block={current_block}")
+    fetch_result = fetch_new_pool_events(from_block, to_block)
 
+    if not fetch_result["ok"]:
+        # ── v4.9.9 fix: RPC failure must NEVER be reported as OK, and
+        # the cursor must NEVER advance — the caller must retry these
+        # exact same blocks next run, not silently skip past them.
+        log.warning(f"Base chain scan FAILED: blocks {from_block}-{to_block}, eth_getLogs request failed")
+        return {"new_pools": [], "new_cursor": cursor_block, "status": "RPC_ERROR"}
+
+    raw_logs = fetch_result["logs"]
     new_pools = []
     for entry in raw_logs:
         parsed = parse_pool_created_log(entry)
         if parsed and parsed.get("pool_address"):
             new_pools.append(parsed)
 
-    log.info(f"Base chain scan: blocks {from_block}-{to_block}, {len(raw_logs)} raw log(s), "
+    log.info(f"Base chain scan OK: blocks {from_block}-{to_block}, {len(raw_logs)} raw log(s), "
              f"{len(new_pools)} parsed pool(s)")
     return {"new_pools": new_pools, "new_cursor": to_block,
-            "status": "OK" if raw_logs is not None else "RPC_UNAVAILABLE"}
+            "status": "OK" if new_pools else "OK_ZERO_RESULTS"}
