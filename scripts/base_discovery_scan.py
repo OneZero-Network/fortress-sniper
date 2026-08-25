@@ -307,11 +307,30 @@ def run() -> None:
             deduped_building.append(best)
         deduped_building.sort(key=lambda c: (-c["stage"]["conditions_met"], -(c.get("pct_24h") or 0)))
 
-        total_monitored = len(building_candidates) + len(other_candidates)
+        # ── v4.9.7 fix: "where is visibility of symbol name 15, what
+        # does it mean?" — the header was counting RAW pool-level
+        # candidates (many pools per token), while only unique SYMBOLS
+        # ever get named below. 15 pools can genuinely mean 3 unique
+        # tokens after dedup — the header must say the number that
+        # matches what's actually nameable, computed BEFORE printing
+        # anything, from BOTH branches, so it's always accurate.
+        unique_others: dict = {}
+        for c in other_candidates:
+            if c["early_move"].get("already_extended"):
+                continue
+            sym = c["snapshot"]["symbol"]
+            unique_others.setdefault(sym, []).append(c)
+        deduped_others = [max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
+                          for sym, pools in unique_others.items()]
+        deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
+
+        display_unique_count = len(deduped_building) if deduped_building else len(deduped_others)
+
         lines.append(f"🧭 <b>BASE DEX RADAR — {today}</b>\n")
         lines.append(f"Result: No Early Move confirmed today.")
-        lines.append(f"{total_monitored} asset(s) passed safety + activity screening.\n")
-        lines.append(f"🟡 {len(deduped_building)} building" if deduped_building else f"🟡 {total_monitored} being monitored")
+        lines.append(f"{len(all_pairs)} DEX pair(s) scanned → {display_unique_count} unique token(s) "
+                     f"passed safety + activity screening.\n")
+        lines.append(f"🟡 {display_unique_count} being monitored")
         lines.append(f"🟢 0 security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
         lines.append(f"🟡 {len(pre_pearl_candidates)} Pre-Pearl")
         lines.append(f"⚡ 0 Early Moves")
@@ -340,19 +359,6 @@ def run() -> None:
             if not fresh_building and not stale_building:
                 lines.append(f"\n(no building candidates this scan)")
         else:
-            unique_others: dict = {}
-            for c in other_candidates:
-                # explicit exclusion, not just deprioritization — an
-                # already-extended candidate should NEVER appear as a
-                # "developing signal," regardless of sort order
-                if c["early_move"].get("already_extended"):
-                    continue
-                sym = c["snapshot"]["symbol"]
-                unique_others.setdefault(sym, []).append(c)
-            deduped_others = [max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
-                              for sym, pools in unique_others.items()]
-            deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
-
             # ── v4.9.2 fix: this fallback branch was NEVER given the
             # unchanged-streak suppression built in v4.9.1 — AERO/BRETT/
             # TOSHI land HERE (0-1 conditions met), not in the BUILDING
@@ -372,6 +378,8 @@ def run() -> None:
                 stale_names = ", ".join(c["snapshot"]["symbol"] for c in stale_others[:5])
                 lines.append(f"\n⏸️ <b>Unchanged {stale_others[0]['unchanged_streak']}+ scans "
                              f"({len(stale_others)})</b>: {stale_names} — no new signal, still logged")
+            if not fresh_others and not stale_others:
+                lines.append(f"\n(no candidates this scan)")
 
         # ── Graduations — pairs that were BUILDING at some point and
         # LATER showed EARLY_MOVE. Direct evidence about whether BUILDING
