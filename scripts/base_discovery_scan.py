@@ -220,13 +220,30 @@ def run() -> None:
 
     # ── FIX: candidates that passed everything but aren't full EARLY MOVE
     # convergence must still be NAMED — a count with no symbol is useless.
+    # ALSO FIX: the same token often has many DEX pools (AERO alone showed
+    # 8 near-identical entries from 8 different pools) — collapse to ONE
+    # line per unique symbol, keeping the highest-liquidity pool as the
+    # representative, and note the pool count so nothing is hidden.
     if other_candidates:
-        lines.append(f"\n👀 <b>Passed security, not yet an early move ({len(other_candidates)})</b>")
-        for c in other_candidates[:8]:
+        by_symbol: dict = {}
+        for c in other_candidates:
+            sym = c["snapshot"]["symbol"]
+            by_symbol.setdefault(sym, []).append(c)
+
+        collapsed = []
+        for sym, pools in by_symbol.items():
+            best = max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
+            best["_pool_count"] = len(pools)
+            collapsed.append(best)
+
+        lines.append(f"\n👀 <b>Passed security, not yet an early move ({len(collapsed)} unique token(s), "
+                     f"{len(other_candidates)} pool(s) total)</b>")
+        for c in collapsed[:8]:
             snap = c["snapshot"]
             missing = ", ".join(c["early_move"]["reasons_missing"][:2])
             pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else ""
-            lines.append(f"   <b>{snap['symbol']}</b> [{c['source']}] {pct} — missing: {missing}")
+            pool_note = f" ({c['_pool_count']} pools)" if c["_pool_count"] > 1 else ""
+            lines.append(f"   <b>{snap['symbol']}</b> [{c['source']}]{pool_note} {pct} — missing: {missing}")
 
     if not early_moves and not other_candidates:
         lines.append(f"No candidates passed the funnel this scan. That's a legitimate outcome for a "
