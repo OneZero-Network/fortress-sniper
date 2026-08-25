@@ -103,6 +103,7 @@ def _score_candidate(symbol: str, coin_id: str, coin_snapshot: Optional[dict],
     result["whale_accum"] = whale_accum
     result["risk"] = risk
     result["_pct_7d"] = coin_snapshot.get("pct_7d") if coin_snapshot else None
+    result["_pct_24h"] = coin_snapshot.get("pct_24h") if coin_snapshot else None
     return result
 
 
@@ -455,7 +456,8 @@ def run() -> None:
         c["emergence_alert"] = pearl_score.classify_emergence_alert(c["discovery_score"], c.get("emergence_score"))
         c["pearl_type"] = pearl_score.classify_pearl_type(
             c["discovery_score"], c.get("evidence_completeness_pct"), c.get("emergence_score"),
-            c["breakout_freshness"], c["false_pearl_risk_pct"], c.get("tier"))
+            c["breakout_freshness"], c["false_pearl_risk_pct"], c.get("tier"),
+            pct_7d=c.get("_pct_7d"), pct_24h=c.get("_pct_24h"))
         c["why_now"] = pearl_score.build_why_now_summary(
             c["discovery_score"], c.get("velocity"), c["trend_change"], c["breakout"],
             c["ecosystem_trend"], c.get("evidence_completeness_pct"), c.get("invalidation_conditions", []))
