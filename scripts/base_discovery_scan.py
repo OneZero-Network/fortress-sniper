@@ -262,6 +262,11 @@ def run() -> None:
         else:
             unique_others: dict = {}
             for c in other_candidates:
+                # explicit exclusion, not just deprioritization — an
+                # already-extended candidate should NEVER appear as a
+                # "developing signal," regardless of sort order
+                if c["early_move"].get("already_extended"):
+                    continue
                 sym = c["snapshot"]["symbol"]
                 unique_others.setdefault(sym, []).append(c)
             deduped_others = [max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
