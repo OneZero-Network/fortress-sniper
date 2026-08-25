@@ -33,10 +33,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
+from core.crypto import base_chain
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -51,6 +52,31 @@ def _gather_universe() -> dict:
     opportunities.'"""
     all_pairs = []
     source_diagnostics = []
+
+    # ── v4.9.8 — CHAIN_EVENT source, first and highest priority. Reads
+    # PoolCreated events directly off Base — genuinely new pairs, zero
+    # search/curation bias, the actual gap identified: 88 of 89 pairs in
+    # the last run came from name-based SEARCH. This does NOT depend on
+    # any token being already known to Fortress.
+    chain_cursor = get_dex_chain_cursor()
+    chain_result = base_chain.discover_new_base_pools(chain_cursor)
+    chain_status = chain_result["status"]
+    new_pools = chain_result["new_pools"]
+    log.info(f"Source CHAIN_EVENT: status={chain_status}, cursor={chain_cursor} -> "
+             f"{chain_result['new_cursor']}, new_pools_found={len(new_pools)}")
+    source_diagnostics.append({"source": "CHAIN_EVENT", "http_status": None,
+                               "raw_item_count": len(new_pools), "base_item_count": len(new_pools),
+                               "status": chain_status if chain_status != "OK_NO_NEW_BLOCKS" else "OK",
+                               "error": None if chain_status != "RPC_UNAVAILABLE" else "Base RPC unreachable"})
+    if chain_status != "RPC_UNAVAILABLE":
+        set_dex_chain_cursor(chain_result["new_cursor"])
+    for pool in new_pools:
+        pair = dexscreener.fetch_pair_data(pool["token0"], chain="base")
+        if not pair:
+            pair = dexscreener.fetch_pair_data(pool["token1"], chain="base")
+        if pair:
+            pair["_source"] = "CHAIN_EVENT"
+            all_pairs.append(pair)
 
     boosted_diag = dexscreener.fetch_boosted_base_tokens_diagnostic(limit=30)
     source_diagnostics.append(boosted_diag)
