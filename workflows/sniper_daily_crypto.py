@@ -577,6 +577,14 @@ def run() -> None:
         momentum = [c for c in typed if c["pearl_type"]["label"] == "🚀 MOMENTUM BREAKOUT"]
         emergence_alerts_typed = [c for c in typed if c["pearl_type"]["label"] == "⚡ EMERGENCE ALERT"]
 
+        # ── PRIORITY HIERARCHY, per explicit instruction: an asset shown
+        # in a higher tier must NOT also be repeated in a lower one.
+        # 💎 Early Pearl > ⚡ Emergence > 🔎 High Potential > 👀 Watch.
+        # PENGU classified both HIGH_POTENTIAL (tier) and EARLY PEARL
+        # (pearl_type) shows ONLY under Early Pearl — never twice.
+        already_shown_symbols = {c["symbol"] for c in early_pearls + emergence_alerts_typed}
+        high_potential_shown = [c for c in high_potential_tier if c["symbol"] not in already_shown_symbols]
+
         total_interesting = len(early_pearls) + len(momentum) + len(emergence_alerts_typed)
         if pearl_tier:
             lines.append(f"💎 <b>{len(pearl_tier)} confirmed Pearl(s) today.</b>")
@@ -602,6 +610,20 @@ def run() -> None:
             for c in sorted(momentum, key=lambda c: c["pearl_priority_score"], reverse=True)[:5]:
                 lines.append(_user_facing_entry(c, "🚀", get_symbol_persistence(c["symbol"])))
 
+        # ── NEW: High Potential gets its own compact section, per
+        # explicit instruction — the previous version only counted these
+        # in the footer, never showed them. Kept deliberately terse (one
+        # line per candidate, no full bullet breakdown) since this is a
+        # wider list than the curated top tiers above.
+        if high_potential_shown:
+            lines.append(f"\n🔎 <b>HIGH POTENTIAL ({len(high_potential_tier)} total)</b>")
+            ranked_hp = sorted(high_potential_shown, key=lambda c: c["discovery_score"] or 0, reverse=True)
+            for c in ranked_hp[:8]:
+                bo = c.get("breakout") or {}
+                tag = "developing breakout" if bo.get("label") == "BREAKOUT" else "strong structure"
+                lines.append(f"• {c['symbol']} — {c['discovery_score']:.0f}/100 — {tag}")
+            if len(high_potential_tier) > len(ranked_hp[:8]):
+                lines.append(f"   (+{len(high_potential_tier) - len(ranked_hp[:8])} more → Google Sheet)")
 
         lines.append(f"\n🔬 <b>Evidence status</b>\n"
                      f"Pearls: {len(pearl_tier)} | Early Pearls: {len(early_pearls)} | "
