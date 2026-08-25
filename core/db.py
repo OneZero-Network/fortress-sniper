@@ -1068,3 +1068,26 @@ def get_dex_graduations(days_back: int = 7) -> list:
                                 "first_building_at": history[first_building_idx]["observed_at"],
                                 "history": history})
     return graduations
+
+
+def get_dex_unchanged_streak(pair_address: str, current_stage: str, current_conditions_met: int) -> int:
+    """v4.9.1 — 'on each hourly run it's giving the same outcome, then
+    what's the use.' AERO/BRETT/TOSHI's pool age only ever increases —
+    'pair not fresh enough' can NEVER resolve for an existing pool, so
+    repeating that exact rejection every hour is genuinely zero new
+    information. This counts how many CONSECUTIVE prior scans showed
+    the identical (stage, conditions_met) as right now — the caller uses
+    this to stop repeating a candidate that hasn't changed in hours."""
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT stage, conditions_met FROM crypto_dex_stage_log
+            WHERE pair_address = ? ORDER BY observed_at DESC LIMIT 10
+        """, (pair_address,)).fetchall()
+
+    streak = 0
+    for stage, conditions_met in rows:
+        if stage == current_stage and conditions_met == current_conditions_met:
+            streak += 1
+        else:
+            break
+    return streak
