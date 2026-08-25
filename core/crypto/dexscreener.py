@@ -240,6 +240,33 @@ def fetch_profiled_base_tokens_diagnostic(limit: int = 30) -> dict:
             "error": None}
 
 
+def fetch_top_boosted_base_tokens_diagnostic(limit: int = 30) -> dict:
+    """v4.9.4 — Discovery source D: /token-boosts/top/v1, ranked by TOTAL
+    boost spend rather than chronological recency (/latest/v1) — a
+    genuinely different slice of the cross-chain boost feed, not a
+    duplicate. Still curated/biased (same honest limitation as BOOSTED/
+    PROFILED), but adds real additional candidates beyond the same 4
+    search anchors."""
+    result = _get_with_diagnostics("/token-boosts/top/v1")
+    data = result["data"]
+    if data is None:
+        return {"source": "TOP_BOOSTED", "http_status": result["http_status"],
+                "response_size_bytes": result["response_size_bytes"],
+                "raw_item_count": 0, "base_item_count": 0, "items": [],
+                "status": "UNAVAILABLE", "error": result["error"]}
+
+    tokens = data if isinstance(data, list) else data.get("tokens", [])
+    base_tokens = [t for t in tokens if t.get("chainId") == "base"]
+    for t in base_tokens:
+        t["_source"] = "TOP_BOOSTED"
+    return {"source": "TOP_BOOSTED", "http_status": result["http_status"],
+            "response_size_bytes": result["response_size_bytes"],
+            "raw_item_count": len(tokens), "base_item_count": len(base_tokens),
+            "items": base_tokens[:limit],
+            "status": "ZERO_RESULTS" if len(base_tokens) == 0 and len(tokens) > 0 else "OK",
+            "error": None}
+
+
 def fetch_search_base_pairs_diagnostic(query_terms: List[str] = None) -> dict:
     """v4.7.2 — Coverage Audit, and a reasoned strategy change.
 
@@ -259,8 +286,15 @@ def fetch_search_base_pairs_diagnostic(query_terms: List[str] = None) -> dict:
     exclusively traded on Base, biasing the relevance ranking toward
     Base results before the chain filter even runs. The NEW per-query
     raw/base counts in this diagnostic will directly confirm or refute
-    whether this actually helps, on the very next run."""
-    query_terms = query_terms or ["AERO", "BRETT", "DEGEN", "TOSHI"]
+    whether this actually helps, on the very next run.
+
+    v4.9.4: added MOONWELL, SEAMLESS, EXTRA — genuinely different Base
+    DeFi projects (not more memecoins from the same original 4), to at
+    least diversify WHICH known tokens get searched. Still fundamentally
+    name-biased — this does NOT solve unknown-token discovery, it only
+    slightly widens the KNOWN-token net. Flagged honestly, not
+    oversold as a fix for the structural search limitation."""
+    query_terms = query_terms or ["AERO", "BRETT", "DEGEN", "TOSHI", "MOONWELL", "SEAMLESS", "EXTRA"]
     all_pairs = []
     per_query = []
     for term in query_terms:
