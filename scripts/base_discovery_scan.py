@@ -147,12 +147,16 @@ def run() -> None:
         accel = dexscreener.compute_acceleration(pair)
         flow = dexscreener.compute_flow_signals(pair)
         age_hours = dexscreener.compute_pair_age_hours(pair)
+        early_move = dexscreener.classify_dex_early_move(
+            {"passes": True}, flow, accel, age_hours, security)
+        pair["_early_move"] = early_move
 
         if pair_address and symbol:
             was_new = log_dex_first_seen(
                 pair_address, symbol, "base", float(pair.get("priceUsd") or 0), liq_usd, vol_usd,
                 txns_24h.get("buys"), txns_24h.get("sells"), age_hours,
-                accel.get("vol_accel_ratio"), flow["flow_label"], security["severity"])
+                accel.get("vol_accel_ratio"), flow["flow_label"], security["severity"],
+                is_early_move=early_move["is_early_move"])
             if was_new:
                 new_detections += 1
 
@@ -166,18 +170,14 @@ def run() -> None:
 
     for pair in after_security:
         flow = dexscreener.compute_flow_signals(pair)
-        accel = dexscreener.compute_acceleration(pair)
-        age_hours = dexscreener.compute_pair_age_hours(pair)
-        security = pair["_security"]
         snapshot = dexscreener.adapt_to_coin_snapshot(pair)
 
         pair_address = pair.get("pairAddress")
         symbol = snapshot["symbol"]
+        early_move = pair["_early_move"]
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
-        early_move = dexscreener.classify_dex_early_move(
-            {"passes": True}, flow, accel, age_hours, security)
 
         entry = {"snapshot": snapshot, "source": pair.get("_source", "?"), "scored": scored,
                  "early_move": early_move, "pair_address": pair_address,
@@ -187,70 +187,53 @@ def run() -> None:
         else:
             other_candidates.append(entry)
 
-    log.info(f"Funnel: discovered={len(all_pairs)}, unique_tokens={unique_tokens}, "
-             f"after_liquidity={len(after_liquidity)}, after_activity={len(after_activity)}, "
-             f"after_security={len(after_security)}, blocked={len(blocked)}, "
-             f"early_moves={len(early_moves)}, new_detections={new_detections}")
+    log.info(f"Funnel (log only, not sent to Telegram): discovered={len(all_pairs)}, "
+             f"unique_tokens={unique_tokens}, after_liquidity={len(after_liquidity)}, "
+             f"after_activity={len(after_activity)}, after_security={len(after_security)}, "
+             f"blocked={len(blocked)}, early_moves={len(early_moves)}, new_detections={new_detections}")
+    log.info(f"Source coverage (log only): " + " | ".join(_source_diagnostic_line(d) for d in source_diagnostics))
 
-    lines = [
-        f"🧭 <b>Base DEX Discovery</b>\n",
-        f"Pairs discovered: {len(all_pairs)}",
-        f"Unique tokens: {unique_tokens}",
-        f"After liquidity filter: {len(after_liquidity)}",
-        f"After activity filter: {len(after_activity)}",
-        f"After security filter: {len(after_security)} ({len(blocked)} blocked)",
-        f"Early-move candidates: {len(early_moves)}",
-        f"New detections: {new_detections}\n",
-    ]
-
-    lines.append("<b>Source coverage</b>")
-    for diag in source_diagnostics:
-        lines.append(_source_diagnostic_line(diag))
-    lines.append("")
+    # ── v4.7.4 — TELEGRAM IS NOW THE DECISION LAYER, not the diagnostics
+    # dump. Per explicit instruction: "If a number doesn't change what
+    # the user should understand or do, it doesn't belong in Telegram."
+    # All funnel/source numbers above are logged for the Sheet/engineering
+    # record — Telegram gets outcome, not metrics.
+    lines = []
+    today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%b %d").upper()
 
     if early_moves:
-        lines.append(f"🚨 <b>DEX EARLY MOVE ({len(early_moves)})</b>")
+        lines.append(f"💎 <b>BASE EARLY DISCOVERY — {today}</b>\n")
         for e in early_moves[:5]:
             snap = e["snapshot"]
             lead = get_dex_lead_time_vs_coingecko(snap["symbol"])
-            lead_note = f" | {lead['detail']}" if lead.get("available") else ""
-            lines.append(f"<b>{snap['symbol']}</b> [{e['source']}]{lead_note}\n"
-                         f"   Fresh DEX activity + accelerating volume + strong buy imbalance\n"
-                         f"   <i>Not a buy signal.</i>")
+            lead_note = f"\n{lead['detail']}" if lead.get("available") else ""
+            lines.append(f"<b>{snap['symbol']}</b>\n"
+                         f"🟢 EARLY MOVE DETECTED\n"
+                         f"Why now: accelerating volume + buying pressure + fresh activity{lead_note}\n"
+                         f"Status: Investigate\n"
+                         f"Evidence: Level 0 — unvalidated\n"
+                         f"Next: Outcome tracking 1h → 6h → 24h\n")
+    else:
+        collapsed_count = len(set(c["snapshot"]["symbol"] for c in other_candidates))
+        lines.append(f"🧭 <b>BASE DEX RADAR — {today}</b>\n")
+        lines.append(f"Result: No Early Moves detected today.")
+        lines.append(f"{len(after_security)} asset(s) passed the safety/activity filters, but none "
+                     f"currently meets Fortress's Early-Move criteria.")
+        lines.append(f"🟢 No security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
+        lines.append(f"⚪ No actionable discovery")
+        lines.append(f"\nStatus: Monitoring continues.")
 
-    # ── FIX: candidates that passed everything but aren't full EARLY MOVE
-    # convergence must still be NAMED — a count with no symbol is useless.
-    # ALSO FIX: the same token often has many DEX pools (AERO alone showed
-    # 8 near-identical entries from 8 different pools) — collapse to ONE
-    # line per unique symbol, keeping the highest-liquidity pool as the
-    # representative, and note the pool count so nothing is hidden.
-    if other_candidates:
-        by_symbol: dict = {}
-        for c in other_candidates:
-            sym = c["snapshot"]["symbol"]
-            by_symbol.setdefault(sym, []).append(c)
+    # ── Outcome resolutions — the 5-state vocabulary, per explicit spec ──
+    resolutions = flywheel_result.get("resolutions", [])
+    if resolutions:
+        lines.append(f"\n🧪 <b>BASE OUTCOME{'S' if len(resolutions) > 1 else ''}</b>")
+        for r in resolutions[:5]:
+            lines.append(f"\n<b>{r['symbol']}</b>\n"
+                         f"{r['horizon'].upper()} RESULT: {r['outcome']['status']}\n"
+                         f"{r['return_pct']:+.1f}% from first detection\n"
+                         f"Verdict: {r['outcome']['verdict']}")
 
-        collapsed = []
-        for sym, pools in by_symbol.items():
-            best = max(pools, key=lambda c: c["snapshot"].get("market_cap") or 0)
-            best["_pool_count"] = len(pools)
-            collapsed.append(best)
-
-        lines.append(f"\n👀 <b>Passed security, not yet an early move ({len(collapsed)} unique token(s), "
-                     f"{len(other_candidates)} pool(s) total)</b>")
-        for c in collapsed[:8]:
-            snap = c["snapshot"]
-            missing = ", ".join(c["early_move"]["reasons_missing"][:2])
-            pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else ""
-            pool_note = f" ({c['_pool_count']} pools)" if c["_pool_count"] > 1 else ""
-            lines.append(f"   <b>{snap['symbol']}</b> [{c['source']}]{pool_note} {pct} — missing: {missing}")
-
-    if not early_moves and not other_candidates:
-        lines.append(f"No candidates passed the funnel this scan. That's a legitimate outcome for a "
-                     f"single hourly snapshot — not evidence Base lacks opportunities.")
-
-    lines.append(f"\n<i>Ordering: discovery → security → activity → Pearl engine. "
-                 f"{len(blocked)} blocked by security before ever reaching scoring.</i>")
+    lines.append(f"\n<i>Full diagnostics (funnel counts, source coverage, raw data) → GitHub Actions log.</i>")
 
     message = "\n".join(lines)
     plain = message.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
