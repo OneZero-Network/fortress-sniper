@@ -2,22 +2,28 @@
 """
 FORTRESS_CRYPTO — scripts/base_discovery_scan.py
 ══════════════════════════════════════════════════════════════════════════════
-v4.7.1 — Base Universe Expansion. Fixes the finding from v4.7's first
-real run: the discovery seed was ONE curated feed (token-boosts) and
-returned exactly 1 token — too narrow to be a real "Base discovery"
-experiment. Now combines THREE independent discovery sources (boosted,
-profiled, search-based), deduplicates, and reports the FULL funnel so
-the actual coverage question is answerable: pairs discovered → unique
-tokens → after liquidity → after activity → after security →
-early-move candidates.
+v4.7.2 — Base Discovery Coverage Audit. Adds full per-source
+diagnostics (BOOSTED/PROFILED/SEARCH: HTTP status, raw item count
+before the chain filter, Base-filtered count) so "zero results" can be
+correctly attributed to either SOURCE UNAVAILABLE (request failed) or
+ZERO_RESULTS (request succeeded, genuinely returned no Base matches) —
+these are different states and were being silently conflated before.
 
-Boosted tokens remain a separate, labeled source (per explicit
-instruction) rather than the whole universe — this lets a later
-analysis ask "which discovery channel actually finds good candidates,"
-not just "did we find anything."
+Also fixes a real UX bug: candidates that pass every filter but don't
+reach full EARLY MOVE convergence were previously shown only as a bare
+count with no symbol name — now individually listed with which specific
+conditions they're missing.
 
-Ordering, per explicit instruction: discovery → security → activity →
-Pearl. NOT discovery → Pearl → security afterward.
+Search strategy changed from generic cross-chain terms (WETH/USDC) to
+Base-native tokens (AERO/BRETT/DEGEN/TOSHI) — a documented-behavior-
+based hypothesis (DexScreener's search caps at 30 results and ranks by
+relevance across ALL chains, so generic terms likely get dominated by
+Ethereum mainnet before any Base result survives), not a blind tune.
+The new diagnostics will confirm or refute this on the next real run.
+
+Boosted tokens remain a separate, labeled source rather than the whole
+universe. Ordering: discovery → security → activity → Pearl. NOT
+discovery → Pearl → security afterward.
 """
 from __future__ import annotations
 import logging
@@ -37,15 +43,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | 
 log = logging.getLogger("fortress.crypto.base_discovery")
 
 
-def _gather_universe() -> list:
-    """Combines all discovery sources into one deduplicated pair list.
-    Boost/profile sources return token stubs needing a fetch_pair_data
-    follow-up; search returns full pair objects directly."""
+def _gather_universe() -> dict:
+    """Combines all discovery sources into one deduplicated pair list,
+    returning the full per-source diagnostic breakdown alongside it —
+    per v4.7.2's explicit requirement: distinguish SOURCE UNAVAILABLE
+    from ZERO RESULTS, don't silently collapse either into 'no
+    opportunities.'"""
     all_pairs = []
+    source_diagnostics = []
 
-    boosted = dexscreener.fetch_boosted_base_tokens(limit=30)
-    log.info(f"Source BOOSTED: {len(boosted)} token(s)")
-    for t in boosted:
+    boosted_diag = dexscreener.fetch_boosted_base_tokens_diagnostic(limit=30)
+    source_diagnostics.append(boosted_diag)
+    log.info(f"Source BOOSTED: status={boosted_diag['status']}, "
+             f"raw={boosted_diag['raw_item_count']}, base={boosted_diag['base_item_count']}")
+    for t in boosted_diag["items"]:
         addr = t.get("tokenAddress")
         if not addr:
             continue
@@ -54,9 +65,11 @@ def _gather_universe() -> list:
             pair["_source"] = "BOOSTED"
             all_pairs.append(pair)
 
-    profiled = dexscreener.fetch_profiled_base_tokens(limit=30)
-    log.info(f"Source PROFILED: {len(profiled)} token(s)")
-    for t in profiled:
+    profiled_diag = dexscreener.fetch_profiled_base_tokens_diagnostic(limit=30)
+    source_diagnostics.append(profiled_diag)
+    log.info(f"Source PROFILED: status={profiled_diag['status']}, "
+             f"raw={profiled_diag['raw_item_count']}, base={profiled_diag['base_item_count']}")
+    for t in profiled_diag["items"]:
         addr = t.get("tokenAddress")
         if not addr:
             continue
@@ -65,23 +78,39 @@ def _gather_universe() -> list:
             pair["_source"] = "PROFILED"
             all_pairs.append(pair)
 
-    search_pairs = dexscreener.fetch_search_base_pairs(["WETH", "USDC"])
-    log.info(f"Source SEARCH: {len(search_pairs)} pair(s)")
-    all_pairs.extend(search_pairs)
+    search_diag = dexscreener.fetch_search_base_pairs_diagnostic()
+    source_diagnostics.append(search_diag)
+    log.info(f"Source SEARCH: status={search_diag['status']}, "
+             f"raw={search_diag['raw_item_count']}, base={search_diag['base_item_count']}, "
+             f"per_query={search_diag.get('per_query')}")
+    all_pairs.extend(search_diag["items"])
 
     deduped = dexscreener.dedupe_pairs_by_address(all_pairs)
     log.info(f"Total pairs discovered: {len(all_pairs)}, unique after dedup: {len(deduped)}")
-    return deduped
+    return {"pairs": deduped, "raw_total": len(all_pairs), "source_diagnostics": source_diagnostics}
+
+
+def _source_diagnostic_line(diag: dict) -> str:
+    if diag["source"] == "SEARCH":
+        query_lines = "; ".join(
+            f"{q['query']}: {q['status']} (raw={q['raw_count']}, base={q['base_count']})"
+            for q in diag.get("per_query", []))
+        return f"SEARCH — {diag['status']} | base={diag['base_item_count']} | {query_lines}"
+    return (f"{diag['source']} — {diag['status']} | HTTP {diag.get('http_status')} | "
+            f"raw={diag['raw_item_count']} | base={diag['base_item_count']}"
+            + (f" | {diag['error']}" if diag.get("error") else ""))
 
 
 def run() -> None:
-    log.info("=== Base DEX Discovery v4.7.1 (multi-source universe) ===")
+    log.info("=== Base DEX Discovery v4.7.2 (coverage audit) ===")
     init_crypto_tables()
 
     flywheel_result = dex_flywheel.resolve_matured_dex_pairs()
     log.info(f"DEX flywheel: {flywheel_result}")
 
-    all_pairs = _gather_universe()
+    universe = _gather_universe()
+    all_pairs = universe["pairs"]
+    source_diagnostics = universe["source_diagnostics"]
     unique_tokens = len(set(
         (p.get("baseToken") or {}).get("address") for p in all_pairs
         if (p.get("baseToken") or {}).get("address")))
@@ -141,8 +170,6 @@ def run() -> None:
         age_hours = dexscreener.compute_pair_age_hours(pair)
         security = pair["_security"]
         snapshot = dexscreener.adapt_to_coin_snapshot(pair)
-        status = dexscreener.classify_base_radar_status(
-            {"passes": True, "reasons": []}, flow, security, age_hours)
 
         pair_address = pair.get("pairAddress")
         symbol = snapshot["symbol"]
@@ -153,7 +180,8 @@ def run() -> None:
             {"passes": True}, flow, accel, age_hours, security)
 
         entry = {"snapshot": snapshot, "source": pair.get("_source", "?"), "scored": scored,
-                 "early_move": early_move, "pair_address": pair_address}
+                 "early_move": early_move, "pair_address": pair_address,
+                 "pct_24h": flow.get("pct_24h"), "flow_label": flow.get("flow_label")}
         if early_move["is_early_move"]:
             early_moves.append(entry)
         else:
@@ -175,6 +203,11 @@ def run() -> None:
         f"New detections: {new_detections}\n",
     ]
 
+    lines.append("<b>Source coverage</b>")
+    for diag in source_diagnostics:
+        lines.append(_source_diagnostic_line(diag))
+    lines.append("")
+
     if early_moves:
         lines.append(f"🚨 <b>DEX EARLY MOVE ({len(early_moves)})</b>")
         for e in early_moves[:5]:
@@ -184,8 +217,19 @@ def run() -> None:
             lines.append(f"<b>{snap['symbol']}</b> [{e['source']}]{lead_note}\n"
                          f"   Fresh DEX activity + accelerating volume + strong buy imbalance\n"
                          f"   <i>Not a buy signal.</i>")
-    else:
-        lines.append(f"No early-move candidates this scan. That's a legitimate outcome for a "
+
+    # ── FIX: candidates that passed everything but aren't full EARLY MOVE
+    # convergence must still be NAMED — a count with no symbol is useless.
+    if other_candidates:
+        lines.append(f"\n👀 <b>Passed security, not yet an early move ({len(other_candidates)})</b>")
+        for c in other_candidates[:8]:
+            snap = c["snapshot"]
+            missing = ", ".join(c["early_move"]["reasons_missing"][:2])
+            pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else ""
+            lines.append(f"   <b>{snap['symbol']}</b> [{c['source']}] {pct} — missing: {missing}")
+
+    if not early_moves and not other_candidates:
+        lines.append(f"No candidates passed the funnel this scan. That's a legitimate outcome for a "
                      f"single hourly snapshot — not evidence Base lacks opportunities.")
 
     lines.append(f"\n<i>Ordering: discovery → security → activity → Pearl engine. "
