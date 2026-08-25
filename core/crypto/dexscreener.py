@@ -426,6 +426,40 @@ def adapt_to_coin_snapshot(pair: dict) -> dict:
     }
 
 
+def compute_dex_precursor(pair_age_hours: Optional[float], accel: dict, flow: dict,
+                           security: dict, already_extended: bool,
+                           new_pair_threshold_hours: float = 24.0) -> dict:
+    """v4.9.3 — DEX Pre-Pearl Engine. Per explicit instruction: 'find the
+    change in behavior BEFORE the price move,' not another price-based
+    check. Deliberately does NOT require price acceleration — that's
+    what distinguishes this from BUILDING/EARLY_MOVE, which both do.
+    A pre-Pearl candidate is genuinely: very new pair + activity (txns/
+    volume/buy-pressure) accelerating on MULTIPLE independent fronts +
+    price hasn't caught up yet + security clean. If price has already
+    moved, this is by definition too late to be a precursor — that's
+    what already_extended blocks."""
+    if security.get("severity") == "HIGH_RISK" or already_extended:
+        return {"is_pre_pearl": False, "signals_met": [], "detail": "blocked" if security.get("severity") == "HIGH_RISK" else "already moved"}
+
+    is_new = pair_age_hours is not None and pair_age_hours <= new_pair_threshold_hours
+    if not is_new:
+        return {"is_pre_pearl": False, "signals_met": [], "detail": "pair not new enough for pre-Pearl consideration"}
+
+    signals = []
+    if accel.get("label") == "ACCELERATING":
+        signals.append("volume accelerating")
+    if accel.get("txn_accel_ratio") is not None and accel["txn_accel_ratio"] >= 1.5:
+        signals.append("transactions accelerating")
+    if flow.get("flow_label") == "STRONG_BUY_PRESSURE":
+        signals.append("buy pressure increasing")
+
+    # Requires genuine convergence — 2+ of 3 activity signals, on top of
+    # the already-checked new-pair + not-extended + security-clean gates
+    is_pre_pearl = len(signals) >= 2
+    return {"is_pre_pearl": is_pre_pearl, "signals_met": signals,
+            "detail": f"{len(signals)}/3 activity signals converging on a new, not-yet-moved pair"}
+
+
 def classify_dex_stage(early_move_result: dict, security: dict) -> dict:
     """v4.7.6 — 🟡 BUILDING state, per explicit instruction: the missing
     layer between WATCH and ⚡ EARLY MOVE. Reuses classify_dex_early_move's
