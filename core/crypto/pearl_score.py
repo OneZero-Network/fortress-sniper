@@ -250,6 +250,73 @@ def compute_overextension_penalty(freshness: Optional[float]) -> float:
     return round(-((100.0 - freshness) / 100.0) * 12.0, 1)  # up to -12 for freshness=0
 
 
+def compute_earliness_score(pct_7d: Optional[float], pct_24h: Optional[float],
+                             velocity: Optional[dict], trend_change: dict,
+                             breakout_freshness: Optional[float]) -> Optional[float]:
+    """v4.8 — EARLINESS SCORE. A genuinely separate axis from
+    discovery_score, per explicit mandate: 'Pearl Score = quality/
+    evidence. Earliness Score = how early the machine believes the
+    opportunity is.' A coin that already moved a lot can have a HIGH
+    discovery_score (strong structure, good liquidity) and a LOW
+    earliness score (the move already happened) — these are meant to
+    disagree with each other on already-extended coins, that's the
+    whole point.
+
+    Rewards: small recent price change (hasn't moved yet), high
+    velocity/acceleration (something IS changing right now), a fresh
+    trend transition (reversal, not continuation of an old trend).
+    Penalizes: large recent price change (the move already happened —
+    this dominates the formula, matching the mentor's own AAVE/PENGU/
+    PONS example where PONS's large realized move crushes its
+    earliness score despite decent discovery quality)."""
+    if pct_7d is None and pct_24h is None and velocity is None:
+        return None
+
+    # magnitude penalty — the single biggest factor, deliberately. A
+    # coin already up 50%+ over 7d should score low regardless of how
+    # good everything else looks.
+    magnitude = max(abs(pct_7d or 0), abs(pct_24h or 0) * 1.5)  # 24h weighted higher (more recent)
+    magnitude_score = max(0.0, 100.0 - magnitude * 1.3)
+
+    velocity_score = 50.0
+    if velocity:
+        vol_ratio = velocity.get("volume_ratio")
+        if vol_ratio is not None:
+            velocity_score = min(100.0, 30.0 + (vol_ratio - 1.0) * 15.0)
+
+    trend_score = 50.0
+    label = trend_change.get("label")
+    if label == "REVERSAL_BULLISH":
+        trend_score = 90.0  # a fresh transition — exactly what "early" looks like
+    elif label == "CONTINUATION_UP":
+        trend_score = 40.0  # already in motion, less early
+    elif label == "FLAT":
+        trend_score = 60.0  # dormant, could be building
+
+    freshness_score = breakout_freshness if breakout_freshness is not None else 50.0
+
+    final = magnitude_score * 0.45 + velocity_score * 0.25 + trend_score * 0.15 + freshness_score * 0.15
+    return round(max(0.0, min(100.0, final)), 1)
+
+
+def classify_earliness(earliness_score: Optional[float], discovery_score: Optional[float]) -> dict:
+    """v4.8 — the quality × earliness matrix, exactly as specified:
+    'A coin with weak evidence but exceptional early behavioral change
+    is a candidate for investigation, not a Pearl. A coin that already
+    pumped is not a Pearl merely because the evidence is strong.'"""
+    if earliness_score is None:
+        return {"label": "⚫ UNKNOWN", "detail": "insufficient data to judge earliness"}
+    high_discovery = (discovery_score or 0) >= 75
+    if earliness_score >= 70:
+        return ({"label": "⚡ PRE-PEARL", "detail": "exceptional early behavioral change"} if not high_discovery
+                else {"label": "🟡 EARLY SETUP", "detail": "strong evidence AND still early"})
+    if earliness_score < 20:
+        return {"label": "🚀 LATE", "detail": "this move already happened — not an early discovery"}
+    if earliness_score < 40:
+        return {"label": "🚀 ALREADY MOVING", "detail": "this move already happened — not an early discovery"}
+    return {"label": "🟠 DEVELOPING", "detail": "partial early signal, not yet confirmed"}
+
+
 def classify_pearl_type(discovery_score: Optional[float], evidence_completeness_pct: Optional[float],
                          emergence_score: Optional[float], freshness: Optional[float],
                          false_pearl_risk_pct: int, tier: Optional[str],
