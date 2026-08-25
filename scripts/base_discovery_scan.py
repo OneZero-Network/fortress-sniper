@@ -166,11 +166,14 @@ def run() -> None:
             after_security.append(pair)
 
     early_moves = []
+    pre_pearl_candidates = []
     building_candidates = []
     other_candidates = []
 
     for pair in after_security:
         flow = dexscreener.compute_flow_signals(pair)
+        accel = dexscreener.compute_acceleration(pair)
+        age_hours = dexscreener.compute_pair_age_hours(pair)
         snapshot = dexscreener.adapt_to_coin_snapshot(pair)
 
         pair_address = pair.get("pairAddress")
@@ -191,15 +194,26 @@ def run() -> None:
                           stage_result["conditions_met"], flow.get("pct_24h"))
             unchanged_streak = get_dex_unchanged_streak(pair_address, stage_result["stage"], stage_result["conditions_met"])
 
+        # ── v4.9.3 — DEX Pre-Pearl Engine. Checked INDEPENDENTLY of the
+        # early-move/BUILDING pipeline, per explicit instruction: "find
+        # the change in behavior BEFORE the price move," not another
+        # price-triggered check. A candidate can be pre-Pearl AND
+        # separately land in BUILDING/other — this is a distinct,
+        # earlier-stage signal, not a replacement tier.
+        precursor = dexscreener.compute_dex_precursor(
+            age_hours, accel, flow, security, early_move.get("already_extended", False))
+
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
 
         entry = {"snapshot": snapshot, "source": pair.get("_source", "?"), "scored": scored,
-                 "early_move": early_move, "stage": stage_result, "pair_address": pair_address,
-                 "pct_24h": flow.get("pct_24h"), "flow_label": flow.get("flow_label"),
-                 "unchanged_streak": unchanged_streak}
+                 "early_move": early_move, "stage": stage_result, "precursor": precursor,
+                 "pair_address": pair_address, "pct_24h": flow.get("pct_24h"),
+                 "flow_label": flow.get("flow_label"), "unchanged_streak": unchanged_streak}
         if early_move["is_early_move"]:
             early_moves.append(entry)
+        elif precursor["is_pre_pearl"]:
+            pre_pearl_candidates.append(entry)
         elif stage_result["stage"] == "BUILDING":
             building_candidates.append(entry)
         else:
@@ -208,7 +222,8 @@ def run() -> None:
     log.info(f"Funnel (log only, not sent to Telegram): discovered={len(all_pairs)}, "
              f"unique_tokens={unique_tokens}, after_liquidity={len(after_liquidity)}, "
              f"after_activity={len(after_activity)}, after_security={len(after_security)}, "
-             f"blocked={len(blocked)}, early_moves={len(early_moves)}, new_detections={new_detections}")
+             f"blocked={len(blocked)}, early_moves={len(early_moves)}, pre_pearl={len(pre_pearl_candidates)}, "
+             f"new_detections={new_detections}")
     log.info(f"Source coverage (log only): " + " | ".join(_source_diagnostic_line(d) for d in source_diagnostics))
 
     # ── v4.7.4 — TELEGRAM IS NOW THE DECISION LAYER, not the diagnostics
@@ -218,6 +233,29 @@ def run() -> None:
     # record — Telegram gets outcome, not metrics.
     lines = []
     today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%b %d").upper()
+
+    # ── v4.9.3 — DEX PRE-PEARL, shown FIRST when present. This is
+    # deliberately the earliest, most valuable signal: genuine multi-
+    # signal activity convergence on a brand-new, not-yet-moved pair —
+    # before price acceleration itself, which is what BUILDING/EARLY_MOVE
+    # both require. "How much did the asset move AFTER Fortress first
+    # detected this" is exactly the measurement the flywheel now tracks.
+    if pre_pearl_candidates:
+        unique_pp: dict = {}
+        for c in pre_pearl_candidates:
+            sym = c["snapshot"]["symbol"]
+            unique_pp.setdefault(sym, []).append(c)
+        deduped_pp = [max(pools, key=lambda c: len(c["precursor"]["signals_met"])) for sym, pools in unique_pp.items()]
+        deduped_pp.sort(key=lambda c: -len(c["precursor"]["signals_met"]))
+
+        lines.append(f"🟡 <b>PRE-PEARL — {today}</b>")
+        lines.append(f"<i>Activity accelerating on a new pair, price hasn't caught up yet. "
+                     f"This is the earliest signal the DEX lens produces.</i>\n")
+        for c in deduped_pp[:5]:
+            snap = c["snapshot"]
+            signals = ", ".join(c["precursor"]["signals_met"])
+            lines.append(f"<b>{snap['symbol']}</b> — {signals}\n"
+                         f"Status: Watching for confirmation\n")
 
     if early_moves:
         lines.append(f"💎 <b>BASE EARLY DISCOVERY — {today}</b>\n")
