@@ -66,10 +66,15 @@ def _gather_universe() -> dict:
              f"{chain_result['new_cursor']}, new_pools_found={len(new_pools)}")
     source_diagnostics.append({"source": "CHAIN_EVENT", "http_status": None,
                                "raw_item_count": len(new_pools), "base_item_count": len(new_pools),
-                               "status": chain_status if chain_status != "OK_NO_NEW_BLOCKS" else "OK",
-                               "error": None if chain_status != "RPC_UNAVAILABLE" else "Base RPC unreachable"})
-    if chain_status != "RPC_UNAVAILABLE":
-        set_dex_chain_cursor(chain_result["new_cursor"])
+                               "status": chain_status,
+                               "error": "Base RPC eth_getLogs failed — see log for exact error" if chain_status == "RPC_ERROR" else None})
+    # ── v4.9.9 fix: discover_new_base_pools() ITSELF now guarantees
+    # new_cursor == the input cursor_block, unchanged, whenever status is
+    # RPC_ERROR (verified directly) — so this call is now always safe to
+    # make unconditionally; the stale 'RPC_UNAVAILABLE' string check
+    # (a status name that no longer exists) has been removed rather than
+    # left as dead, misleading code.
+    set_dex_chain_cursor(chain_result["new_cursor"])
     for pool in new_pools:
         pair = dexscreener.fetch_pair_data(pool["token0"], chain="base")
         if not pair:
@@ -126,7 +131,8 @@ def _gather_universe() -> dict:
 
     deduped = dexscreener.dedupe_pairs_by_address(all_pairs)
     log.info(f"Total pairs discovered: {len(all_pairs)}, unique after dedup: {len(deduped)}")
-    return {"pairs": deduped, "raw_total": len(all_pairs), "source_diagnostics": source_diagnostics}
+    return {"pairs": deduped, "raw_total": len(all_pairs), "source_diagnostics": source_diagnostics,
+            "chain_status": chain_status}
 
 
 def _source_diagnostic_line(diag: dict) -> str:
@@ -150,6 +156,7 @@ def run() -> None:
     universe = _gather_universe()
     all_pairs = universe["pairs"]
     source_diagnostics = universe["source_diagnostics"]
+    chain_status = universe["chain_status"]
     unique_tokens = len(set(
         (p.get("baseToken") or {}).get("address") for p in all_pairs
         if (p.get("baseToken") or {}).get("address")))
@@ -282,6 +289,21 @@ def run() -> None:
     # record — Telegram gets outcome, not metrics.
     lines = []
     today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%b %d").upper()
+
+    # ── v4.9.9 — the explicit product-principle fix: "No Early Move"
+    # must NEVER be conflated with "discovery itself failed." These are
+    # completely different states, and the difference matters more than
+    # any scoring feature. If the highest-priority discovery source
+    # (chain-native, zero search bias) failed this run, say so plainly
+    # BEFORE any result claim — a "No Early Move" conclusion drawn while
+    # the newest, least-biased source couldn't even run is not a
+    # trustworthy conclusion.
+    if chain_status == "RPC_ERROR":
+        lines.append(f"🔴 <b>DISCOVERY DEGRADED — {today}</b>")
+        lines.append(f"Chain-native discovery (CHAIN_EVENT) failed this run — Base RPC eth_getLogs "
+                     f"request was rejected. The results below rely ONLY on DexScreener sources "
+                     f"(search/boosted/profiled), which are known to be narrower and more name-biased. "
+                     f"Treat any 'no opportunity' conclusion below with that caveat in mind.\n")
 
     # ── v4.9.3 — DEX PRE-PEARL, shown FIRST when present. This is
     # deliberately the earliest, most valuable signal: genuine multi-
