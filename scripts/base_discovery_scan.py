@@ -313,6 +313,7 @@ def run() -> None:
         lines.append(f"{total_monitored} asset(s) passed safety + activity screening.\n")
         lines.append(f"🟡 {len(deduped_building)} building" if deduped_building else f"🟡 {total_monitored} being monitored")
         lines.append(f"🟢 0 security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
+        lines.append(f"🟡 {len(pre_pearl_candidates)} Pre-Pearl")
         lines.append(f"⚡ 0 Early Moves")
 
         if deduped_building:
