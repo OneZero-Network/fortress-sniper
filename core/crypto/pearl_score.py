@@ -252,13 +252,25 @@ def compute_overextension_penalty(freshness: Optional[float]) -> float:
 
 def classify_pearl_type(discovery_score: Optional[float], evidence_completeness_pct: Optional[float],
                          emergence_score: Optional[float], freshness: Optional[float],
-                         false_pearl_risk_pct: int, tier: Optional[str]) -> dict:
+                         false_pearl_risk_pct: int, tier: Optional[str],
+                         pct_7d: Optional[float] = None, pct_24h: Optional[float] = None) -> dict:
     """v4.0 — the 5-way classification your mentor specified. This is a
     DISPLAY/interpretation label layered on top of the existing tier
     system (PEARL/HIGH_POTENTIAL/CANDIDATE/WATCH/FALSE_PEARL from
     classify_tier()) — it does NOT replace that authority, it explains
     what KIND of opportunity a candidate represents once it's already
-    cleared the evidence bar to be shown at all."""
+    cleared the evidence bar to be shown at all.
+
+    v4.7.7 FIX: a real gap found in production — the overextension
+    downgrade (EARLY_PEARL/EMERGENCE_ALERT -> MOMENTUM_BREAKOUT) only
+    fired when `freshness` was a real number below 30. When freshness
+    data was MISSING (None — common for brand-new, thin-history listings
+    like HOOKR), the check silently never triggered, and a coin already
+    up +99.78% in 24h got labeled EMERGENCE ALERT — backward-looking,
+    not forward-looking. This adds an INDEPENDENT raw-magnitude check
+    (pct_7d/pct_24h) that fires regardless of whether freshness data
+    exists at all — "has this already moved a lot" should never depend
+    on a different, possibly-missing signal to be checked."""
     if false_pearl_risk_pct >= 70:
         return {"label": "🚫 FALSE PEARL", "detail": "attractive surface behavior contradicted by risk/evidence"}
     if tier == "WATCH":
@@ -270,6 +282,13 @@ def classify_pearl_type(discovery_score: Optional[float], evidence_completeness_
     high_freshness = freshness is not None and freshness >= 60
     low_freshness = freshness is not None and freshness < 30
 
+    # Independent check — does NOT require freshness to be known.
+    already_extended = (pct_24h is not None and pct_24h >= 50) or (pct_7d is not None and pct_7d >= 80)
+
+    if already_extended and (high_discovery or high_emergence):
+        return {"label": "🚀 MOMENTUM BREAKOUT",
+                "detail": (f"already up {pct_24h:+.0f}% in 24h" if pct_24h is not None else
+                           f"already up {pct_7d:+.0f}% in 7d") + " — this is a momentum event, not an early discovery"}
     if high_discovery and high_emergence and high_freshness:
         return {"label": "💎 EARLY PEARL", "detail": "strong evidence + fresh emergence — the closest thing to the original 'find it before it's obvious' goal"}
     if (high_discovery or high_emergence) and low_freshness:
