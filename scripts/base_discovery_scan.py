@@ -115,7 +115,7 @@ def _source_diagnostic_line(diag: dict) -> str:
 
 
 def run() -> None:
-    log.info("=== Base DEX Discovery v4.7.2 (coverage audit) ===")
+    log.info("=== Base DEX Discovery v4.9.5 (Pre-Pearl active, log-only diagnostics) ===")
     init_crypto_tables()
 
     flywheel_result = dex_flywheel.resolve_matured_dex_pairs()
@@ -215,6 +215,16 @@ def run() -> None:
         # earlier-stage signal, not a replacement tier.
         precursor = dexscreener.compute_dex_precursor(
             age_hours, accel, flow, security, early_move.get("already_extended", False))
+
+        # ── v4.9.5 — log-only diagnostic, per explicit "no new features,
+        # no more Telegram" instruction: WHY did this candidate not
+        # qualify as pre-Pearl? Distinguishes "genuinely too old" from
+        # "new but signals didn't converge" — answers the next "why zero"
+        # question directly from the log instead of requiring a guess.
+        if not precursor["is_pre_pearl"]:
+            log.debug(f"{symbol}: not pre-Pearl — age={age_hours}h, "
+                     f"already_extended={early_move.get('already_extended')}, "
+                     f"signals_met={precursor.get('signals_met')} ({precursor.get('detail')})")
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
