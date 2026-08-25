@@ -306,6 +306,23 @@ def init_crypto_tables() -> None:
             security_status_changed INTEGER DEFAULT 0,
             last_checked_at      TEXT
         );
+
+        -- ═══ v4.7.6 STAGE HISTORY LOG ═══ Unlike crypto_dex_first_seen
+        -- (immutable, one row EVER per pair), this logs EVERY scan's
+        -- classification for EVERY candidate that passes activity+
+        -- security — not just Early Moves. This is what makes 'did a
+        -- BUILDING candidate later graduate to EARLY_MOVE' an answerable
+        -- question instead of a guess: if AERO shows BUILDING at 10am
+        -- and EARLY_MOVE at 4pm, both rows exist here, in order.
+        CREATE TABLE IF NOT EXISTS crypto_dex_stage_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_address    TEXT,
+            symbol          TEXT,
+            observed_at     TEXT,
+            stage           TEXT,
+            conditions_met  INTEGER,
+            pct_24h         REAL
+        );
         """)
         # Self-migrating column addition for databases created before this
         # column existed — avoids another manual paste-into-GitHub step.
@@ -992,3 +1009,62 @@ def get_dex_lead_time_vs_coingecko(symbol: str) -> dict:
             "detail": (f"DEX detected {lead_hours}h before CoinGecko lens" if lead_hours > 0
                        else f"CoinGecko detected {-lead_hours}h before DEX lens" if lead_hours < 0
                        else "both lenses detected at the same time")}
+
+
+def log_dex_stage(pair_address: str, symbol: str, stage: str, conditions_met: int, pct_24h: float) -> None:
+    """v4.7.6 — one row per scan, per candidate that passes activity+
+    security (not just Early Moves). This is the append-only log the
+    near-miss flywheel needs — INSERT only, never updated, so the full
+    stage history for a pair is reconstructable in order."""
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn(write=True) as con:
+        con.execute("""
+            INSERT INTO crypto_dex_stage_log (pair_address, symbol, observed_at, stage, conditions_met, pct_24h)
+            VALUES (?,?,?,?,?,?)
+        """, (pair_address, symbol.upper(), now, stage, conditions_met, pct_24h))
+
+
+def get_dex_stage_history(pair_address: str) -> list:
+    """Full stage history for one pair, oldest first — lets you see the
+    BUILDING → EARLY_MOVE progression (or lack of it) directly."""
+    cols = ["observed_at", "stage", "conditions_met", "pct_24h"]
+    with get_conn() as con:
+        rows = con.execute(
+            f"SELECT {', '.join(cols)} FROM crypto_dex_stage_log WHERE pair_address = ? ORDER BY observed_at ASC",
+            (pair_address,)
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_dex_graduations(days_back: int = 7) -> list:
+    """v4.7.6 — the specific question the near-miss flywheel exists to
+    answer: which pairs were classified BUILDING at some point and LATER
+    showed EARLY_MOVE for the SAME pair. This is direct evidence about
+    whether the BUILDING state is a real precursor signal or just noise —
+    built from data already being logged, no new API calls."""
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = (_dt.today() - _td(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT pair_address, symbol, observed_at, stage FROM crypto_dex_stage_log
+            WHERE observed_at >= ? ORDER BY pair_address, observed_at ASC
+        """, (cutoff,)).fetchall()
+
+    by_pair: dict = {}
+    for pair_address, symbol, observed_at, stage in rows:
+        by_pair.setdefault(pair_address, {"symbol": symbol, "history": []})
+        by_pair[pair_address]["history"].append({"observed_at": observed_at, "stage": stage})
+
+    graduations = []
+    for pair_address, data in by_pair.items():
+        history = data["history"]
+        first_building_idx = next((i for i, h in enumerate(history) if h["stage"] == "BUILDING"), None)
+        if first_building_idx is None:
+            continue
+        later_early_move = any(h["stage"] == "EARLY_MOVE" for h in history[first_building_idx + 1:])
+        if later_early_move:
+            graduations.append({"pair_address": pair_address, "symbol": data["symbol"],
+                                "first_building_at": history[first_building_idx]["observed_at"],
+                                "history": history})
+    return graduations
