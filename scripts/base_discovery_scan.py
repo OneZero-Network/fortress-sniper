@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -185,16 +185,19 @@ def run() -> None:
         # "other" — and the log entry lets a future scan detect if it
         # (or anything else) later graduates to EARLY_MOVE.
         stage_result = dexscreener.classify_dex_stage(early_move, security)
+        unchanged_streak = 0
         if pair_address:
             log_dex_stage(pair_address, symbol, stage_result["stage"],
                           stage_result["conditions_met"], flow.get("pct_24h"))
+            unchanged_streak = get_dex_unchanged_streak(pair_address, stage_result["stage"], stage_result["conditions_met"])
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
 
         entry = {"snapshot": snapshot, "source": pair.get("_source", "?"), "scored": scored,
                  "early_move": early_move, "stage": stage_result, "pair_address": pair_address,
-                 "pct_24h": flow.get("pct_24h"), "flow_label": flow.get("flow_label")}
+                 "pct_24h": flow.get("pct_24h"), "flow_label": flow.get("flow_label"),
+                 "unchanged_streak": unchanged_streak}
         if early_move["is_early_move"]:
             early_moves.append(entry)
         elif stage_result["stage"] == "BUILDING":
@@ -252,13 +255,28 @@ def run() -> None:
         lines.append(f"⚡ 0 Early Moves")
 
         if deduped_building:
-            lines.append(f"\n🟡 <b>BUILDING ({len(deduped_building)})</b> — real partial confirmation, not yet full convergence")
-            for c in deduped_building[:3]:
-                snap = c["snapshot"]
-                pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else "n/a"
-                missing = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "unconfirmed"
-                lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {c['stage']['conditions_met']}/6 conditions, "
-                             f"missing: {missing}")
+            fresh_building = [c for c in deduped_building if c["unchanged_streak"] < 3]
+            stale_building = [c for c in deduped_building if c["unchanged_streak"] >= 3]
+
+            if fresh_building:
+                lines.append(f"\n🟡 <b>BUILDING ({len(fresh_building)})</b> — real partial confirmation, not yet full convergence")
+                for c in fresh_building[:3]:
+                    snap = c["snapshot"]
+                    pct = f"{c['pct_24h']:+.1f}%/24h" if c.get("pct_24h") is not None else "n/a"
+                    missing = c["early_move"]["reasons_missing"][0] if c["early_move"]["reasons_missing"] else "unconfirmed"
+                    lines.append(f"• <b>{snap['symbol']}</b> — {pct} — {c['stage']['conditions_met']}/6 conditions, "
+                                 f"missing: {missing}")
+            # ── v4.9.1 fix: "on each hourly run it's giving the same
+            # outcome" — a candidate unchanged for 3+ consecutive scans
+            # provides zero new information (its structural blocker, like
+            # pool age, cannot resolve on its own). Named once, not
+            # repeated with full detail every hour.
+            if stale_building:
+                stale_names = ", ".join(c["snapshot"]["symbol"] for c in stale_building[:5])
+                lines.append(f"\n⏸️ <b>Unchanged {stale_building[0]['unchanged_streak']}+ scans "
+                             f"({len(stale_building)})</b>: {stale_names} — no new signal, still logged")
+            if not fresh_building and not stale_building:
+                lines.append(f"\n(no building candidates this scan)")
         else:
             unique_others: dict = {}
             for c in other_candidates:
