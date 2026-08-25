@@ -152,6 +152,30 @@ def compute_acceleration(pair: dict) -> dict:
     return {"vol_accel_ratio": vol_accel_ratio, "txn_accel_ratio": txn_accel_ratio, "label": label}
 
 
+def classify_dex_outcome(return_pct: Optional[float], was_early_move: bool, horizon: str) -> dict:
+    """v4.7.4 — the standardized 5-state outcome vocabulary, per explicit
+    instruction. This is a REPORTING classification only — it never
+    feeds back into scoring or the early-move definition itself. The
+    key distinction: an asset that moved a lot but was NEVER classified
+    as an early move at discovery gets 'NO EDGE,' not 'FAILED' — no
+    early-detection thesis was ever made for it, so there's nothing to
+    fail."""
+    if return_pct is None:
+        return {"status": "⚫ INSUFFICIENT DATA", "verdict": "Not enough time has passed to judge yet."}
+
+    if was_early_move:
+        if return_pct >= 15:
+            return {"status": "🟢 SUCCESS", "verdict": "Early detection held."}
+        if return_pct <= -10:
+            return {"status": "🔴 FAILED", "verdict": "Initial acceleration reversed."}
+        if horizon in ("1h", "6h"):
+            return {"status": "🟡 DEVELOPING", "verdict": "Thesis still alive, insufficient time to judge."}
+        return {"status": "⚪ NO EDGE", "verdict": "Move did not meaningfully expand after detection."}
+    else:
+        return {"status": "⚪ NO EDGE",
+                "verdict": "Move did not provide meaningful early advantage — detection was never called early."}
+
+
 def check_dex_security(pair: dict) -> dict:
     """v4.6 — REAL security gate, closing the gap left open in v4.5.
     Reuses risk_engine.assess_false_pearl_risk() directly — GoPlus

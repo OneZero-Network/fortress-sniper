@@ -20,14 +20,23 @@ HORIZONS = ("1h", "6h", "24h", "3d", "7d")
 
 def resolve_matured_dex_pairs() -> dict:
     """Call at the start of every Base discovery run, before scoring
-    anything new — same discipline as the Pearl flywheel."""
+    anything new — same discipline as the Pearl flywheel.
+
+    v4.7.4: now also returns a "resolutions" list with full detail
+    (symbol, horizon, return_pct, was_early_move, outcome classification)
+    for every pair resolved THIS run — this is what lets the caller
+    build the outcome-focused Telegram message per the new decision-
+    layer/evidence-layer separation, instead of resolving silently in
+    the database with no visible output at all."""
     resolved_counts = {h: 0 for h in HORIZONS}
+    resolutions = []
 
     for horizon in HORIZONS:
         due = get_dex_pairs_due_for_resolution(horizon)
         for record in due:
             pair_address = record["pair_address"]
             symbol = record["symbol"]
+            was_early_move = bool(record.get("is_early_move_at_discovery"))
             try:
                 # re-fetch by token address isn't directly available from
                 # the first-seen record (we stored pair_address, not
@@ -57,5 +66,11 @@ def resolve_matured_dex_pairs() -> dict:
                               security_status=security_status)
             resolved_counts[horizon] += 1
 
+            outcome = dexscreener.classify_dex_outcome(return_pct, was_early_move, horizon)
+            resolutions.append({"symbol": symbol, "horizon": horizon, "return_pct": return_pct,
+                                "was_early_move": was_early_move, "outcome": outcome,
+                                "max_upside_pct": record.get("max_upside_pct"),
+                                "max_drawdown_pct": record.get("max_drawdown_pct")})
+
     log.info(f"DEX flywheel resolved: {resolved_counts}")
-    return {"resolved_counts": resolved_counts}
+    return {"resolved_counts": resolved_counts, "resolutions": resolutions}
