@@ -1,6 +1,12 @@
-name: Fortress Crypto Slipstream Discovery Proof (manual only)
+name: Fortress Crypto Slipstream Discovery Proof (hourly)
 
 on:
+  schedule:
+    # v4.9.28 — now runs hourly, per explicit request, rather than
+    # manual-only. Deliberately offset from both the main pipeline
+    # (:15) and the chain-discovery-only job (:05/:20/:35/:50) to avoid
+    # any risk of overlapping RPC/database access.
+    - cron: '40 * * * *'
   workflow_dispatch: {}
 
 concurrency:
