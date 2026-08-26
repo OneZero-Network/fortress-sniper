@@ -110,7 +110,18 @@ def run() -> None:
     message = "\n".join(lines)
     plain = message.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
     log.info(plain)
-    send_telegram(message)
+
+    # v4.9.26 — this now runs automatically every 15 minutes, per
+    # explicit decision to fix the real bottleneck (the scanner barely
+    # got to look at the chain). A quiet run sending a Telegram message
+    # every 15 min would be 96 messages/day of "found nothing" — the
+    # opposite of useful for someone who just wants to know when a real
+    # pearl shows up. Only speak up when something genuinely happened:
+    # a new pool found, or a source broke.
+    if unique_new_pools or any_broken:
+        send_telegram(message)
+    else:
+        log.info("Quiet run (nothing found, nothing broken) — not sending Telegram, per design")
 
 
 if __name__ == "__main__":
