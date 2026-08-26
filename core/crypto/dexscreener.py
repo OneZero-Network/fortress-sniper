@@ -574,9 +574,9 @@ def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: 
 
     conditions["pair_new"] = pair_age_hours is not None and pair_age_hours <= 72
     if pair_age_hours is not None and pair_age_hours <= 24:
-        score += 25; breakdown.append("+25 new/recent pair (<=24h)")
+        score += 25; breakdown.append("+25 new/recent pair (≤24h)")
     elif pair_age_hours is not None and pair_age_hours <= 72:
-        score += 12; breakdown.append("+12 recent pair (<=72h)")
+        score += 12; breakdown.append("+12 recent pair (≤72h)")
     else:
         breakdown.append("+0 pair not new")
 
