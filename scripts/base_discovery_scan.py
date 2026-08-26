@@ -399,7 +399,7 @@ def run() -> None:
 
     lines.append(f"\n<b>CHAIN NEW</b>: {new_pool_count} pool(s), {unique_tokens if new_pool_count else 0} token(s)")
     lines.append(f"<b>SEARCH / EXISTING</b>: {search_pool_count} pool(s) monitored (NOT counted as new discovery)")
-    lines.append(f"   ↳ Fresh (<=72h old, found via search): {freshness_counts['DEX_SEARCH_NEW']}")
+    lines.append(f"   ↳ Fresh (≤72h old, found via search): {freshness_counts['DEX_SEARCH_NEW']}")
     lines.append(f"   ↳ Established: {freshness_counts['DEX_SEARCH_EXISTING']}")
     lines.append(f"\nPassed security: {len(after_security)} | Blocked: {len(blocked)}")
     lines.append(f"Pre-Pearls: {len(pre_pearl_candidates)} | Early Moves: {len(early_moves)}\n")
