@@ -19,6 +19,10 @@ on:
           - regime_audit_v1
           - f1_false_pearl
           - regime_v2_calibration
+          - dex_chain_discovery_only
+          - dex_lifecycle_report
+          - slipstream_discovery_proof
+          - slipstream_replay_test
       symbol:
         description: 'For symbol_retrospective only — which symbol to reconstruct'
         required: false
@@ -71,6 +75,7 @@ jobs:
           SYMBOL: ${{ inputs.symbol }}
           CRYPTO_VALIDATION_DAYS: ${{ inputs.days_back }}
           CRYPTO_COMPARISON_LABEL: ${{ inputs.comparison_label }}
+          DEX_LIFECYCLE_DAYS: ${{ inputs.days_back }}
         run: |
           case "${{ inputs.tool }}" in
             all)
@@ -125,6 +130,18 @@ jobs:
               ;;
             regime_v2_calibration)
               python scripts/calibrate_regime_v2.py
+              ;;
+            dex_chain_discovery_only)
+              python scripts/dex_chain_discovery_only.py
+              ;;
+            dex_lifecycle_report)
+              python scripts/dex_lifecycle_report.py
+              ;;
+            slipstream_discovery_proof)
+              python scripts/slipstream_discovery_proof.py
+              ;;
+            slipstream_replay_test)
+              python scripts/slipstream_replay_test.py
               ;;
             all_research)
               declare -A SCRIPTS=(
