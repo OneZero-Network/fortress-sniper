@@ -20,7 +20,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, get_dex_lifecycle_report
+from core.db import init_crypto_tables, get_dex_lifecycle_report, get_dex_milestone_timeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -82,6 +82,28 @@ def run() -> None:
 
     if len(report["entries"]) > 10:
         lines.append(f"\n(+{len(report['entries']) - 10} more → full table in the database)")
+
+    # v4.9.19 — milestone timelines, per explicit gap: "the system
+    # doesn't know when it first encountered the pool... we need
+    # persistent first-seen timestamps." Built from data already
+    # collected (crypto_dex_lifecycle) — no new tracking needed, just
+    # the query that assembles it. AERO/BRETT-shaped "never progressed"
+    # results are shown honestly, not hidden — they're useful controls.
+    lines.append(f"\n<b>Milestone timelines:</b>")
+    for e in report["entries"][:5]:
+        timeline = get_dex_milestone_timeline(e["symbol"], days_back=DAYS_BACK)
+        if not timeline["found"]:
+            continue
+        d = timeline["deltas"]
+        parts = []
+        if d["discovery_to_building_hours"] is not None:
+            parts.append(f"→BUILDING in {d['discovery_to_building_hours']:.1f}h")
+        if d["discovery_to_pre_pearl_hours"] is not None:
+            parts.append(f"→PRE-PEARL in {d['discovery_to_pre_pearl_hours']:.1f}h")
+        if d["discovery_to_early_move_hours"] is not None:
+            parts.append(f"→EARLY MOVE in {d['discovery_to_early_move_hours']:.1f}h")
+        progression = " ".join(parts) if parts else "never progressed past IGNORE (honest control observation)"
+        lines.append(f"   <b>{e['symbol']}</b>: {progression}")
 
     lines.append(f"\n<i>Nothing in this report is silently dropped — every candidate that reached "
                  f"scoring has a permanent record, regardless of outcome.</i>")
