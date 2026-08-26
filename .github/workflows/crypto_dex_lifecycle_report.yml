@@ -1,0 +1,41 @@
+name: Fortress Crypto DEX Lifecycle Forensic Report (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: 'How many days back to report on'
+        required: false
+        default: '1'
+
+concurrency:
+  group: fortress-crypto-dex-lifecycle-report
+  cancel-in-progress: true
+
+jobs:
+  lifecycle-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run DEX lifecycle forensic report
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEX_LIFECYCLE_DAYS: ${{ inputs.days_back }}
+        run: python scripts/dex_lifecycle_report.py
