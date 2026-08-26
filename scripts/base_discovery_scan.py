@@ -317,7 +317,7 @@ def run() -> None:
         # classification side by side, so the transition itself is
         # auditable, not just asserted.
         log.info(f"{symbol}: OLD gate={'PASS' if precursor['is_pre_pearl'] else 'FAIL'} "
-                 f"(signals met: {precursor.get('signals_met')}) | NEW score={pre_pearl['score']}/90 "
+                 f"(signals met: {precursor.get('signals_met')}) | NEW score={pre_pearl['score']}/100 "
                  f"-> {pre_pearl['classification']} | {pre_pearl['breakdown']} | "
                  f"category={new_or_awakening['category']} | price_lag={price_lag['label']} "
                  f"({price_lag.get('detail')})")
@@ -332,10 +332,15 @@ def run() -> None:
         # ── v4.9.12 — bucketing now driven by the weighted score, not
         # the old all-or-nothing gate. EARLY_MOVE still uses its own
         # price-confirmed definition (a distinct, later-stage signal);
-        # everything else is now PRE_PEARL/BUILDING/WATCH by score.
+        # everything else is now EARLY_PEARL/PRE_PEARL/BUILDING/IGNORE by score.
+        # v4.9.24 fix: the new "💎 EARLY PEARL" tier (added when the
+        # score was rebalanced) was NOT checked here — without this fix,
+        # a genuine EARLY PEARL candidate would silently fall through to
+        # the generic "other_candidates" bucket instead of being
+        # surfaced with the priority its own classification implies.
         if early_move["is_early_move"]:
             early_moves.append(entry)
-        elif pre_pearl["classification"] == "🟢 PRE-PEARL":
+        elif pre_pearl["classification"] in ("💎 EARLY PEARL", "🟢 PRE-PEARL"):
             pre_pearl_candidates.append(entry)
         elif pre_pearl["classification"] == "🟡 BUILDING":
             building_candidates.append(entry)
@@ -394,8 +399,19 @@ def run() -> None:
         overall_status = f"🟢 LIVE/QUIET — last chain-discovered candidate {hours_since_chain_discovery:.1f}h ago"
     lines.append(f"\n<b>Discovery status:</b> {overall_status}")
 
+    # v4.9.24 Phase 2 — honest freshness split within DexScreener-sourced
+    # pairs: every SEARCH/BOOSTED/PROFILED/TOP_BOOSTED pair already
+    # carries its own pairCreatedAt, so relabel each one by genuine age
+    # instead of treating every DexScreener hit as equally "existing."
+    search_pairs = [p for p in all_pairs if not (p.get("_source") or "").startswith("CHAIN_EVENT")]
+    freshness_counts = {"DEX_SEARCH_NEW": 0, "DEX_SEARCH_EXISTING": 0, "UNKNOWN_AGE": 0}
+    for p in search_pairs:
+        freshness_counts[dexscreener.classify_pair_freshness(p)] += 1
+
     lines.append(f"\n<b>CHAIN NEW</b>: {new_pool_count} pool(s), {unique_tokens if new_pool_count else 0} token(s)")
     lines.append(f"<b>SEARCH / EXISTING</b>: {search_pool_count} pool(s) monitored (NOT counted as new discovery)")
+    lines.append(f"   ↳ Fresh (<=72h old, found via search): {freshness_counts['DEX_SEARCH_NEW']}")
+    lines.append(f"   ↳ Established: {freshness_counts['DEX_SEARCH_EXISTING']}")
     lines.append(f"\nPassed security: {len(after_security)} | Blocked: {len(blocked)}")
     lines.append(f"Pre-Pearls: {len(pre_pearl_candidates)} | Early Moves: {len(early_moves)}\n")
 

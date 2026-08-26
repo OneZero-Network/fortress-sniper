@@ -76,7 +76,7 @@ def run() -> None:
         if e["return_24h_pct"] is not None:
             outcome += f" | 24h: {e['return_24h_pct']:+.1f}%"
         latency_str = f"{e['pool_age_hours']:.1f}h" if e['pool_age_hours'] is not None else "unknown"
-        lines.append(f"\n<b>{e['symbol']}</b> [{e['source']}] — {e['pre_pearl_score']}/90 -> {e['classification']}\n"
+        lines.append(f"\n<b>{e['symbol']}</b> [{e['source']}] — {e['pre_pearl_score']}/100 -> {e['classification']}\n"
                      f"   {cond}\n"
                      f"   Discovery latency (pool age at first sight): {latency_str}{outcome}")
 

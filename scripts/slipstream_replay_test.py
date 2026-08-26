@@ -116,7 +116,7 @@ def replay_one_pool(pool: dict) -> dict:
         pre_pearl["score"], pre_pearl["classification"], pre_pearl["breakdown"])
 
     result["stage_reached"] = "SCORED"
-    result["detail"] = f"{pre_pearl['score']}/90 -> {pre_pearl['classification']}"
+    result["detail"] = f"{pre_pearl['score']}/100 -> {pre_pearl['classification']}"
     return result
 
 
