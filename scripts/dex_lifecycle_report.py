@@ -30,16 +30,29 @@ DAYS_BACK = int(os.getenv("DEX_LIFECYCLE_DAYS", "1"))
 
 
 def run() -> None:
-    log.info(f"=== DEX Lifecycle Forensic Report — last {DAYS_BACK} day(s) ===")
+    log.info(f"=== DEX Lifecycle Forensic Report ===")
+    log.info(f"requested_period_days={DAYS_BACK} (from DEX_LIFECYCLE_DAYS env var — "
+             f"if this isn't 1, check whether the manual workflow trigger dialog had a "
+             f"leftover value from a PREVIOUS run — GitHub Actions remembers the last "
+             f"entered input by default, this is not a code bug)")
     init_crypto_tables()
 
     report = get_dex_lifecycle_report(days_back=DAYS_BACK)
 
+    # v4.9.16 — NO IMPLICIT TIME AMBIGUITY, per explicit instruction:
+    # "The report should explicitly log: requested_period, actual_cutoff,
+    # now. No implicit defaults." All three always shown, unmissable.
+    log.info(f"actual_cutoff={report['actual_cutoff']} | report_generated_at={report['report_generated_at']}")
+
     lines = [f"🔬 <b>DEX Pearl Forensic Report</b>",
-             f"<i>Period: last {DAYS_BACK} day(s)</i>\n",
+             f"<i>Requested: last {report['requested_period_days']} day(s) | "
+             f"Cutoff: {report['actual_cutoff']} | Now: {report['report_generated_at']}</i>\n",
              f"We examined {report['new_pool_count']} genuinely new chain-discovered pool(s) and "
-             f"{report['awakening_count']} existing/search-derived (awakening-candidate) pool(s).",
-             f"{report['total_examined']} total reached scoring.\n"]
+             f"{report['awakening_count']} existing/search-derived (awakening-candidate) UNIQUE token(s).",
+             f"{report['total_examined']} unique token(s) reached scoring "
+             f"({report['total_raw_observations']} total scan-observations across the period — "
+             f"the same token observed across multiple hourly scans counts once here, not "
+             f"once per scan).\n"]
 
     lines.append("<b>By classification:</b>")
     for classification, count in sorted(report["by_classification"].items(), key=lambda x: -x[1]):
