@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -221,6 +221,7 @@ def run() -> None:
         accel = dexscreener.compute_acceleration(pair)
         age_hours = dexscreener.compute_pair_age_hours(pair)
         snapshot = dexscreener.adapt_to_coin_snapshot(pair)
+        liquidity_usd = (pair.get("liquidity") or {}).get("usd")
 
         pair_address = pair.get("pairAddress")
         symbol = snapshot["symbol"]
@@ -228,49 +229,53 @@ def run() -> None:
         security = pair["_security"]
 
         # ── v4.7.6 — stage classification + per-scan logging for EVERY
-        # candidate, not just Early Moves. This is the near-miss flywheel
-        # your mentor asked for: BUILDINGCAT (+997%, 5/6 conditions met)
-        # gets recorded as BUILDING instead of silently vanishing into
-        # "other" — and the log entry lets a future scan detect if it
-        # (or anything else) later graduates to EARLY_MOVE.
+        # candidate, not just Early Moves.
         stage_result = dexscreener.classify_dex_stage(early_move, security)
         unchanged_streak = 0
+        prior_liquidity = get_dex_prior_liquidity(pair_address) if pair_address else None
         if pair_address:
             log_dex_stage(pair_address, symbol, stage_result["stage"],
-                          stage_result["conditions_met"], flow.get("pct_24h"))
+                          stage_result["conditions_met"], flow.get("pct_24h"), liquidity_usd=liquidity_usd)
             unchanged_streak = get_dex_unchanged_streak(pair_address, stage_result["stage"], stage_result["conditions_met"])
 
-        # ── v4.9.3 — DEX Pre-Pearl Engine. Checked INDEPENDENTLY of the
-        # early-move/BUILDING pipeline, per explicit instruction: "find
-        # the change in behavior BEFORE the price move," not another
-        # price-triggered check. A candidate can be pre-Pearl AND
-        # separately land in BUILDING/other — this is a distinct,
-        # earlier-stage signal, not a replacement tier.
+        # ── v4.9.3 (OLD, all-or-nothing) — kept only for direct
+        # side-by-side comparison during the transition to the weighted
+        # score below. NOT used for classification anymore.
         precursor = dexscreener.compute_dex_precursor(
             age_hours, accel, flow, security, early_move.get("already_extended", False))
 
-        # ── v4.9.5 — log-only diagnostic, per explicit "no new features,
-        # no more Telegram" instruction: WHY did this candidate not
-        # qualify as pre-Pearl? Distinguishes "genuinely too old" from
-        # "new but signals didn't converge" — answers the next "why zero"
-        # question directly from the log instead of requiring a guess.
-        if not precursor["is_pre_pearl"]:
-            log.debug(f"{symbol}: not pre-Pearl — age={age_hours}h, "
-                     f"already_extended={early_move.get('already_extended')}, "
-                     f"signals_met={precursor.get('signals_met')} ({precursor.get('detail')})")
+        # ── v4.9.12 — REPLACES the all-or-nothing convergence gate,
+        # per explicit diagnosis: 6 simultaneous AND conditions made
+        # firing statistically near-impossible even for genuine
+        # precursor behavior. This is now the PRIMARY classification.
+        pre_pearl = dexscreener.compute_pre_pearl_score(
+            age_hours, accel, flow, security, early_move.get("already_extended", False),
+            liquidity_usd, prior_liquidity)
+
+        # Forensic logging for EVERY candidate, at INFO level (the fix
+        # for the invisible-diagnostic bug) — shows both old and new
+        # classification side by side, so the transition itself is
+        # auditable, not just asserted.
+        log.info(f"{symbol}: OLD gate={'PASS' if precursor['is_pre_pearl'] else 'FAIL'} "
+                 f"(signals met: {precursor.get('signals_met')}) | NEW score={pre_pearl['score']}/90 "
+                 f"-> {pre_pearl['classification']} | {pre_pearl['breakdown']}")
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
 
         entry = {"snapshot": snapshot, "source": pair.get("_source", "?"), "scored": scored,
                  "early_move": early_move, "stage": stage_result, "precursor": precursor,
-                 "pair_address": pair_address, "pct_24h": flow.get("pct_24h"),
+                 "pre_pearl": pre_pearl, "pair_address": pair_address, "pct_24h": flow.get("pct_24h"),
                  "flow_label": flow.get("flow_label"), "unchanged_streak": unchanged_streak}
+        # ── v4.9.12 — bucketing now driven by the weighted score, not
+        # the old all-or-nothing gate. EARLY_MOVE still uses its own
+        # price-confirmed definition (a distinct, later-stage signal);
+        # everything else is now PRE_PEARL/BUILDING/WATCH by score.
         if early_move["is_early_move"]:
             early_moves.append(entry)
-        elif precursor["is_pre_pearl"]:
+        elif pre_pearl["classification"] == "🟢 PRE-PEARL":
             pre_pearl_candidates.append(entry)
-        elif stage_result["stage"] == "BUILDING":
+        elif pre_pearl["classification"] == "🟡 BUILDING":
             building_candidates.append(entry)
         else:
             other_candidates.append(entry)
