@@ -1475,3 +1475,28 @@ def get_last_slipstream_proof_result() -> Optional[int]:
 
 def set_last_slipstream_proof_result(matched_count: int) -> None:
     set_dex_chain_cursor_v2("_slipstream_proof_result", matched_count)
+
+
+def get_latest_chain_discovery_detail() -> Optional[dict]:
+    """v4.9.32 — answers directly: 'what did the chain scanner most
+    recently find, in full?' Per direct feedback: a status line saying
+    'last chain-discovered candidate 0.5h ago' with no way to actually
+    SEE that candidate without digging through raw GitHub Actions logs
+    is not something a non-technical person should have to deal with.
+    Returns the full lifecycle record for the single most recent
+    chain-sourced entry, or None if none has ever been logged."""
+    with get_conn() as con:
+        row = con.execute("""
+            SELECT symbol, source, observed_at, pool_age_hours, liquidity_usd, volume_24h_usd,
+                   pct_24h, pre_pearl_score, classification, pair_address, breakdown_json
+            FROM crypto_dex_lifecycle
+            WHERE source LIKE 'CHAIN_EVENT%' ORDER BY observed_at DESC LIMIT 1
+        """).fetchone()
+    if not row:
+        return None
+    import json
+    cols = ["symbol", "source", "observed_at", "pool_age_hours", "liquidity_usd", "volume_24h_usd",
+            "pct_24h", "pre_pearl_score", "classification", "pair_address", "breakdown_json"]
+    result = dict(zip(cols, row))
+    result["breakdown"] = json.loads(result.pop("breakdown_json") or "[]")
+    return result
