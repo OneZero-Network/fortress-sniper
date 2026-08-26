@@ -38,6 +38,37 @@ from typing import List, Optional
 
 import requests
 
+KNOWN_QUOTE_TOKENS_BASE = {
+    "0x4200000000000000000000000000000000000006",  # WETH (Base)
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC (Base)
+    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC (Base)
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI (Base)
+    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH (Base)
+}
+
+
+def identify_new_token_address(token0: str, token1: str) -> str:
+    """v4.9.14 CRITICAL FIX, MOVED HERE in v4.9.25 to be a single shared
+    source of truth. This exact bug regressed once already because the
+    fix lived only in base_discovery_scan.py and was never ported to
+    slipstream_replay_test.py, written later — confirmed directly in a
+    real replay run where ALL 5 'scored' entries showed as WETH instead
+    of the actual discovered tokens. Now there is exactly one place this
+    logic can live, so it cannot silently diverge between callers again.
+
+    Given a pool's two token addresses, returns whichever one is NOT a
+    known quote/base currency (WETH, USDC, etc.) — that's the genuinely
+    new/interesting token. If neither or both are known quote tokens,
+    defaults to token0 rather than guessing further."""
+    t0_lower = token0.lower()
+    t1_lower = token1.lower()
+    if t0_lower in KNOWN_QUOTE_TOKENS_BASE and t1_lower not in KNOWN_QUOTE_TOKENS_BASE:
+        return token1
+    elif t1_lower in KNOWN_QUOTE_TOKENS_BASE and t0_lower not in KNOWN_QUOTE_TOKENS_BASE:
+        return token0
+    else:
+        return token0
+
 log = logging.getLogger("fortress.crypto.base_chain")
 
 BASE_RPC_URL = "https://mainnet.base.org"
