@@ -460,6 +460,56 @@ def adapt_to_coin_snapshot(pair: dict) -> dict:
     }
 
 
+def compute_activity_price_lag(accel: dict, flow: dict) -> dict:
+    """v4.9.18 — PRICE LAG signal, per explicit priority: 'find activity
+    increasing faster than price.' Candidate A (volume +420%, price +7%)
+    is a discovery; Candidate B (same activity, price +180%) is likely
+    the move everyone already sees. This is a REPORTING signal only —
+    does not feed the Pre-Pearl score (avoiding yet another threshold to
+    tune blind) — exposed separately so it can be surfaced and evaluated
+    on its own merit first."""
+    vol_accel_ratio = accel.get("vol_accel_ratio")
+    pct_24h = flow.get("pct_24h")
+
+    if vol_accel_ratio is None or pct_24h is None or pct_24h == 0:
+        return {"lag_ratio": None, "label": "UNKNOWN", "detail": "insufficient data"}
+
+    # activity acceleration relative to price move — a high ratio means
+    # activity is running far ahead of price (the interesting case);
+    # a low ratio means price has already caught up or overshot.
+    lag_ratio = vol_accel_ratio / max(abs(pct_24h), 1.0)
+
+    if lag_ratio >= 0.5 and abs(pct_24h) < 20:
+        label = "ACTIVITY_LEADING"
+        detail = f"volume {vol_accel_ratio:.1f}x accelerating while price only {pct_24h:+.1f}% — activity leading price"
+    elif abs(pct_24h) >= 50:
+        label = "PRICE_ALREADY_MOVED"
+        detail = f"price already {pct_24h:+.1f}% — this may be the move everyone already sees"
+    else:
+        label = "MIXED"
+        detail = f"volume {vol_accel_ratio:.1f}x, price {pct_24h:+.1f}% — no clear lag signal either way"
+
+    return {"lag_ratio": round(lag_ratio, 2), "label": label, "detail": detail}
+
+
+def classify_new_vs_awakening(pair_age_hours: Optional[float], had_prior_observation: bool,
+                               new_threshold_hours: float = 72.0) -> dict:
+    """v4.9.18 — NEW vs AWAKENING, per explicit instruction: these are
+    'completely different signals.' NEW means the pool itself is
+    recent. AWAKENING means an EXISTING pool (already known to
+    Fortress, i.e. we have a prior observation of it) is showing
+    activity now that it wasn't showing before — arguably the more
+    valuable case, since a new pool with zero history could just be
+    quiet forever, while an awakening pool has a real behavior change
+    to point to."""
+    is_new = pair_age_hours is not None and pair_age_hours <= new_threshold_hours
+    if is_new:
+        return {"category": "NEW", "detail": f"pool is {pair_age_hours:.1f}h old"}
+    if had_prior_observation:
+        return {"category": "AWAKENING", "detail": "existing pool, previously observed, now active"}
+    return {"category": "UNKNOWN", "detail": "old pool, no prior observation on record to compare against"}
+
+
 def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: dict, security: dict,
                              already_extended: bool, liquidity_usd: Optional[float],
                              prior_liquidity_usd: Optional[float]) -> dict:
