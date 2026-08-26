@@ -113,6 +113,33 @@ assert len(AERODROME_POOL_CREATED_TOPIC) == 66, \
 assert len(AERODROME_FACTORY_BASE) == 42, \
     f"AERODROME_FACTORY_BASE must be exactly 42 chars, got {len(AERODROME_FACTORY_BASE)}"
 
+# ── v4.9.20 — SLIPSTREAM, verified with FOUR corroborating signals (not
+# one bare label, unlike the two prior mistakes in this build):
+#   1. BaseScan's verified source explicitly names this "CLFactory"
+#      (not "CLPool" — confirmed the actual factory, not a pool template)
+#   2. Its ABI contains exactly PoolCreated(address,address,int24,address)
+#   3. Its constructor arguments reference poolImplementation =
+#      0xeC8E5342B19977B4eF8892e02D8DAEcfa1315831 — the EXACT CLPool
+#      address found in the prior (failed) verification attempt, meaning
+#      both independently-found pieces are internally consistent
+#   4. Confirmed genuine "Create Pool" activity as recent as 4 hours
+#      before this was written — this factory is actively creating pools
+SLIPSTREAM_FACTORY_BASE = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"
+
+# keccak256("PoolCreated(address,address,int24,address)") — computed
+# independently via keccak256, THEN cross-checked against the literal
+# byte sequence embedded in the verified contract's own deployed
+# bytecode (fetched from BaseScan) — confirmed an EXACT match. This is
+# the strongest verification level in this entire build: not just
+# "correct length," not just "matches a label," but confirmed present
+# byte-for-byte in the real deployed contract code.
+SLIPSTREAM_POOL_CREATED_TOPIC = "0xab0d57f0df537bb25e80245ef7748fa62353808c54d6e528a9dd20887aed9ac2"
+
+assert len(SLIPSTREAM_POOL_CREATED_TOPIC) == 66, \
+    f"SLIPSTREAM_POOL_CREATED_TOPIC must be exactly 66 chars, got {len(SLIPSTREAM_POOL_CREATED_TOPIC)}"
+assert len(SLIPSTREAM_FACTORY_BASE) == 42, \
+    f"SLIPSTREAM_FACTORY_BASE must be exactly 42 chars, got {len(SLIPSTREAM_FACTORY_BASE)}"
+
 # ── DEX registry — parameterizes the generic discovery functions below
 # so adding a third DEX later doesn't require duplicating the whole
 # fetch/parse/discover pipeline again.
@@ -121,6 +148,8 @@ DEX_REGISTRY = {
                    "parser": "uniswap_v3"},
     "aerodrome": {"factory": AERODROME_FACTORY_BASE, "topic": AERODROME_POOL_CREATED_TOPIC, "topic_count": 4,
                   "parser": "aerodrome"},
+    "aerodrome_slipstream": {"factory": SLIPSTREAM_FACTORY_BASE, "topic": SLIPSTREAM_POOL_CREATED_TOPIC,
+                             "topic_count": 4, "parser": "aerodrome_slipstream"},
 }
 
 _MIN_INTERVAL = 0.5
@@ -234,6 +263,30 @@ def parse_aerodrome_pool_created_log(log_entry: dict) -> Optional[dict]:
         return None
 
 
+def parse_aerodrome_slipstream_pool_created_log(log_entry: dict) -> Optional[dict]:
+    """v4.9.20 — Decodes a Slipstream PoolCreated log. Confirmed ABI:
+    PoolCreated(address indexed token0, address indexed token1,
+    int24 indexed tickSpacing, address pool) — THREE indexed params
+    like Aerodrome classic, but the third is tickSpacing (an int24),
+    not a bool, so this needs its own parser rather than reusing
+    Aerodrome classic's. Unlike Aerodrome classic (pool at data[0:32])
+    or Uniswap V3 (pool at data[-32:]), here pool is the ONLY data word
+    — data is a single 32-byte value, the address right-aligned within it."""
+    try:
+        topics = log_entry.get("topics", [])
+        if len(topics) < 3:
+            return None
+        token0 = "0x" + topics[1][-40:]
+        token1 = "0x" + topics[2][-40:]
+        data = log_entry.get("data", "")
+        pool_address = "0x" + data[-40:] if len(data) >= 40 else None
+        block_number = int(log_entry.get("blockNumber", "0x0"), 16)
+        return {"token0": token0, "token1": token1, "pool_address": pool_address, "block_number": block_number}
+    except Exception as e:
+        log.warning(f"Failed to parse Slipstream PoolCreated log: {e} — raw: {log_entry}")
+        return None
+
+
 def discover_new_pools(dex_name: str, cursor_block: Optional[int], max_blocks_per_call: int = 2000,
                         lookback_blocks_if_no_cursor: int = 5000) -> dict:
     """v4.9.13 — generalized discovery entrypoint, works for any DEX in
@@ -244,7 +297,12 @@ def discover_new_pools(dex_name: str, cursor_block: Optional[int], max_blocks_pe
     if dex_name not in DEX_REGISTRY:
         raise ValueError(f"Unknown DEX '{dex_name}' — must be one of {list(DEX_REGISTRY.keys())}")
     config = DEX_REGISTRY[dex_name]
-    parser = parse_pool_created_log if config["parser"] == "uniswap_v3" else parse_aerodrome_pool_created_log
+    if config["parser"] == "uniswap_v3":
+        parser = parse_pool_created_log
+    elif config["parser"] == "aerodrome":
+        parser = parse_aerodrome_pool_created_log
+    else:
+        parser = parse_aerodrome_slipstream_pool_created_log
 
     current_block = get_current_block()
     if current_block is None:
