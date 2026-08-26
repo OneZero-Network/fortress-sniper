@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -289,6 +289,19 @@ def run() -> None:
         pre_pearl = dexscreener.compute_pre_pearl_score(
             age_hours, accel, flow, security, early_move.get("already_extended", False),
             liquidity_usd, prior_liquidity)
+
+        # v4.9.15 — permanent lifecycle record for EVERY candidate that
+        # reaches scoring, regardless of final disposition. This is
+        # what makes "nothing disappeared silently" a provable claim.
+        if pair_address:
+            log_dex_lifecycle(
+                pair_address, symbol, pair.get("_source", "?"), age_hours, liquidity_usd,
+                (pair.get("volume") or {}).get("h24"), flow.get("pct_24h"),
+                pre_pearl["conditions"]["pair_new"], pre_pearl["conditions"]["liquidity_accel"],
+                pre_pearl["conditions"]["volume_accel"], pre_pearl["conditions"]["tx_accel"],
+                pre_pearl["conditions"]["buy_pressure"], pre_pearl["conditions"]["price_near_base"],
+                early_move.get("already_extended", False), security.get("severity"),
+                pre_pearl["score"], pre_pearl["classification"], pre_pearl["breakdown"])
 
         # Forensic logging for EVERY candidate, at INFO level (the fix
         # for the invisible-diagnostic bug) — shows both old and new
