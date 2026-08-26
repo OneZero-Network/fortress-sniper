@@ -335,6 +335,18 @@ def init_crypto_tables() -> None:
             last_scanned_block  INTEGER,
             last_scanned_at     TEXT
         );
+
+        -- ═══ v4.9.13 MULTI-DEX CURSOR ═══ The v4.9.8 singleton cursor
+        -- table only supported ONE chain-event source (Uniswap V3).
+        -- Aerodrome needs its own independent cursor — a new table,
+        -- keyed by dex_name, rather than a risky schema change to the
+        -- existing singleton (which stays in place, harmlessly unused
+        -- going forward).
+        CREATE TABLE IF NOT EXISTS crypto_dex_chain_cursor_v2 (
+            dex_name            TEXT PRIMARY KEY,
+            last_scanned_block  INTEGER,
+            last_scanned_at     TEXT
+        );
         """)
         # Self-migrating column addition for databases created before this
         # column existed — avoids another manual paste-into-GitHub step.
@@ -1157,3 +1169,26 @@ def set_dex_chain_cursor(block_number: int) -> None:
             ON CONFLICT(id) DO UPDATE SET last_scanned_block=excluded.last_scanned_block,
                 last_scanned_at=excluded.last_scanned_at
         """, (block_number, now))
+
+
+def get_dex_chain_cursor_v2(dex_name: str) -> Optional[int]:
+    """v4.9.13 — per-DEX cursor (e.g. 'uniswap_v3', 'aerodrome'), each
+    tracked independently. None if this specific DEX has never been
+    scanned before."""
+    with get_conn() as con:
+        row = con.execute(
+            "SELECT last_scanned_block FROM crypto_dex_chain_cursor_v2 WHERE dex_name = ?", (dex_name,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_dex_chain_cursor_v2(dex_name: str, block_number: int) -> None:
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn(write=True) as con:
+        con.execute("""
+            INSERT INTO crypto_dex_chain_cursor_v2 (dex_name, last_scanned_block, last_scanned_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(dex_name) DO UPDATE SET last_scanned_block=excluded.last_scanned_block,
+                last_scanned_at=excluded.last_scanned_at
+        """, (dex_name, block_number, now))
