@@ -1357,3 +1357,76 @@ def get_dex_lifecycle_report(days_back: int = 1, source_filter: str = None) -> d
         "actual_cutoff": cutoff,
         "report_generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def get_dex_milestone_timeline(symbol: str, days_back: int = 30) -> dict:
+    """v4.9.19 — answers the exact gap flagged: 'the system doesn't know
+    when it first encountered the pool... we need persistent first-seen
+    timestamps.' Built entirely from data ALREADY BEING COLLECTED
+    (crypto_dex_lifecycle logs a classification for every scan) — no new
+    data collection needed, just the query that was never written to
+    assemble it into a timeline.
+
+    Returns the FIRST timestamp each milestone was ever reached, in
+    chronological order: first_seen_at, first_building_at,
+    first_pre_pearl_at, first_early_move_at (via crypto_dex_first_seen's
+    own is_early_move_at_discovery flag). Then computes the deltas
+    between them — 'time_from_discovery → acceleration' becomes a real,
+    queryable number instead of 'unknown.'
+
+    Returns None values for any milestone never reached — honestly, not
+    guessed."""
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = (_dt.today() - _td(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT observed_at, classification, pool_age_hours FROM crypto_dex_lifecycle
+            WHERE symbol = ? AND observed_at >= ? ORDER BY observed_at ASC
+        """, (symbol.upper(), cutoff)).fetchall()
+
+    if not rows:
+        return {"symbol": symbol.upper(), "found": False}
+
+    first_seen_at = rows[0][0]
+    first_seen_pool_age_hours = rows[0][2]
+
+    milestones = {"first_seen_at": first_seen_at, "first_building_at": None,
+                  "first_pre_pearl_at": None, "first_early_move_at": None}
+    for observed_at, classification, _ in rows:
+        if classification == "🟡 BUILDING" and milestones["first_building_at"] is None:
+            milestones["first_building_at"] = observed_at
+        if classification == "🟢 PRE-PEARL" and milestones["first_pre_pearl_at"] is None:
+            milestones["first_pre_pearl_at"] = observed_at
+
+    # early-move flag lives on crypto_dex_first_seen, not the lifecycle
+    # log (early move is checked via a different code path) — join it in
+    with get_conn() as con:
+        early_row = con.execute("""
+            SELECT first_seen_at FROM crypto_dex_first_seen
+            WHERE symbol = ? AND is_early_move_at_discovery = 1
+            ORDER BY first_seen_at ASC LIMIT 1
+        """, (symbol.upper(),)).fetchone()
+    if early_row:
+        milestones["first_early_move_at"] = early_row[0]
+
+    # compute deltas — the actual "how early" answer, in hours
+    def _hours_between(t1: str, t2: str) -> Optional[float]:
+        if not t1 or not t2:
+            return None
+        try:
+            dt1 = _dt.strptime(t1, "%Y-%m-%d %H:%M:%S")
+            dt2 = _dt.strptime(t2, "%Y-%m-%d %H:%M:%S")
+            return round((dt2 - dt1).total_seconds() / 3600.0, 2)
+        except (ValueError, TypeError):
+            return None
+
+    deltas = {
+        "discovery_latency_hours": first_seen_pool_age_hours,  # pool creation -> Fortress first saw it
+        "discovery_to_building_hours": _hours_between(milestones["first_seen_at"], milestones["first_building_at"]),
+        "discovery_to_pre_pearl_hours": _hours_between(milestones["first_seen_at"], milestones["first_pre_pearl_at"]),
+        "discovery_to_early_move_hours": _hours_between(milestones["first_seen_at"], milestones["first_early_move_at"]),
+    }
+
+    return {"symbol": symbol.upper(), "found": True, "total_observations": len(rows),
+            "milestones": milestones, "deltas": deltas}
