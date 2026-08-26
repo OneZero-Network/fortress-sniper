@@ -49,10 +49,11 @@ def run() -> None:
              f"Cutoff: {report['actual_cutoff']} | Now: {report['report_generated_at']}</i>\n",
              f"We examined {report['new_pool_count']} genuinely new chain-discovered pool(s) and "
              f"{report['awakening_count']} existing/search-derived (awakening-candidate) UNIQUE token(s).",
-             f"{report['total_examined']} unique token(s) reached scoring "
-             f"({report['total_raw_observations']} total scan-observations across the period — "
-             f"the same token observed across multiple hourly scans counts once here, not "
-             f"once per scan).\n"]
+             f"{report['total_examined']} unique TOKEN(s) reached scoring — across "
+             f"{report['total_pools_examined']} distinct pool(s) and "
+             f"{report['total_raw_observations']} total scan-observations. "
+             f"(A token with many pools, or observed across many hourly scans, is counted ONCE here, "
+             f"not once per pool or once per scan.)\n"]
 
     lines.append("<b>By classification:</b>")
     for classification, count in sorted(report["by_classification"].items(), key=lambda x: -x[1]):
