@@ -1,0 +1,49 @@
+name: Fortress Crypto Chain Discovery (every 15 min, quiet unless something found)
+
+on:
+  schedule:
+    # v4.9.26 — the real fix for the STARVED bottleneck: the hourly
+    # full pipeline (crypto_base_discovery.yml) only looked at the
+    # chain once an hour. This runs 4x more often, cheaply, WITHOUT
+    # the heavier scoring/security work — that still happens hourly
+    # once something is actually found. More looks at the chain,
+    # not more code.
+    #
+    # Offset deliberately avoids :15 — the hourly job (crypto_base_
+    # discovery.yml) fires at '15 * * * *'. Running at the same minute
+    # would risk both jobs racing on the same shared chain cursor
+    # (crypto_dex_chain_cursor_v2) simultaneously. :05/:20/:35/:50
+    # keeps this job's 4x-per-hour cadence while never colliding.
+    - cron: '5,20,35,50 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: fortress-crypto-chain-discovery-only
+  cancel-in-progress: true
+
+jobs:
+  chain-discovery-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crypto DB cache
+        uses: actions/cache@v4
+        with:
+          path: outputs/fortress_unified.db
+          key: fortress-crypto-db-${{ github.run_id }}
+          restore-keys: |
+            fortress-crypto-db-
+
+      - name: Run chain-only discovery (quiet unless something found)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/dex_chain_discovery_only.py
