@@ -1459,3 +1459,19 @@ def get_hours_since_last_chain_discovery() -> Optional[float]:
         return round((_dt.today() - last_dt).total_seconds() / 3600.0, 1)
     except (ValueError, TypeError):
         return None
+
+
+def get_last_slipstream_proof_result() -> Optional[int]:
+    """v4.9.28 — supports quiet-unless-changed behavior for the hourly
+    Slipstream proof: this replays a FIXED historical range, so its
+    result is identical every run unless something actually breaks.
+    Stores just the matched-block count from the last run."""
+    with get_conn() as con:
+        row = con.execute(
+            "SELECT last_scanned_block FROM crypto_dex_chain_cursor_v2 WHERE dex_name = '_slipstream_proof_result'"
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_last_slipstream_proof_result(matched_count: int) -> None:
+    set_dex_chain_cursor_v2("_slipstream_proof_result", matched_count)
