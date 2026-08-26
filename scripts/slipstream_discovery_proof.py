@@ -117,7 +117,8 @@ def run() -> None:
         symbol = "UNKNOWN"
         if pair_data:
             symbol = (pair_data.get("baseToken") or {}).get("symbol") or "UNKNOWN"
-        resolved_pools.append({**p, "symbol": symbol, "matched_known_block": p["block_number"] in KNOWN_CONFIRMED_BLOCKS})
+        resolved_pools.append({**p, "symbol": symbol, "token_address": new_token_address,
+                               "matched_known_block": p["block_number"] in KNOWN_CONFIRMED_BLOCKS})
 
     log.info(f"RESULT: {total_raw_logs} raw log(s), {unique_pools} unique pool(s), "
              f"{unique_tokens} unique token(s)")
@@ -157,14 +158,24 @@ def run() -> None:
     by_symbol: dict = {}
     for rp in resolved_pools:
         key = rp["symbol"] if rp["symbol"] != "UNKNOWN" else f"UNKNOWN_{rp['pool_address']}"
-        by_symbol.setdefault(key, {"symbol": rp["symbol"], "count": 0, "matched": False})
+        by_symbol.setdefault(key, {"symbol": rp["symbol"], "count": 0, "matched": False,
+                                   "token_address": rp["token_address"], "pool_address": rp["pool_address"]})
         by_symbol[key]["count"] += 1
         by_symbol[key]["matched"] = by_symbol[key]["matched"] or rp["matched_known_block"]
     deduped = list(by_symbol.values())
     for d in deduped[:15]:
         tag = " ✓" if d["matched"] else ""
         count_tag = f" (x{d['count']} pools)" if d["count"] > 1 else ""
-        message += f"\n   {d['symbol']}{tag}{count_tag}"
+        # v4.9.29 — CA + explicit chain-labeled DexScreener link, per
+        # direct request. Also matters because of a real finding: "Robinhood
+        # Chain" is a genuinely SEPARATE blockchain from Base (its own
+        # chain ID, launched July 2026, currently huge meme-coin volume)
+        # — a token with the same NAME can exist on both chains as
+        # completely different contracts. This link is explicitly to
+        # dexscreener.com/base/... so there's never ambiguity about
+        # which chain's version this is.
+        dex_link = f"https://dexscreener.com/base/{d['pool_address']}"
+        message += f"\n   {d['symbol']}{tag}{count_tag}\n   CA: {d['token_address']}\n   {dex_link}"
     if len(deduped) > 15:
         message += f"\n   (+{len(deduped) - 15} more — see log for full list)"
     plain = message.replace("<b>", "").replace("</b>", "")
