@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle, get_hours_since_last_chain_discovery
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle, get_hours_since_last_chain_discovery, get_latest_chain_discovery_detail
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -375,6 +375,18 @@ def run() -> None:
     else:
         overall_status = f"🟢 LIVE/QUIET — last chain-discovered candidate {hours_since_chain_discovery:.1f}h ago"
     lines.append(f"\n<b>Discovery status:</b> {overall_status}")
+
+    # v4.9.32 — the direct answer to "what did it actually find,"
+    # in plain language, right here — no digging through raw logs
+    # required. Only shown when there's something real to show.
+    latest_find = get_latest_chain_discovery_detail()
+    if latest_find and hours_since_chain_discovery is not None and hours_since_chain_discovery < 24:
+        readable_source = latest_find["source"].replace("CHAIN_EVENT_", "").replace("_", " ").title()
+        lines.append(f"\n<b>Most recent chain find:</b> {latest_find['symbol']} (via {readable_source})")
+        lines.append(f"   Score: {latest_find['pre_pearl_score']}/100 -> {latest_find['classification']}")
+        if latest_find["liquidity_usd"]:
+            lines.append(f"   Liquidity: ${latest_find['liquidity_usd']:,.0f}")
+        lines.append(f"   https://dexscreener.com/base/{latest_find['pair_address']}")
 
     # v4.9.24 Phase 2 — honest freshness split within DexScreener-sourced
     # pairs: every SEARCH/BOOSTED/PROFILED/TOP_BOOSTED pair already
