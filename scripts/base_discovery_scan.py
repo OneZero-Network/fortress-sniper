@@ -78,10 +78,42 @@ def _gather_universe() -> dict:
         # unchanged whenever status is RPC_ERROR — safe to call
         # unconditionally, verified directly.
         set_dex_chain_cursor_v2(dex_name, chain_result["new_cursor"])
+        # v4.9.14 CRITICAL FIX, found by tracing a real discovered pool
+        # end-to-end: this used to try token0 first, falling back to
+        # token1 only if token0 had no data. WHICHEVER token happens to
+        # be well-known (WETH, USDC, etc.) will ALWAYS have data, so
+        # that fallback never triggers — the genuinely new counterpart
+        # token is silently never looked up. Confirmed directly: a real
+        # Aerodrome discovery scored as "WETH" (10/90, IGNORE) instead
+        # of its actual new pairing, because WETH was token0 in that
+        # specific pool. Fixed: explicitly identify and skip known
+        # quote/base currencies, use the OTHER side — that's the
+        # genuinely new token, which is the whole point of this source.
         for pool in new_pools:
-            pair = dexscreener.fetch_pair_data(pool["token0"], chain="base")
+            known_quote_tokens = {
+                "0x4200000000000000000000000000000000000006",  # WETH (Base)
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC (Base)
+                "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC (Base)
+                "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI (Base)
+                "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH (Base)
+            }
+            t0_lower = pool["token0"].lower()
+            t1_lower = pool["token1"].lower()
+            if t0_lower in known_quote_tokens and t1_lower not in known_quote_tokens:
+                new_token_address = pool["token1"]
+            elif t1_lower in known_quote_tokens and t0_lower not in known_quote_tokens:
+                new_token_address = pool["token0"]
+            else:
+                # neither or both are known quote tokens — genuinely
+                # ambiguous, default to token0 rather than guess further
+                new_token_address = pool["token0"]
+
+            pair = dexscreener.fetch_pair_data(new_token_address, chain="base")
             if not pair:
-                pair = dexscreener.fetch_pair_data(pool["token1"], chain="base")
+                # fall back to the other side only if the identified
+                # "new" token has no DexScreener data at all
+                fallback_address = pool["token1"] if new_token_address == pool["token0"] else pool["token0"]
+                pair = dexscreener.fetch_pair_data(fallback_address, chain="base")
             if pair:
                 pair["_source"] = source_label
                 all_pairs.append(pair)
@@ -183,6 +215,7 @@ def run() -> None:
     after_security = []
     blocked = []
     new_detections = 0
+    new_pool_count = 0  # v4.9.14 — genuinely NEW pools from chain-event sources specifically
     for pair in after_activity:
         security = dexscreener.check_dex_security(pair)
         pair["_security"] = security
@@ -208,6 +241,8 @@ def run() -> None:
                 is_early_move=early_move["is_early_move"])
             if was_new:
                 new_detections += 1
+                if (pair.get("_source") or "").startswith("CHAIN_EVENT"):
+                    new_pool_count += 1
 
         if security["severity"] == "HIGH_RISK":
             blocked.append({"pair": pair, "security": security})
@@ -298,6 +333,18 @@ def run() -> None:
     lines = []
     today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%b %d").upper()
 
+    # ── v4.9.14 — DISCOVERY HEALTH, per explicit instruction: "for the
+    # next 7 days, show enough to determine whether the machine is
+    # actually seeing new things." Always shown first, always small.
+    # Distinguishes genuinely NEW (chain-discovered) pools from
+    # existing/search-derived monitoring — the honesty fix requested:
+    # "88 DEX pairs scanned" does NOT mean 88 new opportunities.
+    lines.append(f"🧭 <b>DISCOVERY HEALTH — {today}</b>")
+    lines.append(f"New pools (chain-discovered): {new_pool_count}")
+    lines.append(f"Existing/search-derived pools monitored: {len(all_pairs) - new_pool_count}")
+    lines.append(f"Passed security: {len(after_security)} | Blocked: {len(blocked)}")
+    lines.append(f"Pre-Pearls: {len(pre_pearl_candidates)} | Early Moves: {len(early_moves)}\n")
+
     # ── v4.9.9 — the explicit product-principle fix: "No Early Move"
     # must NEVER be conflated with "discovery itself failed." These are
     # completely different states, and the difference matters more than
@@ -380,11 +427,19 @@ def run() -> None:
                           for sym, pools in unique_others.items()]
         deduped_others.sort(key=lambda c: (len(c["early_move"]["reasons_missing"]), -(c.get("pct_24h") or 0)))
 
+        # v4.9.14 fix: the header count previously excluded pre_pearl_candidates
+        # entirely — a real pre-Pearl hit would show "0 unique tokens" here,
+        # exactly the confusing case just found in production (GENUINELYNEW
+        # reached Pre-Pearl but the header still said 0).
         display_unique_count = len(deduped_building) if deduped_building else len(deduped_others)
+        total_unique_this_scan = display_unique_count + len(pre_pearl_candidates)
 
         lines.append(f"🧭 <b>BASE DEX RADAR — {today}</b>\n")
         lines.append(f"Result: No Early Move confirmed today.")
-        lines.append(f"{len(all_pairs)} DEX pair(s) scanned → {display_unique_count} unique token(s) "
+        # v4.9.14 terminology fix, per explicit instruction: "88 DEX
+        # pairs scanned" reads like 88 opportunities searched — it isn't.
+        lines.append(f"{new_pool_count} new pool(s) discovered + {len(all_pairs) - new_pool_count} "
+                     f"existing/search pool(s) monitored → {total_unique_this_scan} unique token(s) "
                      f"passed safety + activity screening.\n")
         lines.append(f"🟡 {display_unique_count} being monitored")
         lines.append(f"🟢 0 security blocks" if not blocked else f"🔴 {len(blocked)} security block(s)")
