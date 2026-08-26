@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
 from core.crypto import base_chain, dexscreener
+from core.db import init_crypto_tables, get_last_slipstream_proof_result, set_last_slipstream_proof_result
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -59,6 +60,7 @@ CHUNK_SIZE = 2000
 
 def run() -> None:
     log.info("=== Slipstream Discovery Proof ===")
+    init_crypto_tables()
     log.info(f"Backfill range: {BACKFILL_FROM} -> {BACKFILL_TO} "
              f"({BACKFILL_TO - BACKFILL_FROM} blocks), containing "
              f"{len(KNOWN_CONFIRMED_BLOCKS)} KNOWN confirmed PoolCreated events")
@@ -145,14 +147,41 @@ def run() -> None:
               f"Known blocks matched: {len(known_blocks_matched)}/{len(KNOWN_CONFIRMED_BLOCKS)}\n\n"
               f"<b>{status}</b>\n{verdict}\n\n"
               f"<b>Tokens found:</b>")
-    for rp in resolved_pools[:15]:
-        tag = " ✓" if rp["matched_known_block"] else ""
-        message += f"\n   {rp['symbol']}{tag}"
-    if len(resolved_pools) > 15:
-        message += f"\n   (+{len(resolved_pools) - 15} more — see log for full list)"
+    # v4.9.28 — deduplicate by symbol before display, same collapsing
+    # discipline used throughout this build (a token with several pools
+    # showing up N times isn't N discoveries). "UNKNOWN" entries stay
+    # ungrouped from each other by intent — different unresolved pools
+    # aren't confirmed to be the same token just because DexScreener
+    # couldn't name either of them, so collapsing them would overstate
+    # certainty we don't have.
+    by_symbol: dict = {}
+    for rp in resolved_pools:
+        key = rp["symbol"] if rp["symbol"] != "UNKNOWN" else f"UNKNOWN_{rp['pool_address']}"
+        by_symbol.setdefault(key, {"symbol": rp["symbol"], "count": 0, "matched": False})
+        by_symbol[key]["count"] += 1
+        by_symbol[key]["matched"] = by_symbol[key]["matched"] or rp["matched_known_block"]
+    deduped = list(by_symbol.values())
+    for d in deduped[:15]:
+        tag = " ✓" if d["matched"] else ""
+        count_tag = f" (x{d['count']} pools)" if d["count"] > 1 else ""
+        message += f"\n   {d['symbol']}{tag}{count_tag}"
+    if len(deduped) > 15:
+        message += f"\n   (+{len(deduped) - 15} more — see log for full list)"
     plain = message.replace("<b>", "").replace("</b>", "")
     log.info(plain)
-    send_telegram(message)
+
+    # v4.9.28 — quiet unless the result CHANGES from last run, since
+    # this replays a fixed historical range and will otherwise send the
+    # identical "10/10 PROVEN" message every single hour forever.
+    last_result = get_last_slipstream_proof_result()
+    current_result = len(known_blocks_matched)
+    if last_result is None or current_result != last_result:
+        send_telegram(message)
+        log.info(f"Result changed ({last_result} -> {current_result}) or first run — sent to Telegram")
+    else:
+        log.info(f"Result unchanged ({current_result}/{len(KNOWN_CONFIRMED_BLOCKS)}, same as last run) — "
+                 f"not sending Telegram, per design")
+    set_last_slipstream_proof_result(current_result)
 
 
 if __name__ == "__main__":
