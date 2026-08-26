@@ -1,0 +1,27 @@
+name: Fortress Crypto Slipstream Replay Test (manual only)
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: fortress-crypto-slipstream-replay
+  cancel-in-progress: true
+
+jobs:
+  slipstream-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Slipstream Replay Test (isolated DB, production untouched)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/slipstream_replay_test.py
