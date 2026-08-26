@@ -43,7 +43,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.crypto import base_chain
+from core.crypto import base_chain, dexscreener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                      datefmt="%H:%M:%S")
@@ -102,10 +102,28 @@ def run() -> None:
     found_blocks = set(p["block_number"] for p in all_found_pools)
     known_blocks_matched = [b for b in KNOWN_CONFIRMED_BLOCKS if b in found_blocks]
 
+    # v4.9.27 — resolve each found pool's symbol name, per direct
+    # request: "where is the symbol name?" This script previously only
+    # counted raw addresses — genuinely proving the decoder works, but
+    # never showing WHAT it actually found. Uses the same shared
+    # WETH-exclusion logic as the main pipeline (v4.9.25) so this picks
+    # the interesting token, not the quote currency.
+    resolved_pools = []
+    for p in all_found_pools:
+        new_token_address = base_chain.identify_new_token_address(p["token0"], p["token1"])
+        pair_data = dexscreener.fetch_pair_data(new_token_address, chain="base")
+        symbol = "UNKNOWN"
+        if pair_data:
+            symbol = (pair_data.get("baseToken") or {}).get("symbol") or "UNKNOWN"
+        resolved_pools.append({**p, "symbol": symbol, "matched_known_block": p["block_number"] in KNOWN_CONFIRMED_BLOCKS})
+
     log.info(f"RESULT: {total_raw_logs} raw log(s), {unique_pools} unique pool(s), "
              f"{unique_tokens} unique token(s)")
     log.info(f"Known confirmed blocks matched: {len(known_blocks_matched)}/{len(KNOWN_CONFIRMED_BLOCKS)} "
              f"-> {known_blocks_matched}")
+    for rp in resolved_pools:
+        log.info(f"  block={rp['block_number']} symbol={rp['symbol']} pool={rp['pool_address']} "
+                 f"{'[KNOWN]' if rp['matched_known_block'] else ''}")
 
     if len(known_blocks_matched) >= 1:
         status = "🟢 PROVEN — decoder correctly finds real, independently-confirmed events"
@@ -125,7 +143,13 @@ def run() -> None:
               f"Unique pools: {unique_pools}\n"
               f"Unique tokens: {unique_tokens}\n"
               f"Known blocks matched: {len(known_blocks_matched)}/{len(KNOWN_CONFIRMED_BLOCKS)}\n\n"
-              f"<b>{status}</b>\n{verdict}")
+              f"<b>{status}</b>\n{verdict}\n\n"
+              f"<b>Tokens found:</b>")
+    for rp in resolved_pools[:15]:
+        tag = " ✓" if rp["matched_known_block"] else ""
+        message += f"\n   {rp['symbol']}{tag}"
+    if len(resolved_pools) > 15:
+        message += f"\n   (+{len(resolved_pools) - 15} more — see log for full list)"
     plain = message.replace("<b>", "").replace("</b>", "")
     log.info(plain)
     send_telegram(message)
