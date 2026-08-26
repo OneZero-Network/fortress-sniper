@@ -460,6 +460,105 @@ def adapt_to_coin_snapshot(pair: dict) -> dict:
     }
 
 
+def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: dict, security: dict,
+                             already_extended: bool, liquidity_usd: Optional[float],
+                             prior_liquidity_usd: Optional[float]) -> dict:
+    """v4.9.12 — REPLACES the all-or-nothing convergence gate with a
+    weighted score, per explicit diagnosis: 6 simultaneous AND
+    conditions at even a generous 50% each gives ~1.6% joint probability
+    — the machine was structurally almost incapable of firing, not
+    'appropriately conservative.'
+
+    HONEST SCOPE, stated directly: two of the originally-requested
+    signals are not fabricated here.
+    - 'Unique buyer acceleration' is NOT included — DexScreener's basic
+      pair endpoint (what this integration actually reads) exposes raw
+      buy/sell TRANSACTION counts, not unique wallet/trader counts. I
+      will not invent a proxy and call it 'buyer acceleration.'
+    - 'Liquidity increasing' IS included, but only computable from the
+      SECOND time a pair is seen onward — there's no baseline on first
+      sight. First-sight candidates score 0 (unknown), not a fabricated
+      value in either direction.
+
+    Point values (max 90, not 100, due to the omitted buyer signal):
+      +20  new/recent pair (<=24h)      | +10 (<=72h)
+      +20  liquidity genuinely growing  | +0 if unknown/first sight
+      +15  volume accelerating
+      +15  transactions accelerating
+      +10  buy/sell imbalance (buy pressure)
+      +10  price still near base (not already extended, small recent move)
+      -20  already extended (real move already happened)
+      -30  security concern (HIGH_RISK)
+    """
+    score = 0
+    breakdown = []
+
+    if pair_age_hours is not None and pair_age_hours <= 24:
+        score += 20; breakdown.append("+20 new/recent pair (<=24h)")
+    elif pair_age_hours is not None and pair_age_hours <= 72:
+        score += 10; breakdown.append("+10 recent pair (<=72h)")
+    else:
+        breakdown.append("+0 pair not new")
+
+    if prior_liquidity_usd is not None and liquidity_usd is not None and prior_liquidity_usd > 0:
+        liq_growth_pct = 100.0 * (liquidity_usd - prior_liquidity_usd) / prior_liquidity_usd
+        if liq_growth_pct >= 15:
+            score += 20; breakdown.append(f"+20 liquidity growing ({liq_growth_pct:+.1f}% since last scan)")
+        elif liq_growth_pct <= -15:
+            breakdown.append(f"+0 liquidity shrinking ({liq_growth_pct:+.1f}% since last scan)")
+        else:
+            breakdown.append(f"+0 liquidity flat ({liq_growth_pct:+.1f}% since last scan)")
+    else:
+        breakdown.append("+0 liquidity trend unknown (first sight, no baseline)")
+
+    if accel.get("label") == "ACCELERATING":
+        score += 15; breakdown.append("+15 volume accelerating")
+    else:
+        breakdown.append("+0 volume not accelerating")
+
+    if accel.get("txn_accel_ratio") is not None and accel["txn_accel_ratio"] >= 1.5:
+        score += 15; breakdown.append("+15 transactions accelerating")
+    else:
+        breakdown.append("+0 transactions not accelerating")
+
+    if flow.get("flow_label") == "STRONG_BUY_PRESSURE":
+        score += 10; breakdown.append("+10 buy pressure")
+    else:
+        breakdown.append("+0 no strong buy pressure")
+
+    pct_24h = flow.get("pct_24h")
+    if not already_extended and pct_24h is not None and abs(pct_24h) < 15:
+        score += 10; breakdown.append("+10 price still near base")
+    else:
+        breakdown.append("+0 price not near base")
+
+    if already_extended:
+        score -= 20; breakdown.append("-20 already extended")
+
+    if security.get("severity") == "HIGH_RISK":
+        score -= 30; breakdown.append("-30 security concern")
+
+    # Security is a GATE, not merely a penalty — consistent with the
+    # rest of this codebase's principle that a HIGH_RISK token is never
+    # surfaced as investigable regardless of how strong everything else
+    # looks. A -30 point deduction alone wasn't enough to guarantee this
+    # (a strong-enough candidate could still land in BUILDING) — fixed
+    # to an absolute override, caught by testing this exact case.
+    if security.get("severity") == "HIGH_RISK":
+        return {"score": score, "classification": "🚫 BLOCKED", "breakdown": breakdown}
+
+    if score >= 70:
+        classification = "🟢 PRE-PEARL"
+    elif score >= 55:
+        classification = "🟡 BUILDING"
+    elif score >= 40:
+        classification = "👀 WATCH"
+    else:
+        classification = "⚫ IGNORE"
+
+    return {"score": score, "classification": classification, "breakdown": breakdown}
+
+
 def compute_dex_precursor(pair_age_hours: Optional[float], accel: dict, flow: dict,
                            security: dict, already_extended: bool,
                            new_pair_threshold_hours: float = 24.0) -> dict:
