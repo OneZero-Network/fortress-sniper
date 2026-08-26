@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle, get_hours_since_last_chain_discovery
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -365,18 +365,34 @@ def run() -> None:
     # messages days apart.
     chain_diag = {d["source"]: d for d in source_diagnostics if d["source"].startswith("CHAIN_EVENT")}
     search_pool_count = len(all_pairs) - new_pool_count
+    any_chain_broken = any(d["status"] == "RPC_ERROR" for d in chain_diag.values())
+    hours_since_chain_discovery = get_hours_since_last_chain_discovery()
 
     lines.append(f"🧭 <b>DEX DISCOVERY HEALTH — {today}</b>\n")
     lines.append(f"<b>Chain coverage</b>")
     for dex_label, diag in chain_diag.items():
         short_name = dex_label.replace("CHAIN_EVENT_", "").title()
         if diag["status"] == "RPC_ERROR":
-            heartbeat = "🔴 STALE — RPC failed, cursor not advancing"
+            heartbeat = "🔴 BROKEN — RPC failed, cursor not advancing, this run is not trustworthy"
         elif diag["status"] in ("OK", "OK_ZERO_RESULTS"):
-            heartbeat = "🟢 LIVE"
+            heartbeat = "🟢 LIVE/QUIET — queried successfully"
         else:
             heartbeat = f"🟡 {diag['status']}"
         lines.append(f"   {short_name}: {heartbeat} — {diag['base_item_count']} new pool(s)")
+
+    # v4.9.22 — the 3-state classification, per explicit spec: LIVE/QUIET
+    # (nothing happened, machine is fine) vs BROKEN (this run isn't
+    # trustworthy) vs STARVED (machine works but production coverage is
+    # dominated by old/search pools for an extended stretch).
+    if any_chain_broken:
+        overall_status = "🔴 BROKEN — at least one chain source failed this run"
+    elif hours_since_chain_discovery is None:
+        overall_status = "🟡 STARVED — no chain-discovered candidate has EVER been logged yet"
+    elif hours_since_chain_discovery >= 24:
+        overall_status = f"🟡 STARVED — {hours_since_chain_discovery:.0f}h since last chain-discovered candidate"
+    else:
+        overall_status = f"🟢 LIVE/QUIET — last chain-discovered candidate {hours_since_chain_discovery:.1f}h ago"
+    lines.append(f"\n<b>Discovery status:</b> {overall_status}")
 
     lines.append(f"\n<b>CHAIN NEW</b>: {new_pool_count} pool(s), {unique_tokens if new_pool_count else 0} token(s)")
     lines.append(f"<b>SEARCH / EXISTING</b>: {search_pool_count} pool(s) monitored (NOT counted as new discovery)")
