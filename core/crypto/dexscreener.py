@@ -492,7 +492,9 @@ def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: 
     """
     score = 0
     breakdown = []
+    conditions = {}
 
+    conditions["pair_new"] = pair_age_hours is not None and pair_age_hours <= 72
     if pair_age_hours is not None and pair_age_hours <= 24:
         score += 20; breakdown.append("+20 new/recent pair (<=24h)")
     elif pair_age_hours is not None and pair_age_hours <= 72:
@@ -500,10 +502,12 @@ def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: 
     else:
         breakdown.append("+0 pair not new")
 
+    conditions["liquidity_accel"] = False
     if prior_liquidity_usd is not None and liquidity_usd is not None and prior_liquidity_usd > 0:
         liq_growth_pct = 100.0 * (liquidity_usd - prior_liquidity_usd) / prior_liquidity_usd
         if liq_growth_pct >= 15:
             score += 20; breakdown.append(f"+20 liquidity growing ({liq_growth_pct:+.1f}% since last scan)")
+            conditions["liquidity_accel"] = True
         elif liq_growth_pct <= -15:
             breakdown.append(f"+0 liquidity shrinking ({liq_growth_pct:+.1f}% since last scan)")
         else:
@@ -511,23 +515,27 @@ def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: 
     else:
         breakdown.append("+0 liquidity trend unknown (first sight, no baseline)")
 
-    if accel.get("label") == "ACCELERATING":
+    conditions["volume_accel"] = accel.get("label") == "ACCELERATING"
+    if conditions["volume_accel"]:
         score += 15; breakdown.append("+15 volume accelerating")
     else:
         breakdown.append("+0 volume not accelerating")
 
-    if accel.get("txn_accel_ratio") is not None and accel["txn_accel_ratio"] >= 1.5:
+    conditions["tx_accel"] = accel.get("txn_accel_ratio") is not None and accel["txn_accel_ratio"] >= 1.5
+    if conditions["tx_accel"]:
         score += 15; breakdown.append("+15 transactions accelerating")
     else:
         breakdown.append("+0 transactions not accelerating")
 
-    if flow.get("flow_label") == "STRONG_BUY_PRESSURE":
+    conditions["buy_pressure"] = flow.get("flow_label") == "STRONG_BUY_PRESSURE"
+    if conditions["buy_pressure"]:
         score += 10; breakdown.append("+10 buy pressure")
     else:
         breakdown.append("+0 no strong buy pressure")
 
     pct_24h = flow.get("pct_24h")
-    if not already_extended and pct_24h is not None and abs(pct_24h) < 15:
+    conditions["price_near_base"] = not already_extended and pct_24h is not None and abs(pct_24h) < 15
+    if conditions["price_near_base"]:
         score += 10; breakdown.append("+10 price still near base")
     else:
         breakdown.append("+0 price not near base")
@@ -545,7 +553,7 @@ def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: 
     # (a strong-enough candidate could still land in BUILDING) — fixed
     # to an absolute override, caught by testing this exact case.
     if security.get("severity") == "HIGH_RISK":
-        return {"score": score, "classification": "🚫 BLOCKED", "breakdown": breakdown}
+        return {"score": score, "classification": "🚫 BLOCKED", "breakdown": breakdown, "conditions": conditions}
 
     if score >= 70:
         classification = "🟢 PRE-PEARL"
@@ -556,7 +564,7 @@ def compute_pre_pearl_score(pair_age_hours: Optional[float], accel: dict, flow: 
     else:
         classification = "⚫ IGNORE"
 
-    return {"score": score, "classification": classification, "breakdown": breakdown}
+    return {"score": score, "classification": classification, "breakdown": breakdown, "conditions": conditions}
 
 
 def compute_dex_precursor(pair_age_hours: Optional[float], accel: dict, flow: dict,
