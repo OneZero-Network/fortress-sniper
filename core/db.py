@@ -1392,12 +1392,17 @@ def get_dex_milestone_timeline(symbol: str, days_back: int = 30) -> dict:
     first_seen_pool_age_hours = rows[0][2]
 
     milestones = {"first_seen_at": first_seen_at, "first_building_at": None,
-                  "first_pre_pearl_at": None, "first_early_move_at": None}
+                  "first_pre_pearl_at": None, "first_early_pearl_at": None, "first_early_move_at": None}
     for observed_at, classification, _ in rows:
         if classification == "🟡 BUILDING" and milestones["first_building_at"] is None:
             milestones["first_building_at"] = observed_at
         if classification == "🟢 PRE-PEARL" and milestones["first_pre_pearl_at"] is None:
             milestones["first_pre_pearl_at"] = observed_at
+        # v4.9.24 fix: the new "💎 EARLY PEARL" tier (added when the
+        # score was rebalanced for Phase 3) was never tracked here —
+        # same gap just fixed in base_discovery_scan.py's bucketing.
+        if classification == "💎 EARLY PEARL" and milestones["first_early_pearl_at"] is None:
+            milestones["first_early_pearl_at"] = observed_at
 
     # early-move flag lives on crypto_dex_first_seen, not the lifecycle
     # log (early move is checked via a different code path) — join it in
@@ -1425,6 +1430,7 @@ def get_dex_milestone_timeline(symbol: str, days_back: int = 30) -> dict:
         "discovery_latency_hours": first_seen_pool_age_hours,  # pool creation -> Fortress first saw it
         "discovery_to_building_hours": _hours_between(milestones["first_seen_at"], milestones["first_building_at"]),
         "discovery_to_pre_pearl_hours": _hours_between(milestones["first_seen_at"], milestones["first_pre_pearl_at"]),
+        "discovery_to_early_pearl_hours": _hours_between(milestones["first_seen_at"], milestones["first_early_pearl_at"]),
         "discovery_to_early_move_hours": _hours_between(milestones["first_seen_at"], milestones["first_early_move_at"]),
     }
 
