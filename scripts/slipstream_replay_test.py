@@ -69,9 +69,18 @@ def replay_one_pool(pool: dict) -> dict:
     result = {"pool_address": pool["pool_address"], "block": pool["block_number"], "stage_reached": None,
               "symbol": None, "detail": None}
 
-    pair = dexscreener.fetch_pair_data(pool["token0"], chain="base")
+    # v4.9.25 CRITICAL FIX: this used to try token0 first, falling back
+    # to token1 only if token0 had no data — the EXACT bug fixed in
+    # base_discovery_scan.py back in v4.9.14, which regressed here
+    # because this script was written later and never got the fix.
+    # Confirmed directly: a real replay run showed ALL 5 'scored'
+    # entries as "WETH" instead of the actual discovered tokens. Now
+    # uses the single shared function so this can't diverge again.
+    new_token_address = base_chain.identify_new_token_address(pool["token0"], pool["token1"])
+    pair = dexscreener.fetch_pair_data(new_token_address, chain="base")
     if not pair:
-        pair = dexscreener.fetch_pair_data(pool["token1"], chain="base")
+        fallback_address = pool["token1"] if new_token_address == pool["token0"] else pool["token0"]
+        pair = dexscreener.fetch_pair_data(fallback_address, chain="base")
     if not pair:
         result["stage_reached"] = "FETCH_FAILED"
         result["detail"] = "no DexScreener data for either token — pool may be too obscure/untracked, or too old for current API state"

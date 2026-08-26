@@ -78,36 +78,13 @@ def _gather_universe() -> dict:
         # unchanged whenever status is RPC_ERROR — safe to call
         # unconditionally, verified directly.
         set_dex_chain_cursor_v2(dex_name, chain_result["new_cursor"])
-        # v4.9.14 CRITICAL FIX, found by tracing a real discovered pool
-        # end-to-end: this used to try token0 first, falling back to
-        # token1 only if token0 had no data. WHICHEVER token happens to
-        # be well-known (WETH, USDC, etc.) will ALWAYS have data, so
-        # that fallback never triggers — the genuinely new counterpart
-        # token is silently never looked up. Confirmed directly: a real
-        # Aerodrome discovery scored as "WETH" (10/90, IGNORE) instead
-        # of its actual new pairing, because WETH was token0 in that
-        # specific pool. Fixed: explicitly identify and skip known
-        # quote/base currencies, use the OTHER side — that's the
-        # genuinely new token, which is the whole point of this source.
+        # v4.9.14 CRITICAL FIX, MOVED to a shared function in v4.9.25
+        # after the exact same bug regressed in slipstream_replay_test.py
+        # (that script had its own copy of this logic that never got the
+        # fix). Now both callers use base_chain.identify_new_token_address()
+        # — there is exactly one place this logic can live.
         for pool in new_pools:
-            known_quote_tokens = {
-                "0x4200000000000000000000000000000000000006",  # WETH (Base)
-                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC (Base)
-                "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC (Base)
-                "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI (Base)
-                "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH (Base)
-            }
-            t0_lower = pool["token0"].lower()
-            t1_lower = pool["token1"].lower()
-            if t0_lower in known_quote_tokens and t1_lower not in known_quote_tokens:
-                new_token_address = pool["token1"]
-            elif t1_lower in known_quote_tokens and t0_lower not in known_quote_tokens:
-                new_token_address = pool["token0"]
-            else:
-                # neither or both are known quote tokens — genuinely
-                # ambiguous, default to token0 rather than guess further
-                new_token_address = pool["token0"]
-
+            new_token_address = base_chain.identify_new_token_address(pool["token0"], pool["token1"])
             pair = dexscreener.fetch_pair_data(new_token_address, chain="base")
             if not pair:
                 # fall back to the other side only if the identified
