@@ -1484,19 +1484,42 @@ def get_latest_chain_discovery_detail() -> Optional[dict]:
     SEE that candidate without digging through raw GitHub Actions logs
     is not something a non-technical person should have to deal with.
     Returns the full lifecycle record for the single most recent
-    chain-sourced entry, or None if none has ever been logged."""
+    chain-sourced entry, or None if none has ever been logged.
+
+    v4.9.34 FIX: the fast 15-min scanner (dex_chain_discovery_only.py)
+    logs a minimal 'DISCOVERED_ONLY' placeholder (score 0, unscored) the
+    instant it finds a pool — real scoring happens later, on the next
+    full hourly pass. Since that scanner runs more often, its
+    placeholder was ALMOST ALWAYS the 'most recent' entry — meaning this
+    almost never showed a genuinely scored result, and displaying
+    'Score: 0.0/100' for an unscored placeholder reads exactly like a
+    rejected candidate, which is actively misleading. Now prefers the
+    most recent GENUINELY SCORED entry; only falls back to a placeholder
+    (with a distinct, honest 'is_placeholder' flag) if nothing scored
+    exists yet."""
     with get_conn() as con:
         row = con.execute("""
             SELECT symbol, source, observed_at, pool_age_hours, liquidity_usd, volume_24h_usd,
                    pct_24h, pre_pearl_score, classification, pair_address, breakdown_json
             FROM crypto_dex_lifecycle
-            WHERE source LIKE 'CHAIN_EVENT%' ORDER BY observed_at DESC LIMIT 1
+            WHERE source LIKE 'CHAIN_EVENT%' AND classification != '⚪ DISCOVERED_ONLY'
+            ORDER BY observed_at DESC LIMIT 1
         """).fetchone()
+        is_placeholder = False
+        if not row:
+            row = con.execute("""
+                SELECT symbol, source, observed_at, pool_age_hours, liquidity_usd, volume_24h_usd,
+                       pct_24h, pre_pearl_score, classification, pair_address, breakdown_json
+                FROM crypto_dex_lifecycle
+                WHERE source LIKE 'CHAIN_EVENT%' ORDER BY observed_at DESC LIMIT 1
+            """).fetchone()
+            is_placeholder = row is not None
     if not row:
         return None
     import json
     cols = ["symbol", "source", "observed_at", "pool_age_hours", "liquidity_usd", "volume_24h_usd",
             "pct_24h", "pre_pearl_score", "classification", "pair_address", "breakdown_json"]
     result = dict(zip(cols, row))
+    result["is_placeholder"] = is_placeholder
     result["breakdown"] = json.loads(result.pop("breakdown_json") or "[]")
     return result
