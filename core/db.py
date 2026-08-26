@@ -347,6 +347,36 @@ def init_crypto_tables() -> None:
             last_scanned_block  INTEGER,
             last_scanned_at     TEXT
         );
+
+        -- ═══ v4.9.15 FULL LIFECYCLE LEDGER ═══ Reverse-engineered from
+        -- the actual target question: "does Fortress detect assets
+        -- before they move, and by how much lead time — with nothing
+        -- silently dropped?" INSERT-ONLY, one row per (candidate, scan),
+        -- so no scoring event can ever vanish between discovery and
+        -- final disposition. discovery_id is the permanent handle a
+        -- report can follow across every table this candidate touches.
+        CREATE TABLE IF NOT EXISTS crypto_dex_lifecycle (
+            discovery_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_address         TEXT,
+            symbol               TEXT,
+            source               TEXT,          -- CHAIN_EVENT_UNISWAP_V3 | CHAIN_EVENT_AERODROME | SEARCH | BOOSTED | ...
+            observed_at          TEXT,
+            pool_age_hours       REAL,           -- discovery latency: how old was the pool when Fortress first saw it
+            liquidity_usd        REAL,
+            volume_24h_usd       REAL,
+            pct_24h              REAL,
+            pair_new             INTEGER,        -- 1/0 — was the "new pair" condition met
+            liquidity_accel      INTEGER,        -- 1/0
+            volume_accel         INTEGER,        -- 1/0
+            tx_accel             INTEGER,        -- 1/0
+            buy_pressure         INTEGER,        -- 1/0
+            price_near_base      INTEGER,        -- 1/0
+            already_extended     INTEGER,        -- 1/0
+            security_severity    TEXT,
+            pre_pearl_score      REAL,
+            classification       TEXT,           -- 🟢 PRE-PEARL | 🟡 BUILDING | 👀 WATCH | ⚫ IGNORE | 🚫 BLOCKED
+            breakdown_json       TEXT            -- the full human-readable scoring breakdown, verbatim
+        );
         """)
         # Self-migrating column addition for databases created before this
         # column existed — avoids another manual paste-into-GitHub step.
@@ -1192,3 +1222,98 @@ def set_dex_chain_cursor_v2(dex_name: str, block_number: int) -> None:
             ON CONFLICT(dex_name) DO UPDATE SET last_scanned_block=excluded.last_scanned_block,
                 last_scanned_at=excluded.last_scanned_at
         """, (dex_name, block_number, now))
+
+
+def log_dex_lifecycle(pair_address: str, symbol: str, source: str, pool_age_hours,
+                       liquidity_usd, volume_24h_usd, pct_24h, pair_new: bool, liquidity_accel: bool,
+                       volume_accel: bool, tx_accel: bool, buy_pressure: bool, price_near_base: bool,
+                       already_extended: bool, security_severity: str, pre_pearl_score: float,
+                       classification: str, breakdown: list) -> int:
+    """v4.9.15 — INSERT-ONLY, one row per (candidate, scan). This is the
+    ledger that makes 'nothing disappears silently' a provable claim
+    rather than an assertion — every candidate that reaches scoring gets
+    a permanent row here, regardless of its final disposition, including
+    IGNORE and BLOCKED. Returns the new discovery_id."""
+    import json
+    from datetime import datetime as _dt
+    now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn(write=True) as con:
+        cur = con.execute("""
+            INSERT INTO crypto_dex_lifecycle
+                (pair_address, symbol, source, observed_at, pool_age_hours, liquidity_usd,
+                 volume_24h_usd, pct_24h, pair_new, liquidity_accel, volume_accel, tx_accel,
+                 buy_pressure, price_near_base, already_extended, security_severity,
+                 pre_pearl_score, classification, breakdown_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (pair_address, symbol.upper(), source, now, pool_age_hours, liquidity_usd, volume_24h_usd,
+              pct_24h, int(pair_new), int(liquidity_accel), int(volume_accel), int(tx_accel),
+              int(buy_pressure), int(price_near_base), int(already_extended), security_severity,
+              pre_pearl_score, classification, json.dumps(breakdown)))
+        return cur.lastrowid
+
+
+def get_dex_lifecycle_report(days_back: int = 1, source_filter: str = None) -> dict:
+    """v4.9.15 — REVERSE-ENGINEERED FROM THE TARGET QUESTION: 'we
+    examined X genuinely new pools and Y awakening assets, Z reached
+    precursor scoring, here are the rejection reasons, here's what
+    happened after.' Joins the lifecycle ledger against
+    crypto_dex_first_seen's own resolution columns (by pair_address) to
+    attach forward outcomes (1h/6h/24h) wherever they've resolved —
+    this is the actual proof of discovery latency AND whether early
+    detection paid off, assembled from data that already existed but
+    was never unified under one queryable report before."""
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = (_dt.today() - _td(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+
+    lifecycle_cols = ["discovery_id", "pair_address", "symbol", "source", "observed_at",
+                      "pool_age_hours", "pair_new", "liquidity_accel", "volume_accel", "tx_accel",
+                      "buy_pressure", "price_near_base", "already_extended", "security_severity",
+                      "pre_pearl_score", "classification", "breakdown_json"]
+    query = f"SELECT {', '.join(lifecycle_cols)} FROM crypto_dex_lifecycle WHERE observed_at >= ?"
+    params = [cutoff]
+    if source_filter:
+        query += " AND source = ?"
+        params.append(source_filter)
+    query += " ORDER BY observed_at DESC"
+
+    with get_conn() as con:
+        rows = con.execute(query, params).fetchall()
+
+    import json
+    entries = []
+    for r in rows:
+        entry = dict(zip(lifecycle_cols, r))
+        entry["breakdown"] = json.loads(entry.pop("breakdown_json") or "[]")
+        # attach forward outcomes from the SAME pair's first-seen record, if resolved
+        with get_conn() as con:
+            outcome_row = con.execute("""
+                SELECT return_1h_pct, resolved_1h, return_6h_pct, resolved_6h,
+                       return_24h_pct, resolved_24h, first_seen_at
+                FROM crypto_dex_first_seen WHERE pair_address = ?
+            """, (entry["pair_address"],)).fetchone()
+        if outcome_row:
+            entry["return_1h_pct"] = outcome_row[0] if outcome_row[1] else None
+            entry["return_6h_pct"] = outcome_row[2] if outcome_row[3] else None
+            entry["return_24h_pct"] = outcome_row[4] if outcome_row[5] else None
+            entry["first_seen_at"] = outcome_row[6]
+        else:
+            entry["return_1h_pct"] = entry["return_6h_pct"] = entry["return_24h_pct"] = None
+            entry["first_seen_at"] = None
+        entries.append(entry)
+
+    # summary counts, exactly matching the requested success-criteria language:
+    # "we examined X new pools and Y awakening assets, Z reached scoring"
+    new_pool_entries = [e for e in entries if (e["source"] or "").startswith("CHAIN_EVENT")]
+    awakening_entries = [e for e in entries if not (e["source"] or "").startswith("CHAIN_EVENT")]
+    by_classification = {}
+    for e in entries:
+        by_classification.setdefault(e["classification"], 0)
+        by_classification[e["classification"]] += 1
+
+    return {
+        "entries": entries,
+        "total_examined": len(entries),
+        "new_pool_count": len(new_pool_entries),
+        "awakening_count": len(awakening_entries),
+        "by_classification": by_classification,
+    }
