@@ -383,9 +383,16 @@ def run() -> None:
     if latest_find and hours_since_chain_discovery is not None and hours_since_chain_discovery < 24:
         readable_source = latest_find["source"].replace("CHAIN_EVENT_", "").replace("_", " ").title()
         lines.append(f"\n<b>Most recent chain find:</b> {latest_find['symbol']} (via {readable_source})")
-        lines.append(f"   Score: {latest_find['pre_pearl_score']}/100 -> {latest_find['classification']}")
-        if latest_find["liquidity_usd"]:
-            lines.append(f"   Liquidity: ${latest_find['liquidity_usd']:,.0f}")
+        if latest_find["is_placeholder"]:
+            # v4.9.34 fix: never show "Score: 0.0/100" for something
+            # that simply hasn't been scored yet — that reads exactly
+            # like a rejection, which is the opposite of what's true.
+            lines.append(f"   Just found by the fast scanner — full scoring happens on the next "
+                         f"hourly pass.")
+        else:
+            lines.append(f"   Score: {latest_find['pre_pearl_score']}/100 -> {latest_find['classification']}")
+            if latest_find["liquidity_usd"]:
+                lines.append(f"   Liquidity: ${latest_find['liquidity_usd']:,.0f}")
         lines.append(f"   https://dexscreener.com/base/{latest_find['pair_address']}")
 
     # v4.9.24 Phase 2 — honest freshness split within DexScreener-sourced
