@@ -1318,21 +1318,26 @@ def get_dex_lifecycle_report(days_back: int = 1, source_filter: str = None) -> d
             entry["first_seen_at"] = None
         entries.append(entry)
 
-    # ── v4.9.16 — deduplicate by (symbol, pair_address), keeping only
-    # the MOST RECENT scoring per unique pool (entries are already
-    # ordered DESC by observed_at, so the first occurrence of each key
-    # is the latest).
-    seen_keys = set()
-    unique_entries = []
+    # ── v4.9.17 fix: v4.9.16 deduplicated by (symbol, pair_address),
+    # which STILL treats every different POOL of the same token as a
+    # separate "unique token" — AERO alone has 7+ distinct pools, so
+    # this fixed the TIME-repetition (same pool, many hourly scans) but
+    # NOT the POOL-repetition (same token, many pools), which is exactly
+    # why AERO still appeared ~10 times in the confirmed real output.
+    # Deduplicating by SYMBOL ALONE now — that's what "how many distinct
+    # tokens did we examine" actually means. Keeps the highest-scoring
+    # pool per symbol as the representative (most informative one to show).
+    by_symbol: dict = {}
     for e in entries:
-        key = (e["symbol"], e["pair_address"])
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique_entries.append(e)
+        by_symbol.setdefault(e["symbol"], []).append(e)
+    unique_entries = [max(pools, key=lambda e: e["pre_pearl_score"]) for pools in by_symbol.values()]
+    unique_entries.sort(key=lambda e: e["observed_at"], reverse=True)
+    total_pools_examined = len(set((e["symbol"], e["pair_address"]) for e in entries))
 
     # summary counts, exactly matching the requested success-criteria
-    # language — computed on the DEDUPLICATED set, since "28 candidates"
-    # from 2 repeated tokens is not 28 opportunities.
+    # language — computed on the DEDUPLICATED-BY-SYMBOL set, since
+    # "14 candidates" that are really one token across 14 pools/scans
+    # is not 14 opportunities.
     new_pool_entries = [e for e in unique_entries if (e["source"] or "").startswith("CHAIN_EVENT")]
     awakening_entries = [e for e in unique_entries if not (e["source"] or "").startswith("CHAIN_EVENT")]
     by_classification = {}
@@ -1343,6 +1348,7 @@ def get_dex_lifecycle_report(days_back: int = 1, source_filter: str = None) -> d
     return {
         "entries": unique_entries,
         "total_raw_observations": len(entries),
+        "total_pools_examined": total_pools_examined,
         "total_examined": len(unique_entries),
         "new_pool_count": len(new_pool_entries),
         "awakening_count": len(awakening_entries),
