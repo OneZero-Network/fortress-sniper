@@ -1430,3 +1430,26 @@ def get_dex_milestone_timeline(symbol: str, days_back: int = 30) -> dict:
 
     return {"symbol": symbol.upper(), "found": True, "total_observations": len(rows),
             "milestones": milestones, "deltas": deltas}
+
+
+def get_hours_since_last_chain_discovery() -> Optional[float]:
+    """v4.9.22 — supports the 3-state discovery classification (LIVE/
+    QUIET, BROKEN, STARVED): how long since ANY chain-native source
+    (source starting with CHAIN_EVENT) last logged a genuinely new pool
+    to the lifecycle ledger. Returns None if no chain-discovered
+    candidate has EVER been logged — honestly distinct from 'it's been
+    a while,' since 'never' and 'a while ago' mean different things for
+    diagnosing whether the machine is starved or simply new."""
+    with get_conn() as con:
+        row = con.execute("""
+            SELECT observed_at FROM crypto_dex_lifecycle
+            WHERE source LIKE 'CHAIN_EVENT%' ORDER BY observed_at DESC LIMIT 1
+        """).fetchone()
+    if not row:
+        return None
+    from datetime import datetime as _dt
+    try:
+        last_dt = _dt.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+        return round((_dt.today() - last_dt).total_seconds() / 3600.0, 1)
+    except (ValueError, TypeError):
+        return None
