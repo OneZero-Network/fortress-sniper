@@ -440,15 +440,40 @@ def run() -> None:
 
         lines.append(f"\nStatus: Monitoring for acceleration.")
 
-    # ── Outcome resolutions — the 5-state vocabulary, per explicit spec ──
+    # ── Outcome resolutions — the 5-state vocabulary, per explicit spec.
+    # v4.9.11 fix: resolutions are per PAIR ADDRESS, not per symbol — a
+    # token with 7+ pools (like AERO) can have several pools resolve at
+    # the same horizon in the same run, previously printing as N near-
+    # identical entries with no indication they're different pools of
+    # the same token. Aggregated by (symbol, horizon) — same collapsing
+    # discipline already used for BUILDING/closest-signals sections.
     resolutions = flywheel_result.get("resolutions", [])
     if resolutions:
-        lines.append(f"\n🧪 <b>BASE OUTCOME{'S' if len(resolutions) > 1 else ''}</b>")
-        for r in resolutions[:5]:
-            lines.append(f"\n<b>{r['symbol']}</b>\n"
-                         f"{r['horizon'].upper()} RESULT: {r['outcome']['status']}\n"
-                         f"{r['return_pct']:+.1f}% from first detection\n"
-                         f"Verdict: {r['outcome']['verdict']}")
+        grouped: dict = {}
+        for r in resolutions:
+            key = (r["symbol"], r["horizon"])
+            grouped.setdefault(key, []).append(r)
+
+        lines.append(f"\n🧪 <b>BASE OUTCOME{'S' if len(grouped) > 1 else ''}</b>")
+        for (symbol, horizon), group in list(grouped.items())[:5]:
+            if len(group) == 1:
+                r = group[0]
+                lines.append(f"\n<b>{symbol}</b>\n"
+                             f"{horizon.upper()} RESULT: {r['outcome']['status']}\n"
+                             f"{r['return_pct']:+.1f}% from first detection\n"
+                             f"Verdict: {r['outcome']['verdict']}")
+            else:
+                returns = [r["return_pct"] for r in group]
+                avg_return = sum(returns) / len(returns)
+                statuses = set(r["outcome"]["status"] for r in group)
+                status_str = group[0]["outcome"]["status"] if len(statuses) == 1 else "⚠️ MIXED"
+                verdict = group[0]["outcome"]["verdict"] if len(statuses) == 1 else \
+                    "Pools of this token showed different outcomes — see Sheet for per-pool detail."
+                lines.append(f"\n<b>{symbol}</b> ({len(group)} pools)\n"
+                             f"{horizon.upper()} RESULT: {status_str}\n"
+                             f"Avg {avg_return:+.1f}% (range {min(returns):+.1f}% to {max(returns):+.1f}%) "
+                             f"from first detection\n"
+                             f"Verdict: {verdict}")
 
     lines.append(f"\n<i>Full diagnostics (funnel counts, source coverage, raw data) → GitHub Actions log.</i>")
 
