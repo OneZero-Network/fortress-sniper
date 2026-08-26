@@ -1258,12 +1258,29 @@ def get_dex_lifecycle_report(days_back: int = 1, source_filter: str = None) -> d
     precursor scoring, here are the rejection reasons, here's what
     happened after.' Joins the lifecycle ledger against
     crypto_dex_first_seen's own resolution columns (by pair_address) to
-    attach forward outcomes (1h/6h/24h) wherever they've resolved —
-    this is the actual proof of discovery latency AND whether early
-    detection paid off, assembled from data that already existed but
-    was never unified under one queryable report before."""
+    attach forward outcomes (1h/6h/24h) wherever they've resolved.
+
+    v4.9.16 FIXES, both confirmed as real from production logs:
+    1. NO IMPLICIT TIME AMBIGUITY — returns requested_period_days,
+       actual_cutoff, and 'now' explicitly, so a caller (or the
+       Telegram message) can never silently misreport what window was
+       actually used. This doesn't prevent someone from passing 100 when
+       they meant 1 — GitHub Actions' manual dispatch dialog remembers
+       the LAST entered value, which is almost certainly what happened
+       in production — but it makes the ACTUAL window used impossible
+       to miss or misread.
+    2. DEDUPLICATION — the raw ledger correctly logs every scan of every
+       candidate (that's the right behavior for full traceability), but
+       a SUMMARY of '28 candidates examined' when it's actually the same
+       2 tokens observed 14 times each is misleading. Now reports BOTH:
+       total_raw_observations (the full ledger count, for transparency)
+       AND unique_tokens_examined (deduplicated by symbol+pair_address,
+       showing only the MOST RECENT scoring per token) — the caller can
+       use whichever framing fits."""
     from datetime import datetime as _dt, timedelta as _td
-    cutoff = (_dt.today() - _td(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+    now = _dt.today()
+    cutoff_dt = now - _td(days=days_back)
+    cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     lifecycle_cols = ["discovery_id", "pair_address", "symbol", "source", "observed_at",
                       "pool_age_hours", "pair_new", "liquidity_accel", "volume_accel", "tx_accel",
@@ -1301,19 +1318,36 @@ def get_dex_lifecycle_report(days_back: int = 1, source_filter: str = None) -> d
             entry["first_seen_at"] = None
         entries.append(entry)
 
-    # summary counts, exactly matching the requested success-criteria language:
-    # "we examined X new pools and Y awakening assets, Z reached scoring"
-    new_pool_entries = [e for e in entries if (e["source"] or "").startswith("CHAIN_EVENT")]
-    awakening_entries = [e for e in entries if not (e["source"] or "").startswith("CHAIN_EVENT")]
-    by_classification = {}
+    # ── v4.9.16 — deduplicate by (symbol, pair_address), keeping only
+    # the MOST RECENT scoring per unique pool (entries are already
+    # ordered DESC by observed_at, so the first occurrence of each key
+    # is the latest).
+    seen_keys = set()
+    unique_entries = []
     for e in entries:
+        key = (e["symbol"], e["pair_address"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_entries.append(e)
+
+    # summary counts, exactly matching the requested success-criteria
+    # language — computed on the DEDUPLICATED set, since "28 candidates"
+    # from 2 repeated tokens is not 28 opportunities.
+    new_pool_entries = [e for e in unique_entries if (e["source"] or "").startswith("CHAIN_EVENT")]
+    awakening_entries = [e for e in unique_entries if not (e["source"] or "").startswith("CHAIN_EVENT")]
+    by_classification = {}
+    for e in unique_entries:
         by_classification.setdefault(e["classification"], 0)
         by_classification[e["classification"]] += 1
 
     return {
-        "entries": entries,
-        "total_examined": len(entries),
+        "entries": unique_entries,
+        "total_raw_observations": len(entries),
+        "total_examined": len(unique_entries),
         "new_pool_count": len(new_pool_entries),
         "awakening_count": len(awakening_entries),
         "by_classification": by_classification,
+        "requested_period_days": days_back,
+        "actual_cutoff": cutoff,
+        "report_generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
     }
