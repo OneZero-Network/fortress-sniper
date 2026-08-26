@@ -290,6 +290,15 @@ def run() -> None:
             age_hours, accel, flow, security, early_move.get("already_extended", False),
             liquidity_usd, prior_liquidity)
 
+        # v4.9.18 — PRICE LAG + NEW/AWAKENING, per the broader discovery
+        # architecture mandate. Log-only for now, per explicit "don't add
+        # another Telegram section" instruction — these are new signals
+        # to observe and evaluate on their own merit before they earn a
+        # place in the score or the message.
+        price_lag = dexscreener.compute_activity_price_lag(accel, flow)
+        had_prior = prior_liquidity is not None
+        new_or_awakening = dexscreener.classify_new_vs_awakening(age_hours, had_prior)
+
         # v4.9.15 — permanent lifecycle record for EVERY candidate that
         # reaches scoring, regardless of final disposition. This is
         # what makes "nothing disappeared silently" a provable claim.
@@ -309,7 +318,9 @@ def run() -> None:
         # auditable, not just asserted.
         log.info(f"{symbol}: OLD gate={'PASS' if precursor['is_pre_pearl'] else 'FAIL'} "
                  f"(signals met: {precursor.get('signals_met')}) | NEW score={pre_pearl['score']}/90 "
-                 f"-> {pre_pearl['classification']} | {pre_pearl['breakdown']}")
+                 f"-> {pre_pearl['classification']} | {pre_pearl['breakdown']} | "
+                 f"category={new_or_awakening['category']} | price_lag={price_lag['label']} "
+                 f"({price_lag.get('detail')})")
 
         scored = pearl_score.compute_pearl_score(
             symbol, snapshot, None, None, {"severity": "UNCHECKED"}, None)
@@ -346,16 +357,30 @@ def run() -> None:
     lines = []
     today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%b %d").upper()
 
-    # ── v4.9.14 — DISCOVERY HEALTH, per explicit instruction: "for the
-    # next 7 days, show enough to determine whether the machine is
-    # actually seeing new things." Always shown first, always small.
-    # Distinguishes genuinely NEW (chain-discovered) pools from
-    # existing/search-derived monitoring — the honesty fix requested:
-    # "88 DEX pairs scanned" does NOT mean 88 new opportunities.
-    lines.append(f"🧭 <b>DISCOVERY HEALTH — {today}</b>")
-    lines.append(f"New pools (chain-discovered): {new_pool_count}")
-    lines.append(f"Existing/search-derived pools monitored: {len(all_pairs) - new_pool_count}")
-    lines.append(f"Passed security: {len(after_security)} | Blocked: {len(blocked)}")
+    # ── v4.9.21 — DISCOVERY HEALTH, rebuilt per explicit format:
+    # "SEARCH must never masquerade as discovery" — split into CHAIN
+    # (genuinely new) vs SEARCH (existing/monitoring), each labeled
+    # distinctly, plus a per-source LIVE/STALE heartbeat so a broken
+    # source is visible immediately instead of inferred from identical
+    # messages days apart.
+    chain_diag = {d["source"]: d for d in source_diagnostics if d["source"].startswith("CHAIN_EVENT")}
+    search_pool_count = len(all_pairs) - new_pool_count
+
+    lines.append(f"🧭 <b>DEX DISCOVERY HEALTH — {today}</b>\n")
+    lines.append(f"<b>Chain coverage</b>")
+    for dex_label, diag in chain_diag.items():
+        short_name = dex_label.replace("CHAIN_EVENT_", "").title()
+        if diag["status"] == "RPC_ERROR":
+            heartbeat = "🔴 STALE — RPC failed, cursor not advancing"
+        elif diag["status"] in ("OK", "OK_ZERO_RESULTS"):
+            heartbeat = "🟢 LIVE"
+        else:
+            heartbeat = f"🟡 {diag['status']}"
+        lines.append(f"   {short_name}: {heartbeat} — {diag['base_item_count']} new pool(s)")
+
+    lines.append(f"\n<b>CHAIN NEW</b>: {new_pool_count} pool(s), {unique_tokens if new_pool_count else 0} token(s)")
+    lines.append(f"<b>SEARCH / EXISTING</b>: {search_pool_count} pool(s) monitored (NOT counted as new discovery)")
+    lines.append(f"\nPassed security: {len(after_security)} | Blocked: {len(blocked)}")
     lines.append(f"Pre-Pearls: {len(pre_pearl_candidates)} | Early Moves: {len(early_moves)}\n")
 
     # ── v4.9.9 — the explicit product-principle fix: "No Early Move"
