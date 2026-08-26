@@ -1,12 +1,20 @@
-name: Fortress Crypto Slipstream Discovery Proof (hourly)
+name: Fortress Crypto Slipstream Discovery Proof (weekly health-check)
 
 on:
   schedule:
-    # v4.9.28 — now runs hourly, per explicit request, rather than
-    # manual-only. Deliberately offset from both the main pipeline
-    # (:15) and the chain-discovery-only job (:05/:20/:35/:50) to avoid
-    # any risk of overlapping RPC/database access.
-    - cron: '40 * * * *'
+    # v4.9.31 — DEMOTED from hourly to weekly, per direct feedback: "same
+    # token again and again." This tool replays a FIXED set of 10
+    # historical events forever — it already proved the decoder works
+    # (10/10, confirmed multiple times). It was never meant to find new
+    # tokens; the ONLY thing it can ever report is whether that same
+    # proof still passes. Re-confirming that hourly, forever, adds
+    # nothing and was the wrong call to push to the main feed that often.
+    # Weekly is more than enough for "did something break since last
+    # time" — actual new-token discovery lives in
+    # crypto_chain_discovery_only.yml (every 15 min) and
+    # crypto_base_discovery.yml (hourly), both of which only message
+    # when something genuinely new is found.
+    - cron: '40 6 * * 1'
   workflow_dispatch: {}
 
 concurrency:
