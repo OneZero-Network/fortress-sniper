@@ -321,7 +321,8 @@ def init_crypto_tables() -> None:
             observed_at     TEXT,
             stage           TEXT,
             conditions_met  INTEGER,
-            pct_24h         REAL
+            pct_24h         REAL,
+            liquidity_usd   REAL
         );
 
         -- ═══ v4.9.8 CHAIN-EVENT DISCOVERY CURSOR ═══ Single-row table
@@ -373,6 +374,14 @@ def init_crypto_tables() -> None:
                 con.commit()
             except Exception:
                 pass  # column already exists — expected on every run after the first
+
+        # v4.9.12 — liquidity tracking on crypto_dex_stage_log (table
+        # introduced in v4.7.6, needs this added for existing deployments)
+        try:
+            con.execute("ALTER TABLE crypto_dex_stage_log ADD COLUMN liquidity_usd REAL")
+            con.commit()
+        except Exception:
+            pass  # column already exists — expected on every run after the first
     log.info(f"Crypto tables initialized in {DB_PATH}")
 
 
@@ -1022,18 +1031,43 @@ def get_dex_lead_time_vs_coingecko(symbol: str) -> dict:
                        else "both lenses detected at the same time")}
 
 
-def log_dex_stage(pair_address: str, symbol: str, stage: str, conditions_met: int, pct_24h: float) -> None:
+def log_dex_stage(pair_address: str, symbol: str, stage: str, conditions_met: int, pct_24h: float,
+                   liquidity_usd: float = None) -> None:
     """v4.7.6 — one row per scan, per candidate that passes activity+
     security (not just Early Moves). This is the append-only log the
     near-miss flywheel needs — INSERT only, never updated, so the full
-    stage history for a pair is reconstructable in order."""
+    stage history for a pair is reconstructable in order.
+
+    v4.9.12: now also records liquidity_usd, so a genuine liquidity-
+    growth signal can be computed from real prior scans instead of
+    guessed at on first sight (there's no baseline to compare against
+    the very first time a pair is seen)."""
     from datetime import datetime as _dt
     now = _dt.today().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn(write=True) as con:
         con.execute("""
-            INSERT INTO crypto_dex_stage_log (pair_address, symbol, observed_at, stage, conditions_met, pct_24h)
-            VALUES (?,?,?,?,?,?)
-        """, (pair_address, symbol.upper(), now, stage, conditions_met, pct_24h))
+            INSERT INTO crypto_dex_stage_log (pair_address, symbol, observed_at, stage, conditions_met, pct_24h, liquidity_usd)
+            VALUES (?,?,?,?,?,?,?)
+        """, (pair_address, symbol.upper(), now, stage, conditions_met, pct_24h, liquidity_usd))
+
+
+def get_dex_prior_liquidity(pair_address: str) -> Optional[float]:
+    """v4.9.12 — most recent PRIOR liquidity reading for this pair, used
+    to compute a genuine liquidity-growth-rate signal. Returns None if
+    this pair has never been scanned before — the caller must treat that
+    as 'unknown,' not 'liquidity is not growing.'
+
+    Orders by id DESC, not just observed_at DESC — same-second scans
+    (a real occurrence, second-precision timestamps can tie) would
+    otherwise make 'most recent' ambiguous; id is a monotonically
+    increasing autoincrement key, so it always breaks ties correctly."""
+    with get_conn() as con:
+        row = con.execute("""
+            SELECT liquidity_usd FROM crypto_dex_stage_log
+            WHERE pair_address = ? AND liquidity_usd IS NOT NULL
+            ORDER BY observed_at DESC, id DESC LIMIT 1
+        """, (pair_address,)).fetchone()
+    return row[0] if row else None
 
 
 def get_dex_stage_history(pair_address: str) -> list:
