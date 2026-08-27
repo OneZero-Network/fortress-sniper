@@ -1523,3 +1523,48 @@ def get_latest_chain_discovery_detail() -> Optional[dict]:
     result["is_placeholder"] = is_placeholder
     result["breakdown"] = json.loads(result.pop("breakdown_json") or "[]")
     return result
+
+
+def get_unscored_placeholder_pools() -> list:
+    """v4.9.35 — closes the actual gap found in production: the fast
+    15-min scanner logs a 'DISCOVERED_ONLY' placeholder the instant it
+    finds a pool, and advances the SHARED chain cursor past that block.
+    The main hourly pipeline's own chain-event discovery can then
+    NEVER see that same pool again — its scan only ever looks at NEW
+    territory ahead of wherever the cursor currently sits. The promise
+    that 'the next hourly pass will score it' was structurally false
+    without this: something has to explicitly pick up outstanding
+    placeholders, since chain-event rediscovery can't.
+
+    Returns placeholders that have NOT yet been superseded by a real
+    scored entry for the same pool (i.e., genuinely still stuck).
+    Also extracts token0/token1 from the breakdown text — the fast
+    scanner only stores these as free-text ('token0=0x...'), not as
+    structured columns, so this parses them out rather than the caller
+    incorrectly querying by pool address (which fetch_pair_data was
+    never built to handle — it takes a TOKEN address everywhere else
+    in this codebase)."""
+    import json, re
+    with get_conn() as con:
+        rows = con.execute("""
+            SELECT DISTINCT p.pair_address, p.source, p.breakdown_json
+            FROM crypto_dex_lifecycle p
+            WHERE p.classification = '⚪ DISCOVERED_ONLY'
+            AND NOT EXISTS (
+                SELECT 1 FROM crypto_dex_lifecycle s
+                WHERE s.pair_address = p.pair_address AND s.classification != '⚪ DISCOVERED_ONLY'
+            )
+        """).fetchall()
+    results = []
+    for pair_address, source, breakdown_json in rows:
+        breakdown = json.loads(breakdown_json or "[]")
+        token0 = token1 = None
+        for item in breakdown:
+            m0 = re.match(r"token0=(0x[0-9a-fA-F]+)", item)
+            m1 = re.match(r"token1=(0x[0-9a-fA-F]+)", item)
+            if m0:
+                token0 = m0.group(1)
+            if m1:
+                token1 = m1.group(1)
+        results.append({"pair_address": pair_address, "source": source, "token0": token0, "token1": token1})
+    return results
