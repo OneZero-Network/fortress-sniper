@@ -33,7 +33,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.telegram import send as send_telegram
-from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle, get_hours_since_last_chain_discovery, get_latest_chain_discovery_detail
+from core.db import init_crypto_tables, log_dex_first_seen, get_dex_lead_time_vs_coingecko, log_dex_stage, get_dex_graduations, get_dex_unchanged_streak, get_dex_chain_cursor, set_dex_chain_cursor, get_dex_prior_liquidity, get_dex_chain_cursor_v2, set_dex_chain_cursor_v2, log_dex_lifecycle, get_hours_since_last_chain_discovery, get_latest_chain_discovery_detail, get_unscored_placeholder_pools
 from core.crypto import dexscreener
 from core.crypto import dex_flywheel
 from core.crypto import pearl_score
@@ -94,6 +94,33 @@ def _gather_universe() -> dict:
             if pair:
                 pair["_source"] = source_label
                 all_pairs.append(pair)
+
+    # v4.9.35 — pick up any pool the fast 15-min scanner found but that
+    # never got scored, since the shared cursor means the main
+    # pipeline's own chain-event discovery structurally CANNOT
+    # rediscover it (the cursor already moved past that block). Without
+    # this, a fast-scanner find could sit as an unscored placeholder
+    # forever — confirmed directly in production across multiple
+    # consecutive hourly runs.
+    stuck_placeholders = get_unscored_placeholder_pools()
+    if stuck_placeholders:
+        log.info(f"Picking up {len(stuck_placeholders)} stuck placeholder(s) from the fast scanner")
+    for placeholder in stuck_placeholders:
+        if not placeholder["token0"] or not placeholder["token1"]:
+            log.warning(f"Stuck placeholder {placeholder['pair_address']} has no recoverable token "
+                       f"addresses — cannot be scored, will remain unscored")
+            continue
+        new_token_address = base_chain.identify_new_token_address(placeholder["token0"], placeholder["token1"])
+        pair = dexscreener.fetch_pair_data(new_token_address, chain="base")
+        if not pair:
+            fallback_address = placeholder["token1"] if new_token_address == placeholder["token0"] else placeholder["token0"]
+            pair = dexscreener.fetch_pair_data(fallback_address, chain="base")
+        if pair:
+            pair["_source"] = placeholder["source"]
+            all_pairs.append(pair)
+        else:
+            log.warning(f"Stuck placeholder {placeholder['pair_address']} still could not be resolved "
+                       f"via DexScreener — will remain unscored until it can be")
 
     boosted_diag = dexscreener.fetch_boosted_base_tokens_diagnostic(limit=30)
     source_diagnostics.append(boosted_diag)
